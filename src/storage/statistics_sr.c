@@ -127,94 +127,6 @@ xstats_update_statistics (THREAD_ENTRY * thread_p, OID * class_id_p, bool with_f
  *       statistics and they are stored to disk within the catalog structure
  *       for the last class representation.
  */
-/*
- * stats_clamp_leading_pkeys () - raise a sampled btree's leading-column pkeys to the column NDV
- *   class_id_p(in)   : class of the btree
- *   btree_stats_p(in/out): stats just filled by btree_get_stats ()
- *   with_fullscan(in): statement flag; exact traversal results are never touched
- *   rs_ndv_attr_ids/rs_ndv_values/rs_n_attrs(in): per-attribute NDV from the reservoir full scan
- *
- * Note: (CBRD-26903) the AR-sampled btree stats extrapolate the distinct prefixes seen in the
- * sampled leaves linearly, so an index whose leading column is NULL-dominated with its few
- * non-null values clustered in a handful of leaves reports pkeys[0] == 1 (every sampled leaf
- * holds only NULL-leading keys). The reservoir scan measured every column's NDV exactly
- * (HLL over all rows), so use it as a lower bound for the leading prefix: the number of
- * distinct (c1) prefixes in the index is at least the number of distinct non-null c1 values.
- * Sampling can only under-count, therefore the clamp only ever raises the estimate, capped by
- * the key count; exact (fullscan / small index) results are left untouched.
- */
-static void
-stats_clamp_leading_pkeys (THREAD_ENTRY * thread_p, OID * class_id_p, BTREE_STATS * btree_stats_p, int with_fullscan,
-			   const ATTR_ID * rs_ndv_attr_ids, const INT64 * rs_ndv_values, int rs_n_attrs)
-{
-  OR_CLASSREP *cls_rep = NULL;
-  int cls_idx_cache = 0;
-  ATTR_ID leading_attr_id = -1;
-  INT64 ndv = -1;
-  int i;
-
-  if (with_fullscan || btree_stats_p->pages <= STATS_SAMPLING_THRESHOLD)
-    {
-      /* btree_get_stats () traversed every leaf: the pkeys are exact */
-      return;
-    }
-  if (btree_stats_p->pkeys_size <= 0 || rs_n_attrs <= 0 || rs_ndv_attr_ids == NULL || rs_ndv_values == NULL)
-    {
-      return;
-    }
-
-  cls_rep = heap_classrepr_get (thread_p, class_id_p, NULL, NULL_REPRID, &cls_idx_cache);
-  if (cls_rep == NULL)
-    {
-      return;			/* best-effort: keep the sampled estimate */
-    }
-  for (i = 0; i < cls_rep->n_indexes; i++)
-    {
-      if (BTID_IS_EQUAL (&cls_rep->indexes[i].btid, &btree_stats_p->btid))
-	{
-	  if (cls_rep->indexes[i].n_atts > 0 && cls_rep->indexes[i].func_index_info == NULL)
-	    {
-	      leading_attr_id = cls_rep->indexes[i].atts[0]->id;
-	    }
-	  break;
-	}
-    }
-  heap_classrepr_free_and_init (cls_rep, &cls_idx_cache);
-
-  if (leading_attr_id < 0)
-    {
-      return;
-    }
-  for (i = 0; i < rs_n_attrs; i++)
-    {
-      if (rs_ndv_attr_ids[i] == leading_attr_id)
-	{
-	  ndv = rs_ndv_values[i];
-	  break;
-	}
-    }
-  if (ndv <= 0)
-    {
-      return;			/* unsupported type or all-NULL column: nothing better than the sample */
-    }
-  if (ndv > (INT64) btree_stats_p->keys)
-    {
-      ndv = (INT64) btree_stats_p->keys;
-    }
-  if ((INT64) btree_stats_p->pkeys[0] < ndv)
-    {
-      btree_stats_p->pkeys[0] = (int) ndv;
-    }
-  /* prefix NDVs are non-decreasing by definition; restore monotonicity after the raise */
-  for (i = 1; i < btree_stats_p->pkeys_size; i++)
-    {
-      if (btree_stats_p->pkeys[i] < btree_stats_p->pkeys[i - 1])
-	{
-	  btree_stats_p->pkeys[i] = btree_stats_p->pkeys[i - 1];
-	}
-    }
-}
-
 static int
 stats_update_statistics_internal (THREAD_ENTRY * thread_p, OID * class_id_p, bool with_fullscan,
 				  CLASS_ATTR_NDV * class_attr_ndv, STATS_NDV_SKETCH_SET ** out_ndv_sketches)
@@ -485,9 +397,6 @@ stats_update_statistics_internal (THREAD_ENTRY * thread_p, OID * class_id_p, boo
 	    }
 
 	  assert_release (btree_stats_p->keys >= 0);
-
-	  stats_clamp_leading_pkeys (thread_p, class_id_p, btree_stats_p, with_fullscan, rs_ndv_attr_ids,
-				     rs_ndv_values, rs_n_attrs);
 	}			/* for (j = 0; ...) */
 
       /* put ndv of columns */
