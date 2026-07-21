@@ -849,6 +849,9 @@ IDL       [a-zA-Z0-9_]
 [rR][aA][nN][kK]							{ begin_token(yytext);
 									  csql_yylval.cptr = pt_makename(yytext);
 									  return RANK; }
+[rR][aA][nN][dD][oO][mM]						{ begin_token(yytext);
+										csql_yylval.cptr = pt_makename(yytext);
+										return RANDOM_; }
 [rR][aA][nN][gG][eE]							{ begin_token(yytext);
 										csql_yylval.cptr = pt_makename(yytext);
 										return RANGE_; }
@@ -936,6 +939,9 @@ IDL       [a-zA-Z0-9_]
 [sS][eE][cC][oO][nN][dD]						{ begin_token(yytext);   return SECOND_; }
 [sS][eE][cC][oO][nN][dD]_[mM][iI][lL][lL][iI][sS][eE][cC][oO][nN][dD]	{ begin_token(yytext);   return SECOND_MILLISECOND; }
 [sS][eE][cC][tT][iI][oO][nN]						{ begin_token(yytext);   return SECTION; }
+[sS][eE][eE][dD]							{ begin_token(yytext);
+										csql_yylval.cptr = pt_makename(yytext);
+										return SEED_; }
 [sS][eE][cC][tT][iI][oO][nN][sS]					{ begin_token(yytext);
 										csql_yylval.cptr = pt_makename(yytext);
 										return SECTIONS; }
