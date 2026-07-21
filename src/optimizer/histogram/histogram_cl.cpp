@@ -495,6 +495,11 @@ histogram_extract_key (const DB_VALUE *db_val, hist::histogram_key &key)
     case DB_TYPE_BIGINT:
       key.kind = hist::histogram_key_kind::i64;
       key.i64 = db_get_bigint (db_val);
+      break;
+
+    case DB_TYPE_ENUMERATION:
+      key.kind = hist::histogram_key_kind::i64;
+      key.i64 = db_get_enum_short (db_val);
       return true;
 
     case DB_TYPE_FLOAT:
@@ -505,6 +510,11 @@ histogram_extract_key (const DB_VALUE *db_val, hist::histogram_key &key)
     case DB_TYPE_DOUBLE:
       key.kind = hist::histogram_key_kind::dbl;
       key.dbl = db_get_double (db_val);
+      break;
+
+    case DB_TYPE_MONETARY:
+      key.kind = hist::histogram_key_kind::dbl;
+      key.dbl = db_get_monetary (db_val)->amount;
       return true;
 
     case DB_TYPE_NUMERIC:
@@ -814,9 +824,11 @@ histogram_key_kind_for_type (DB_TYPE type)
     case DB_TYPE_INTEGER:
     case DB_TYPE_SHORT:
     case DB_TYPE_BIGINT:
+    case DB_TYPE_ENUMERATION:
       return hist::histogram_key_kind::i64;
     case DB_TYPE_FLOAT:
     case DB_TYPE_DOUBLE:
+    case DB_TYPE_MONETARY:
     case DB_TYPE_NUMERIC:
       return hist::histogram_key_kind::dbl;
     case DB_TYPE_STRING:
@@ -1618,6 +1630,8 @@ is_histogrammable_type (DB_TYPE type)
     case DB_TYPE_DOUBLE:
     case DB_TYPE_NUMERIC:
     case DB_TYPE_BIGINT:
+    case DB_TYPE_ENUMERATION:	/* member index */
+    case DB_TYPE_MONETARY:	/* amount */
       return true;
 
     /* bit string */
