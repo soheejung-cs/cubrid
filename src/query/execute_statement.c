@@ -4736,6 +4736,8 @@ do_update_stats (PARSER_CONTEXT * parser, PT_NODE * statement)
 
       int n_tables = 0, n_cols = 0;
 
+      int n_hist_skipped = 0;
+
       // update stats
       for (cls = statement->info.update_stats.class_list; cls != NULL && error == NO_ERROR; cls = cls->next)
 	{
@@ -4779,7 +4781,7 @@ do_update_stats (PARSER_CONTEXT * parser, PT_NODE * statement)
 		  histogram_info.with_fullscan = statement->info.update_stats.with_fullscan;
 		  histogram_info.random_seed = statement->info.update_stats.random_seed;
 		  error = update_or_drop_histogram_helper (NULL, obj, true /* quiet */ , &histogram_info,
-							   DO_HISTOGRAM_DROP);
+							   DO_HISTOGRAM_DROP, NULL);
 		  AU_RESTORE (save);
 		  if (error != NO_ERROR)
 		    {
@@ -4811,8 +4813,11 @@ do_update_stats (PARSER_CONTEXT * parser, PT_NODE * statement)
 		    (statement->info.update_stats.bucket_count > 0) ? statement->info.update_stats.bucket_count : -1;
 		  histogram_info.with_fullscan = statement->info.update_stats.with_fullscan;
 		  histogram_info.random_seed = statement->info.update_stats.random_seed;
+		  int hist_skipped = 0;
+
 		  error = update_or_drop_histogram_helper (NULL, obj, true /* quiet */ , &histogram_info,
-							   DO_HISTOGRAM_CREATE);
+							   DO_HISTOGRAM_CREATE, &hist_skipped);
+		  n_hist_skipped += hist_skipped;
 		  if (error == NO_ERROR)
 		    {
 		      stats_updated = true;
@@ -4856,6 +4861,11 @@ do_update_stats (PARSER_CONTEXT * parser, PT_NODE * statement)
 	{
 	  fprintf (stdout, "Statistics updated successfully: %d table%s, %d column%s.\n", n_tables,
 		   (n_tables == 1) ? "" : "s", n_cols, (n_cols == 1) ? "" : "s");
+	  if (n_hist_skipped > 0)
+	    {
+	      fprintf (stdout, "Histogram skipped on %d column%s of unsupported types"
+		       " (SET TRACE ON lists them).\n", n_hist_skipped, (n_hist_skipped == 1) ? "" : "s");
+	    }
 	  fflush (stdout);
 	}
 
