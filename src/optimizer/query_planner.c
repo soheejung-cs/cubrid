@@ -103,9 +103,18 @@
 #define SSCAN_DEFAULT_CARD 50
 #define GUESSED_BIND_LIMIT_CARD 2000	/* When limit is a bind variable, assume that fewer rows will be assigned. */
 
-#define RBO_CHECK_COST 50
+/* The cost band inside which qo_plan_cmp () falls through to rule-based tie-breaks. The
+ * absolute offset only guards against near-zero cost noise (about one page of IO); the band
+ * itself is relative, so small-cost plans still get a genuine cost comparison. The former
+ * absolute offset of 50 pages disabled the cost model for every small query, and the former
+ * LIMIT ratio of 10 let a 9x costlier plan win on rules. */
+#define RBO_CHECK_COST 1.0
 #define RBO_CHECK_RATIO 1.2
-#define RBO_CHECK_LIMIT_RATIO 10
+#define RBO_CHECK_LIMIT_RATIO 1.5
+
+/* Cost tie detection for the rule-based comparison steps: exact floating-point equality
+ * never fires after any nontrivial arithmetic, silently disabling the tie-break rules. */
+#define QO_COST_EQ(x, y) (fabs ((x) - (y)) <= 1e-6 * MAX (1.0, MAX (fabs (x), fabs (y))))
 
 #define	qo_scan_walk	qo_generic_walk
 #define	qo_worst_walk	qo_generic_walk
@@ -2275,6 +2284,11 @@ qo_iscan_cost (QO_PLAN * planp)
        * (heap_rows <= 1) keep the old cost via the MAX (1.0, ...) floor below. */
       object_IO = MIN (heap_rows, opages);
       heap_access = heap_rows * (double) ISCAN_OID_ACCESS_OVERHEAD;
+
+      /* Index-driven heap fetches are random page reads while a sequential scan's pages are
+       * sequential, yet both cost 1.0 per page; the ratio below (optimizer_random_page_cost_ratio,
+       * default 1.0 = no change) prices that difference and is the tuning knob for the gap. */
+      object_IO *= (double) prm_get_float_value (PRM_ID_OPTIMIZER_RANDOM_PAGE_COST_RATIO);
     }
   object_IO = MAX (1.0, object_IO);
 
@@ -2807,7 +2821,7 @@ qo_sort_cost (QO_PLAN * planp)
 
       if (order != QO_UNORDERED && order != subplanp->order)
 	{
-	  double sort_io, tcard;
+	  double sort_io;
 
 	  sort_io = 0.0;	/* init */
 
@@ -2822,24 +2836,14 @@ qo_sort_cost (QO_PLAN * planp)
 		}
 	      else
 		{
-		  /* There are too many records to permit an in-memory sort, so io costs will be increased.  Assume
-		   * that the io costs increase by the number of pages required to hold the intermediate result.  CPU
-		   * costs increase as above. Model courtesy of Ender.
-		   */
-		  sort_io = pages * log3 (pages / 4.0);
+		  /* External merge sort: every merge pass reads and writes the whole run set once, and
+		   * the number of passes is ceil (log_F (pages / F)) with F the real merge fan-in -- the
+		   * sort buffer size -- not a fixed 3 (the old log3 (pages / 4) model overpriced large
+		   * sorts by a multiple and then patched itself with an arbitrary *0.1 cache guess). */
+		  double fan_in = MAX (2.0, (double) prm_get_integer_value (PRM_ID_SR_NBUFFERS));
+		  double merge_passes = ceil (log (MAX (pages / fan_in, 1.0)) / log (fan_in));
 
-		  /* guess: apply IO caching for big size sort list. Disk IO cost cannot be greater than the 10% number
-		   * of the requested IO pages
-		   */
-		  if (subplanp->plan_type == QO_PLANTYPE_SCAN)
-		    {
-		      tcard = (double) QO_NODE_TCARD (subplanp->plan_un.scan.node);
-		      tcard *= 0.1;
-		      if (pages >= tcard)
-			{	/* big size sort list */
-			  sort_io *= 0.1;
-			}
-		    }
+		  sort_io = pages * (1.0 + merge_passes);	/* initial run formation + merge passes */
 		}
 	    }
 
@@ -4238,11 +4242,11 @@ qo_plan_cmp (QO_PLAN * a, QO_PLAN * b)
   tb = bf + ba;
   if (ta > 0 && tb > 0 && QO_PLAN_HAS_LIMIT (a) && QO_PLAN_HAS_LIMIT (b))
     {
-      if (ta * RBO_CHECK_LIMIT_RATIO <= tb)
+      if ((ta + RBO_CHECK_COST <= tb) && (ta * RBO_CHECK_LIMIT_RATIO <= tb))
 	{
 	  return PLAN_COMP_LT;
 	}
-      else if (ta > tb * RBO_CHECK_LIMIT_RATIO)
+      else if ((ta > tb + RBO_CHECK_COST) && (ta > tb * RBO_CHECK_LIMIT_RATIO))
 	{
 	  return PLAN_COMP_GT;
 	}
@@ -4869,7 +4873,7 @@ qo_plan_cmp (QO_PLAN * a, QO_PLAN * b)
 	return PLAN_COMP_GT;
       }
 
-    if (af == bf && aa == ba)
+    if (QO_COST_EQ (af, bf) && QO_COST_EQ (aa, ba))
       {
 	if (a->plan_un.scan.index_equi == b->plan_un.scan.index_equi && qo_is_index_covering_scan (a)
 	    && qo_is_index_covering_scan (b))
@@ -4940,7 +4944,7 @@ qo_plan_cmp (QO_PLAN * a, QO_PLAN * b)
 
 cost_cmp:
 
-  if (a == b || (af == bf && aa == ba))
+  if (a == b || (QO_COST_EQ (af, bf) && QO_COST_EQ (aa, ba)))
     {
       return PLAN_COMP_EQ;
     }
@@ -9940,6 +9944,11 @@ qo_expr_selectivity (QO_ENV * env, PT_NODE * pt_expr)
       /* per-node: an IS [NOT] NULL node must not suppress the null-correction of its siblings */
       not_null_calculated = false;
 
+      /* reset per disjunct: an operator that hits the default case below leaves selectivity
+       * untouched, which would otherwise leak the previous disjunct's value into this one's
+       * OR accumulation */
+      selectivity = DEFAULT_SELECTIVITY;
+
       switch (node->info.expr.op)
 	{
 	case PT_OR:
@@ -10399,9 +10408,10 @@ qo_equal_selectivity (QO_ENV * env, PT_NODE * pt_expr)
 	case PC_SUBQUERY:
 	case PC_SET:
 	case PC_OTHER:
-	  /* const = const */
-
-	  selectivity = DEFAULT_EQUAL_SELECTIVITY;
+	  /* const = const; an expression side (PC_OTHER, e.g. UPPER (col) = ?) has an unknown
+	   * distribution -- the near-unique default would oversell it */
+	  selectivity = (pc_lhs == PC_OTHER
+			 || pc_rhs == PC_OTHER) ? DEFAULT_EXPR_EQUAL_SELECTIVITY : DEFAULT_EQUAL_SELECTIVITY;
 	  break;
 
 	case PC_MULTI_ATTR:
@@ -10987,6 +10997,53 @@ qo_all_some_in_selectivity (QO_ENV * env, PT_NODE * pt_expr)
   pc_lhs = qo_classify (arg1);
   pc_rhs = qo_classify (arg2);
 
+  /* attr IN (const, const, ...): the values are mutually exclusive, so the selectivity is the
+   * SUM of the per-value equality selectivities. When the column has a histogram, sum the exact
+   * per-value probes (this reflects the real value frequencies -- e.g. an IN list of common
+   * values is far more selective-heavy than the flat 1/ndv assumption). */
+  if (pc_lhs == PC_ATTR && pc_rhs == PC_SET && pt_is_function (arg2))
+    {
+      double sum = 0.0;
+      bool all_probed = true;
+      PT_NODE *elem;
+
+      for (elem = arg2->info.function.arg_list; elem != NULL; elem = elem->next)
+	{
+	  PRED_CLASS pc_elem = qo_classify (elem);
+	  DB_VALUE *elem_value = NULL;
+	  double one = 0.0;
+	  bool success = false;
+
+	  if (pc_elem == PC_CONST)
+	    {
+	      elem_value = &elem->info.value.db_value;
+	    }
+	  else if (pc_elem == PC_HOST_VAR)
+	    {
+	      elem_value = &env->parser->host_variables[elem->info.host_var.index];
+	    }
+	  else
+	    {
+	      all_probed = false;
+	      break;
+	    }
+
+	  histogram_get_equal_selectivity (arg1, elem_value, &one, &success);
+	  if (!success)
+	    {
+	      all_probed = false;
+	      break;
+	    }
+	  sum += one;
+	}
+
+      if (all_probed)
+	{
+	  return MIN (MAX (sum, 0.0), 1.0);
+	}
+      /* fall through to the generic estimate below when a value had no histogram probe */
+    }
+
   /* The only interesting cases are: attr IN set or (attr,attr) IN set or attr IN subquery */
   if ((pc_lhs == PC_MULTI_ATTR || pc_lhs == PC_ATTR) && (pc_rhs == PC_SET || pc_rhs == PC_SUBQUERY))
     {
@@ -11046,9 +11103,10 @@ qo_all_some_in_selectivity (QO_ENV * env, PT_NODE * pt_expr)
 	    }
 	}
 
-      /* compute selectivity--cap at 0.5 */
+      /* IN values are mutually exclusive equalities, so their selectivities add; the sum is
+       * naturally bounded by 1.0 (the former hard cap of 0.5 had no distributional basis). */
       double in_selectivity = list_card * equal_selectivity;
-      return in_selectivity > 0.5 ? 0.5 : in_selectivity;
+      return MIN (in_selectivity, 1.0);
     }
 
   return DEFAULT_IN_SELECTIVITY;

@@ -802,6 +802,7 @@ static const char sysprm_ha_conf_file_name[] = "cubrid_ha.conf";
 
 #define PRM_NAME_HARDWARE_AFFINITY "hardware_affinity"
 #define PRM_NAME_BESTSPACE_SHARD_COUNT "bestspace_shard_count"
+#define PRM_NAME_OPTIMIZER_RANDOM_PAGE_COST_RATIO "optimizer_random_page_cost_ratio"
 
 #define PRM_NAME_STATISTICS_SAMPLING_THRESHOLD_PAGES "statistics_sampling_threshold_pages"
 
@@ -5437,6 +5438,19 @@ SYSPRM_PARAM prm_Def[] = {
    {false, {.i = 8}},
    {false, {.i = 28}},
    {false, {.i = 1}},
+   (char *) NULL,
+   (DUP_PRM_FUNC) NULL,
+   (DUP_PRM_FUNC) NULL},
+
+  {PRM_ID_OPTIMIZER_RANDOM_PAGE_COST_RATIO,
+   PRM_NAME_OPTIMIZER_RANDOM_PAGE_COST_RATIO,
+   (PRM_FOR_CLIENT | PRM_USER_CHANGE | PRM_HIDDEN),
+   PRM_FLOAT,
+   PRM_CLEAR_DYNAMIC_FLAG,
+   {false, {.f = 1.0f}},
+   {false, {.f = 1.0f}},
+   {false, {.f = 100.0f}},
+   {false, {.f = 0.1f}},
    (char *) NULL,
    (DUP_PRM_FUNC) NULL,
    (DUP_PRM_FUNC) NULL}
