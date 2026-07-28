@@ -96,6 +96,10 @@
 					   SERVER/SA-only (query_hash_scan.h) so it cannot be sizeof'd in the
 					   client-side optimizer; a static_assert there guards against drift. */
 #define ISCAN_IO_HIT_RATIO 0.5
+#define QO_EFFECTIVE_CACHE_PAGES 32768.0	/* pages assumed cachable for the Mackert-Lohman repeated-probe
+						   correction in qo_nljoin_cost (); matches the data_buffer_pages
+						   default (512M / 16K). The real parameter is server-only, so the
+						   client-side optimizer cannot read it. */
 #define SSCAN_DEFAULT_CARD 50
 #define GUESSED_BIND_LIMIT_CARD 2000	/* When limit is a bind variable, assume that fewer rows will be assigned. */
 
@@ -514,6 +518,7 @@ qo_plan_malloc (QO_ENV * env)
   plan->use_iscan_descending = false;
   plan->need_final_sort = false;
   plan->limit_nljoin_guessed_card = 0.0;
+  plan->iscan_index_rows = 0.0;
 
   return plan;
 }
@@ -2097,7 +2102,7 @@ qo_iscan_cost (QO_PLAN * planp)
   QO_NODE_INDEX_ENTRY *ni_entryp;
   QO_ATTR_CUM_STATS *cum_statsp;
   QO_INDEX_ENTRY *index_entryp;
-  double sel, sel_limit, height, leaves, opages, filter_sel, leaf_access, heap_access;
+  double sel, sel_limit, height, leaves, opages, filter_sel, leaf_access, heap_access, heap_rows, descent_cpu;
   double object_IO, index_IO;
   QO_TERM *termp;
   BITSET_ITERATOR iter;
@@ -2257,15 +2262,33 @@ qo_iscan_cost (QO_PLAN * planp)
     }
   else
     {
-      object_IO = opages * sel * filter_sel;
-      heap_access = (double) QO_NODE_NCARD (nodep) * sel * filter_sel * (double) ISCAN_OID_ACCESS_OVERHEAD;
+      heap_rows = (double) QO_NODE_NCARD (nodep) * sel * filter_sel;
+      /* PG cost_index tuples_fetched: rows matching the INDEX conditions alone, per probe --
+       * the heap pages must be visited before the non-index filter can reject a row */
+      planp->iscan_index_rows = MAX (1.0, (double) QO_NODE_NCARD (nodep) * sel);
+      /* With no physical-order (clustering/correlation) statistic, assume the heap order is
+       * uncorrelated with the index -- as PostgreSQL does when correlation is unknown: every
+       * fetched row costs one page read, bounded by the table size. The previous formula
+       * (opages * sel) modeled the opposite extreme (perfectly clustered rows), which priced
+       * an N-row scattered fetch and a 1-row unique probe at the same single page and made
+       * high-fanout inner index scans of nested loops look nearly free. Unique/pk probes
+       * (heap_rows <= 1) keep the old cost via the MAX (1.0, ...) floor below. */
+      object_IO = MIN (heap_rows, opages);
+      heap_access = heap_rows * (double) ISCAN_OID_ACCESS_OVERHEAD;
     }
   object_IO = MAX (1.0, object_IO);
+
+  /* PG cost_index (): every index scan pays a root-to-leaf descent -- about ceil(log2(rows)) key
+   * compares plus (height + 1) page-boundary steps of 50 operator units each. Charge it into the
+   * per-scan VARIABLE cpu cost so a nested loop pays it once per probe. After the Mackert-Lohman
+   * correction saturates the repeated-probe heap IO, this per-probe term is what keeps a
+   * multi-million-probe NL from looking free -- the same balance PG keeps. */
+  descent_cpu = (ceil (log2 ((double) QO_NODE_NCARD (nodep) + 1.0)) + (height + 1.0) * 50.0) * (double) QO_CPU_WEIGHT;
 
   /* index scan requires more CPU cost than sequential scan */
   planp->fixed_cpu_cost = 0.0;
   planp->fixed_io_cost = index_IO;
-  planp->variable_cpu_cost = (leaf_access + heap_access) * (double) QO_CPU_WEIGHT;
+  planp->variable_cpu_cost = (leaf_access + heap_access) * (double) QO_CPU_WEIGHT + descent_cpu;
   planp->variable_io_cost = object_IO;
   planp->info->scan_rows = MAX (1, (double) QO_NODE_NCARD (nodep) * sel * filter_sel);
 
@@ -3408,7 +3431,48 @@ qo_nljoin_cost (QO_PLAN * planp)
   /* inner side IO cost of nested-loop block join */
   if (qo_is_iscan (inner))
     {
-      inner_io_cost = guessed_result_cardinality * inner->variable_io_cost * (1 - ISCAN_IO_HIT_RATIO);
+      /* Repeated index probes mostly revisit pages that earlier probes already pulled into the
+       * buffer pool. Port of PostgreSQL index_pages_fetched () (Mackert-Lohman approximation):
+       * the total heap pages fetched by ALL probes together saturates near the inner table size
+       * while it fits in the cache, instead of charging every probe its full uncached page count.
+       * This replaces the flat (1 - ISCAN_IO_HIT_RATIO) discount, which under-corrected small
+       * outers (a handful of probes over a hot table are all cache hits) and thereby made
+       * hash join + full scan or a bad leading order beat an actually-cheap NL re-probe. */
+      double T, N, b, lim, pages_fetched, naive_io;
+
+      T = MAX (1.0, (double) QO_NODE_TCARD (inner->plan_un.scan.node));
+      /* PG cost_index tuples_fetched: probes x rows matching the index conditions per probe
+       * (BEFORE non-index filters -- those rows' pages are fetched regardless of whether the
+       * filter later rejects them). Using the filtered join cardinality here under-counted the
+       * fetches of strongly-filtered joins and made orders containing them look too cheap. */
+      N = guessed_result_cardinality * MAX (1.0, inner->iscan_index_rows);
+      /* effective cache: matches the data_buffer_pages default (server-only parameter, not
+       * visible to the client-side optimizer) */
+      b = QO_EFFECTIVE_CACHE_PAGES;
+
+      if (T <= b)
+	{
+	  pages_fetched = (2.0 * T * N) / (2.0 * T + N);
+	  if (pages_fetched > T)
+	    {
+	      pages_fetched = T;
+	    }
+	}
+      else
+	{
+	  lim = (2.0 * T * b) / (2.0 * T - b);
+	  if (N <= lim)
+	    {
+	      pages_fetched = (2.0 * T * N) / (2.0 * T + N);
+	    }
+	  else
+	    {
+	      pages_fetched = b + (N - lim) * (T - b) / T;
+	    }
+	}
+
+      naive_io = guessed_result_cardinality * inner->variable_io_cost;
+      inner_io_cost = MIN (naive_io, pages_fetched);
     }
   else
     {
