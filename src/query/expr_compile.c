@@ -334,7 +334,7 @@ expr_arith_row_interp (EXPR_STEP * step, EXPR_EVAL_CTX * ctx)
     {
       return ER_FAILED;
     }
-  if (fetch_peek_dbval (ctx->thread_p, step->regu, ctx->vd, NULL, ctx->obj_oid, ctx->tpl, &peek) != NO_ERROR)
+  if (fetch_peek_dbval (ctx->thread_p, step->regu, ctx->vd, NULL, ctx->obj_oid, ctx->tplrec, &peek) != NO_ERROR)
     {
       return ER_FAILED;
     }
@@ -1338,7 +1338,7 @@ expr_k_leaf_fetch (EXPR_STEP * step, EXPR_EVAL_CTX * ctx)
 {
   DB_VALUE *peek = NULL;
 
-  if (fetch_peek_dbval (ctx->thread_p, step->regu, ctx->vd, NULL, ctx->obj_oid, ctx->tpl, &peek) != NO_ERROR)
+  if (fetch_peek_dbval (ctx->thread_p, step->regu, ctx->vd, NULL, ctx->obj_oid, ctx->tplrec, &peek) != NO_ERROR)
     {
       return ER_FAILED;
     }
@@ -1361,7 +1361,7 @@ expr_k_fallback (EXPR_STEP * step, EXPR_EVAL_CTX * ctx)
 {
   DB_VALUE *peek = NULL;
 
-  if (fetch_peek_dbval (ctx->thread_p, step->regu, ctx->vd, NULL, ctx->obj_oid, ctx->tpl, &peek) != NO_ERROR)
+  if (fetch_peek_dbval (ctx->thread_p, step->regu, ctx->vd, NULL, ctx->obj_oid, ctx->tplrec, &peek) != NO_ERROR)
     {
       return ER_FAILED;
     }
@@ -2967,7 +2967,7 @@ expr_scan_pred_eval (void *compiled, cubthread::entry * thread_p, val_descr * vd
   ctx.thread_p = thread_p;
   ctx.vd = vd;
   ctx.obj_oid = obj_oid;
-  ctx.tpl = NULL;
+  ctx.tplrec = NULL;
   ctx.prog = root->prog;
   if (root->prog != NULL && unlikely (expr_prog_prepare (root->prog, &ctx) != NO_ERROR))
     {
@@ -4632,7 +4632,7 @@ expr_prog_prepare (EXPR_PROG * prog, EXPR_EVAL_CTX * ctx)
 }
 
 int
-expr_prog_eval (EXPR_PROG * prog, cubthread::entry * thread_p, val_descr * vd, OID * obj_oid, QFILE_TUPLE tpl)
+expr_prog_eval (EXPR_PROG * prog, cubthread::entry * thread_p, val_descr * vd, OID * obj_oid, QFILE_TUPLE_RECORD * tplrec)
 {
   EXPR_EVAL_CTX ctx;
   int error;
@@ -4640,7 +4640,7 @@ expr_prog_eval (EXPR_PROG * prog, cubthread::entry * thread_p, val_descr * vd, O
   ctx.thread_p = thread_p;
   ctx.vd = vd;
   ctx.obj_oid = obj_oid;
-  ctx.tpl = tpl;
+  ctx.tplrec = tplrec;
   ctx.prog = prog;
 
   error = expr_prog_prepare (prog, &ctx);
