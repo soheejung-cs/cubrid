@@ -26,6 +26,15 @@
 
 /* No global error state is changed while computing a conversion. All recorded
  * date/time errors have no message arguments; keep their original location. */
+/*
+ * [리뷰] clear — 날짜·시간 변환이 만든 에러 하나(코드·심각도·발생 파일/줄)를 스레드 전역 에러 상태 대신 호출자 스택에 담아 두는 운반체. 변환 체인 전체가 이 포인터 하나를 돌려
+ * 쓰고, 맨 바깥 호출자만 발행한다.
+ * develop: develop 에 없음 — 이 PR 이 신설한 파일/구조체다. develop 에서는 변환 함수가 그 자리에서 바로 `er_set`/`er_clear` 를 불러 스레드 전역 에러
+ * 상태를 썼다.
+ * 이 PR: `set(level,file,line,code,nargs)` 은 `assert(nargs==0)` 하에 네 필드를 기록하고 `touched=true` 로만 표시한다. `clear()`
+ * 는 `code=NO_ERROR; touched=true` 로 '발행 시점에 지워라'를 예약한다. 둘 다 전역 상태를 건드리지 않는다.
+ * 바뀐 것: 신설 +133줄(파일 전체). `set` 의 `nargs==0` assert 가 '여기 모은 날짜 에러는 인자 없는 것뿐'이라는 계약을 코드로 박아 둔 것이다.
+ */
 struct date_conversion_error
 {
   int code = NO_ERROR;
@@ -50,6 +59,13 @@ struct date_conversion_error
     touched = true;
   }
 
+  /*
+   * [리뷰] publish — 쌓아 둔 변환 에러를 스레드 전역 에러 상태로 내보내는 유일한 지점. 레거시 진입점 래퍼와 `tp_value_cast_internal` 만 부른다.
+   * develop: develop 에 없음 — 이 PR 이 신설.
+   * 이 PR: `touched` 가 참일 때만 동작한다: `code != NO_ERROR` 면 기록해 둔 원래 파일·줄로 `er_set (severity,file,line,code,0)`,
+   * `code == NO_ERROR` 면 `er_clear ()`. 손대지 않았으면 전역 상태를 그대로 둔다.
+   * 바뀐 것: 신설. develop 에서 변환 도중 여러 번 일어나던 `er_set`/`er_clear` 가 호출당 최대 한 번의 발행으로 접힌다.
+   */
   void publish () const
   {
     if (touched)

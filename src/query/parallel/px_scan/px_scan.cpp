@@ -1350,6 +1350,15 @@ extern "C"
     return NO_ERROR;
   }
 
+  /*
+   * [리뷰] scan_try_promote_parallel_index_scan — 이미 열려 있는 직렬 인덱스 스캔을 병렬 인덱스 스캔으로 승격할 수 있는지 보고, 가능하면 SCAN_ID 를
+   * isid 에서 pisid 로 바꿔 끼운 뒤 manager 를 만들어 준다.
+   * develop: 승격 직전에 scan_close_scan 으로 직렬 스캔 자원(bt_attr_ids, oid_list, copy_buf 등)을 모두 해제하고 status 를 S_OPENED 로
+   * 되돌렸다 — 키 계획 저장소도 그때 함께 사라졌다.
+   * 이 PR: close 전에 s.isid 의 key_plan·resolved_keys·key_state 를 지역에 빼 두고 s.isid.key_state 를 nullptr 로 만들어 close 가
+   * 해제하지 못하게 한 뒤, close 후 s.pisid 의 같은 세 필드에 되꽂는다. 해제는 병렬 스캔의 close 가 워커 뒤에 한다.
+   * 바뀐 것: +8줄. 실행 전 게이트가 도출해 둔 인덱스 키 계획의 수명이 '직렬 스캔의 것'에서 '병렬 스캔이 워커 뒤에 푸는 것'으로 옮겨졌다.
+   */
   int
   scan_try_promote_parallel_index_scan (THREAD_ENTRY *thread_p, SCAN_ID *scan_id)
   {
@@ -1594,6 +1603,13 @@ extern "C"
 namespace parallel_scan
 {
   template <RESULT_TYPE result_type, SCAN_TYPE ST>
+  /*
+   * [리뷰] manager<result_type, ST>::~manager — 병렬 스캔 매니저의 소멸자 — 워커가 모두 끝난 뒤 이 매니저가 만든 자원(워커용 값 디스크립터 포함)을 푼다.
+   * develop: m_vd->dbval_ptr 배열을 원소마다 pr_clear_value 한 뒤 배열과 VAL_DESCR 을 각각 db_private_free 했다 — VAL_DESCR 이 독립
+   * 할당이었다.
+   * 이 PR: qexec_free_xasl_state (m_thread_p, m_vd->xasl_state) 한 번으로 끝낸다. VAL_DESCR 이 XASL_STATE 안의 멤버가 됐기 때문이다.
+   * 바뀐 것: 해제 11줄 → 1줄. open 의 복제 방식 변경과 짝이다.
+   */
   manager<result_type, ST>::~manager()
   {
     if (m_worker_manager != nullptr)
@@ -1630,6 +1646,16 @@ namespace parallel_scan
   }
 
   template <RESULT_TYPE result_type, SCAN_TYPE ST>
+  /*
+   * [리뷰] manager<result_type, ST>::open — 병렬 스캔을 연다 — 워커가 쓸 XASL 클론과 값 디스크립터를 만들고 입력 핸들러·태스크를 준비해
+   * NO_ERROR/ER_FAILED 를 돌려준다.
+   * develop: VAL_DESCR 을 db_private_alloc 하고 m_orig_vd 를 memcpy 한 뒤, dbval_cnt 만큼 DB_VALUE 배열을 따로 할당해
+   * pr_clone_value 로 바인드 값만 복제했다 — 해결 도메인 상태는 복제 대상에 아예 없었다.
+   * 이 PR: `assert (m_orig_vd == &m_orig_vd->xasl_state->vd)` 로 vd 가 XASL_STATE 의 멤버임을 못박고,
+   * qexec_deep_copy_xasl_state (m_thread_p, m_orig_vd->xasl_state, false) 하나로 바인드 값과 해결 도메인 테이블까지 복제한 뒤 m_vd =
+   * &new_xasl_state->vd 로 받는다.
+   * 바뀐 것: 할당·복제 약 22줄 → 7줄. 워커가 리더와 같은 실행 전 게이트 결과를 보게 되는 지점이다.
+   */
   int manager<result_type, ST>::open()
   {
     int h;
@@ -1820,6 +1846,16 @@ namespace parallel_scan
   }
 
   template <RESULT_TYPE result_type, SCAN_TYPE ST>
+  /*
+   * [리뷰] manager<result_type, ST>::next — 병렬 스캔에서 다음 행(또는 집계 결과)을 꺼내 SCAN_CODE 를 돌려준다 — 상위 스캔 루프가 행마다 부른다.
+   * develop: fetch_val_list 뒤, m_g_agg_domain_resolve_need 이면 scan_code 와 무관하게
+   * qexec_resolve_domains_for_aggregation_for_parallel_heap_scan_g_agg 를 불러(반환값 없음) 집계 누적기 도메인을 첫 값으로 해결했고, 해결되면
+   * qdata_link_shared_accumulators 로 공유 누적기를 연결했다.
+   * 이 PR: `&& scan_code == S_SUCCESS` 조건이 붙어 행이 실제로 나왔을 때만 돌고, 호출이 qexec_parallel_aggregate_first_values 로 바뀌어
+   * 에러를 반환하며, 에러면 scan_code = S_ERROR 로 만든다. 연결 조건 자체는 그대로다.
+   * 바뀐 것: +8/-6. 이름이 '도메인 해결'에서 '첫 값이 아직 정해야 하는 것'으로 바뀐 것은, 도메인은 이미 실행 전 게이트가 정했고 여기 남은 것은 값뿐이라는 뜻이다. 에러가 삼켜지던
+   * 경로가 막혔다.
+   */
   SCAN_CODE manager<result_type, ST>::next()
   {
     SCAN_CODE scan_code = S_SUCCESS;
@@ -2060,6 +2096,13 @@ namespace parallel_scan
   }
 
   template <RESULT_TYPE result_type, SCAN_TYPE ST>
+  /*
+   * [리뷰] manager<result_type, ST>::reset — 스캔 블록이 다시 열릴 때(상관 서브질의 재실행 등) 매니저를 초기 상태로 되돌린다 — 이전 값 디스크립터를 버리고
+   * NO_ERROR/ER_FAILED 를 돌려준다.
+   * develop: 소멸자와 똑같은 수작업 해제 11줄(dbval_ptr 원소별 pr_clear_value → 배열 free → VAL_DESCR free)로 m_vd 를 버렸다.
+   * 이 PR: qexec_free_xasl_state (m_thread_p, m_vd->xasl_state) 한 줄로 바뀌었다.
+   * 바뀐 것: -11/+1. 소멸자와 같은 교체로, 세 곳(소멸자·open·reset)의 vd 수명 관리가 XASL_STATE 한 묶음으로 통일됐다.
+   */
   int manager<result_type, ST>::reset ()
   {
     int err_code = NO_ERROR;

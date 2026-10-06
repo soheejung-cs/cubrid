@@ -295,6 +295,17 @@ REGU_VARIABLE_GET_TYPE (const regu_variable_node *regu)
 
 /* A variable POS: a host variable position whose domain the compiler left VARIABLE. The execution takes its domain
  * from the bound value before its first row. */
+/*
+ * [리뷰] regu_is_variable_pos — regu 노드 하나가 '호스트 변수 위치인데 컴파일러가 도메인을 VARIABLE 로 남긴 것'인지 판정하는 인라인 술어.
+ * 로드(stx_build_regu_variable)와 실행 전 게이트가 불러 bool 을 돌려준다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에는 같은 판정이 없고, regu 는 original_domain 에 컴파일 도메인 사본을 들고 실행 중에
+ * domain 을 덮어썼다.
+ * 이 PR: type==TYPE_POS_VALUE && domain!=NULL && TP_DOMAIN_TYPE(domain)==DB_TYPE_VARIABLE 이면 true. 로드가 '이 스트림에
+ * 늦은 바인딩이 있다'를 표시하는 데(stx_index_stream_rejected) 쓰고, 실행은 이 regu 를 DOMAIN_PLAN 이 도메인을 줄 때까지 fast peek 대상에서 뺀다.
+ * 바뀐 것: 신설 — 헤더에 inline 선언(L262) + 정의(+8줄). 같은 헤더에서 regu_variable_node::original_domain /
+ * arith_list_node::original_domain 이 domain_plan_item *plan_item 으로 교체되고, FETCH_ALL_CONST·FETCH_NOT_CONST 플래그가
+ * 삭제되고 REGU_VARIABLE_VARIABLE_DOMAIN(0x8000)이 추가됐다.
+ */
 bool
 regu_is_variable_pos (const regu_variable_node *regu)
 {

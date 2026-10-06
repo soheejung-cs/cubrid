@@ -543,6 +543,15 @@ struct hash_scan_key_plan
  * (scan_plan_list_scan_domains: the resolved domain or a load-fixed domain). Any other key gives the domain the plan
  * gives it, a key over a session variable read too.
  */
+/*
+ * [리뷰] qdata_hscan_key_value_domain — qdata_plan_hscan_keys 가 build 쪽 키 regu 의 "값이 실제로 들고 올 도메인"을 알아내려고 부르는 보조
+ * 함수 — TYPE_CONSTANT 키면 같은 dbval 을 채우는 producer(TYPE_POSITION)를 찾아 그 위치의 실행 도메인을, 아니면 그 키의 소비자 도메인을 돌려준다(없으면
+ * NULL).
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 은 build 쪽 producer 를 역추적하지 않고 행마다 probe regu 타입과 값 타입을 비교했을 뿐이다.
+ * 이 PR: producers 리스트를 훑어 vfetch_to 가 키의 dbvalptr 와 같은 TYPE_POSITION 을 찾고, 그 pos_descr 의 실행 도메인을 돌려준다. 못 찾으면
+ * qexec_consumer_domain 결과를 돌려주고, NULL 이면 호출자가 미해결 에러로 만든다.
+ * 바뀐 것: 신규 16줄. 키 플랜을 만들기 위한 도메인 출처 결정이 여기로 모였다.
+ */
 static const TP_DOMAIN *
 qdata_hscan_key_value_domain (const VAL_DESCR * vd, const REGU_VARIABLE * key, REGU_VARIABLE_LIST producers)
 {
@@ -572,6 +581,18 @@ qdata_hscan_key_value_domain (const VAL_DESCR * vd, const REGU_VARIABLE * key, R
  * (tp_value_coerce, ER_TP_CANT_COERCE when that fails). The probe key's domain is the one the scan reads: the
  * compiled domain, or the resolved domain once the node was computed in this execution; check_hash_list_scan reads
  * the same. The values' type is the plan's, so each key's choice is made here, once.
+ */
+/*
+ * [리뷰] qdata_plan_hscan_keys — scan_build_hash_list_scan 이 해시 리스트 스캔을 열 때 한 번 부르는 실행 전 게이트 — 키마다 (규칙, 변환기, 목표
+ * 도메인, 원본 타입)을 담은 HASH_SCAN_KEY_PLAN 을 db_private_alloc 로 만들어 hlsid->key_plan 에 달고 NO_ERROR 를 돌려준다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에는 키 플랜이라는 자료구조 자체가 없었고 변환 여부는 행마다 결정됐다.
+ * 이 PR: 키마다 target = probe 의 실행 도메인(qexec_get_node_domain), source = build 값의 도메인 타입을 구해 HASH_SCAN_KEY_COPY /
+ * CONVERT / COERCE / FAIL 중 하나로 확정한다. CONVERT 면 tp_value_find_converter (source, target,
+ * DOMAIN_CONVERT_IMPLICIT) 로 함수 포인터까지 미리 박아 둔다. target 이 NULL 이거나 DB_TYPE_VARIABLE 이면 FAIL, build 쪽 도메인이 없으면
+ * qexec_domain_unresolved.
+ * 바뀐 것: 신규 59줄. 소유권은 hlsid->key_plan 대입 직후 스캔으로 넘어가 에러 반환 경로에서도 scan_close_scan 이 해제한다(주석에 명시) — 하네스의
+ * alloc-free=+1 은 이 위임에서 나온 오탐이다.
+ * [지적 C9-04]
  */
 int
 qdata_plan_hscan_keys (THREAD_ENTRY * thread_p, const VAL_DESCR * vd, HASH_LIST_SCAN * hlsid,
@@ -633,6 +654,13 @@ qdata_plan_hscan_keys (THREAD_ENTRY * thread_p, const VAL_DESCR * vd, HASH_LIST_
   return NO_ERROR;
 }
 
+/*
+ * [리뷰] qdata_free_hscan_key_plan — scan_close_scan 이 해시 리스트 스캔을 닫을 때 부르는 해제 함수 — hlsid->key_plan 블록을
+ * db_private_free_and_init 로 풀고 포인터를 NULL 로 만든다.
+ * develop: develop 에 없음 — 이 PR 이 신설(해제할 키 플랜이 없었다).
+ * 이 PR: NULL 검사 뒤 해제·NULL 화뿐이라 같은 스캔이 여러 번 닫혀도 안전하다. qdata_plan_hscan_keys 의 alloc 과 짝을 이룬다.
+ * 바뀐 것: 신규 8줄.
+ */
 void
 qdata_free_hscan_key_plan (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hlsid)
 {
@@ -645,6 +673,14 @@ qdata_free_hscan_key_plan (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hlsid)
 #if !defined (NDEBUG)
 /* The debug cross-check of a resolved build key conversion: tp_value_coerce gives the same outcome and, where it
  * converts, a value of the same type that hashes alike. */
+/*
+ * [리뷰] qdata_check_hscan_key_convert — 디버그 빌드에서만 도는 교차검증 — 플랜이 고른 변환 결과가 develop 식 tp_value_coerce 결과와 같은
+ * 성공/실패, 같은 타입, 같은 해시값인지 assert 한다. qdata_copy_hscan_key_without_alloc 이 CONVERT·FAIL 규칙에서 부른다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에는 플랜이 없어 대조할 기준 자체가 없었다.
+ * 이 PR: expected 에 tp_value_coerce (value, &expected, target) 결과를 받아 status 와 비교하고, 둘 다 성공이면 타입과
+ * mht_get_hash_number 까지 같은지 본다. 호출 측은 #if !defined (NDEBUG) 로 감싼다.
+ * 바뀐 것: 신규 15줄. 릴리스 빌드에는 들어가지 않는다.
+ */
 static void
 qdata_check_hscan_key_convert (const DB_VALUE * value, const TP_DOMAIN * target, TP_DOMAIN_STATUS status,
 			       const DB_VALUE * converted)
@@ -670,6 +706,19 @@ qdata_check_hscan_key_convert (const DB_VALUE * value, const TP_DOMAIN * target,
  *   key(in): the build row's key
  *   plan(in): the scan's key plan (qdata_plan_hscan_keys)
  *   new_key(in/out): the scan's key with values of its own
+ */
+/*
+ * [리뷰] qdata_copy_hscan_key_without_alloc — 해시 리스트 스캔의 probe 단계에서 행마다 부르는 키 복사기 — build 쪽 키 값을 probe 키 도메인에 맞춰
+ * new_key 에 채워 돌려준다(실패 시 NULL).
+ * develop: 인자로 probe_regu_list 를 받아 행마다 키 i 에 대해 REGU_VARIABLE_GET_TYPE (&probe_regu_list->value) 와
+ * DB_VALUE_DOMAIN_TYPE (key->values[i]) 를 비교하고, 다르면 tp_value_coerce, 같으면 pr_clone_value 했다. 즉 타입 판정과 coercion
+ * 선택이 행마다 반복됐다.
+ * 이 PR: 인자가 const HASH_SCAN_KEY_PLAN * plan 으로 바뀌어, 행은 plan->key[i].rule 을 읽어 COPY / CONVERT(미리 찾아둔 conv 로
+ * tp_value_convert) / COERCE / FAIL 로 분기만 한다. NULL 값은 규칙과 무관하게 COPY 로 처리하고, 디버그 빌드는
+ * qdata_check_hscan_key_convert 로 결과를 대조한다. 실패 에러 메시지는 값 타입과 target 도메인 타입으로 만든다.
+ * 바뀐 것: 시그니처 변경(REGU_VARIABLE_LIST → const HASH_SCAN_KEY_PLAN *) + 행별 타입 판정 삭제와 규칙 switch 도입(약 -24/+39줄). 이 PR
+ * 의 "행은 읽기만" 이 적용된 자리다.
+ * [지적 X2-03]
  */
 HASH_SCAN_KEY *
 qdata_copy_hscan_key_without_alloc (cubthread::entry * thread_p, HASH_SCAN_KEY * key, const HASH_SCAN_KEY_PLAN * plan,

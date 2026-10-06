@@ -301,6 +301,14 @@ scan_init_iss (INDX_SCAN_ID * isidp)
  * oid_list (in)     : OID list.
  * mvcc_snapshot(in) : MVCC snapshot
  */
+/*
+ * [리뷰] scan_init_index_scan — INDX_SCAN_ID 를 스캔 열기 전에 0 상태로 만드는 초기화. scan_open_index_scan 과 PX 인덱스 스캔 워커가 부르고
+ * 반환값은 없다.
+ * develop: isidp->prebuilt_midxkey_domains = NULL 로, 키 범위마다 실행 중에 만들어 캐시하던 MIDXKEY 도메인 배열 포인터를 비웠다.
+ * 이 PR: 그 필드가 사라지고 key_plan(로드가 도출한 인덱스 키 플랜) / resolved_keys(이번 실행의 해소 결과) / key_state(스캔이 open 에서 잡는 작업 메모리)
+ * 세 개를 NULL 로 둔다.
+ * 바뀐 것: 필드 1개 → 3개 교체(-1/+3줄). 자료구조 교체 — '실행 중 도메인 캐시'가 '열기 전 게이트가 채우는 슬롯'으로 바뀐 자리.
+ */
 void
 scan_init_index_scan (INDX_SCAN_ID * isidp, struct btree_iscan_oid_list *oid_list, MVCC_SNAPSHOT * mvcc_snapshot)
 {
@@ -358,6 +366,14 @@ enum SCAN_KEY_CHOICE
 
 /* What the B-tree's comparisons of an index scan's search key values read; NONE for a B-tree search outside a query
  * plan (an index scan identifier without a key plan). */
+/*
+ * [리뷰] scan_index_search_keys — 이 인덱스 스캔의 탐색 키 값들을 B-tree 가 무엇을 읽어 비교해야 하는지(BTID_INT.search_keys)를 돌려주는 접근자.
+ * btree_prepare_bts·scan_get_index_oidset·PX 키범위 변환이 부른다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에는 search_keys 개념 자체가 없고 B-tree 는 언제나 값의 실제 도메인으로 비교했다.
+ * 이 PR: key_plan 이 없으면(질의 플랜 밖의 B-tree 탐색) NONE, key_state 가 없으면(저장소가 필요 없는 단일 컬럼 키) OWN, 있으면 open 때 정해 둔
+ * state->search_keys(OWN 또는 OTHER)를 돌려준다.
+ * 바뀐 것: 신설(+13줄). 실행 전 게이트가 정한 한 번의 결정을 행 처리 경로가 읽기만 하게 하는 접근자.
+ */
 DOMAIN_SEARCH_KEYS
 scan_index_search_keys (const INDX_SCAN_ID * isidp)
 {
@@ -372,6 +388,14 @@ scan_index_search_keys (const INDX_SCAN_ID * isidp)
 /* How the B-tree compares an index scan's search key values: the scan's choice at open
  * (scan_open_index_key_plan); RESOLVED without a key plan - the type and collation checks btree_compare_key_with
  * makes. */
+/*
+ * [리뷰] scan_index_search_compare — 이 인덱스 스캔의 탐색 키를 B-tree 가 어떤 방식으로 인덱스 키와 비교할지(BTID_INT.search_compare)를 돌려주는
+ * 접근자. btree_prepare_bts 가 BTID_INT 에 심는다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 의 btree_compare_key 는 매번 타입·콜레이션 검사를 거쳤다.
+ * 이 PR: key_plan 이 없으면 RESOLVED(기존과 같은 전수 검사), key_state 가 없으면 DIRECT(컬럼의 cmpval 직행), 있으면 open 때 고른 RESOLVED /
+ * MIDXKEY_PLAIN / DIRECT 중 하나.
+ * 바뀐 것: 신설(+13줄). 행마다 하던 타입·콜레이션 판정을 스캔당 1회 결정으로 올린 지점.
+ */
 BTREE_SEARCH_COMPARE
 scan_index_search_compare (const INDX_SCAN_ID * isidp)
 {
@@ -385,6 +409,15 @@ scan_index_search_compare (const INDX_SCAN_ID * isidp)
 
 /* The unresolved-domain check (execution) of an index scan's key plan: optdebug stops,
  * release raises ER_QPROC_DOMAIN_UNRESOLVED. */
+/*
+ * [리뷰] scan_key_plan_unresolved — 인덱스 스캔의 키 플랜이 해소하지 못한 도메인을 만났을 때의 단일 실패 출구. 같은 파일의
+ * scan_open_index_key_plan·scan_key_column·scan_key_single_column·scan_regu_key_to_index_key·scan_dbvals_to_midxkey
+ * 가 부르고 ER_QPROC_DOMAIN_UNRESOLVED 를 돌려준다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에는 미해소 도메인이라는 판정 자체가 없고 실행 중에 tp_domain_resolve_value 로 그때그때 도메인을
+ * 만들었다.
+ * 이 PR: domain_unresolved_error("", -1, key_type 의 타입) 한 줄로 위임한다 — optdebug 빌드는 멈추고 release 는 에러를 올린다.
+ * 바뀐 것: 신설(+5줄). 모든 미해소 경로가 한 함수를 지나게 묶은 관문.
+ */
 static int
 scan_key_plan_unresolved (const TP_DOMAIN * key_type)
 {
@@ -393,6 +426,15 @@ scan_key_plan_unresolved (const TP_DOMAIN * key_type)
 
 /* Releases an index scan's key plan storage: at scan close, or at the XASL clear of a scan torn down without
  * one. */
+/*
+ * [리뷰] scan_close_index_key_plan — 인덱스 스캔이 open 에서 잡은 키 플랜 작업 메모리를 돌려준다. scan_close_scan, scan_open_index_scan
+ * 의 실패 경로, 그리고 스캔을 열지 못한 채 치워지는 qexec_clear_access_spec_list 가 부른다.
+ * develop: develop 에 없음 — 이 PR 이 신설. 같은 일을 scan_close_scan 안의 인라인 루프가 했다: prebuilt_midxkey_domains[i] 마다
+ * tp_domain_free 로 전역 도메인 캐시에 돌려주고 배열을 db_private_free.
+ * 이 PR: key_state 가 있으면 n_columns 개의 strict 변환값을 pr_clear_value 한 뒤 블록 하나를 db_private_free_and_init 하고,
+ * key_plan·resolved_keys 포인터를 NULL 로 되돌린다. 전역 도메인 캐시는 건드리지 않는다.
+ * 바뀐 것: 신설(+14줄), scan_close_scan 의 인라인 해제 루프(-14줄)를 흡수. 해제 대상이 '캐시된 TP_DOMAIN 여러 개'에서 '스레드 사유 블록 1개'로 바뀌었다.
+ */
 void
 scan_close_index_key_plan (THREAD_ENTRY * thread_p, INDX_SCAN_ID * isidp)
 {
@@ -417,6 +459,18 @@ scan_close_index_key_plan (THREAD_ENTRY * thread_p, INDX_SCAN_ID * isidp)
  * unresolved-domain check (execution). The scan's storage is made once here for every range it builds, and the B-tree's
  * comparison of its search key values is chosen here. A single-column key whose values all have the column's key needs
  * no storage, whatever resolve_domains resolved for it: it takes its values as they are.
+ */
+/*
+ * [리뷰] scan_open_index_key_plan — 이 PR 의 인덱스 스캔 쪽 실행 전 게이트. scan_open_index_scan 이 루트 페이지를 unfix 한 직후 한 번 불러,
+ * 로드가 만든 indx_info->key_plan 과 이번 실행의 resolved_domain 을 맞춰 스캔의 비교 방식과 작업 메모리를 확정한다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서 이 자리의 일은 없었고, 대신 범위를 만들 때마다 scan_dbvals_to_midxkey 가 값 도메인을
+ * tp_domain_resolve_value/tp_domain_copy/tp_domain_cache 로 만들어 prebuilt_midxkey_domains 에 캐시했다.
+ * 이 PR: 먼저 scan_close_index_key_plan 으로 재진입을 정리하고, plan 이 없거나 plan->key_type 이 실제 B-tree 루트의 key_type 과
+ * TP_EXACT_MATCH 가 아니면 미해소로 거절한다. resolved_keys_index>=0 이면 vd->xasl_state->resolved_domain 의 해당 인덱스 항목을 집어
+ * other_keys 를 거기서 다시 읽는다. 단일 컬럼이고 other_keys 가 아니면 저장소 없이 반환(디버그에서 STRICT 규칙이 없음을 단언)하고, 아니면 scan_key_state +
+ * chains + converted + values + domains + choices + last 를 한 번의 db_private_alloc 으로 잡아 오프셋 배치하고
+ * search_keys·search_compare 를 확정한다.
+ * 바뀐 것: 신설(+90줄). 행마다 하던 도메인 생성·캐시를 스캔당 1회 할당 + 1회 결정으로 올린 핵심 함수.
  */
 static int
 scan_open_index_key_plan (THREAD_ENTRY * thread_p, INDX_SCAN_ID * isidp, const INDX_INFO * indx_info,
@@ -588,6 +642,14 @@ scan_restore_range_details (ISS_RANGE_DETAILS * rdp_src, INDX_SCAN_ID * isidp_de
  * inside isidp->iss.dbval, fill in slot 0 of the real range ([C1=?]) with
  * that new value, and restore the real range as if it were ready to be used
  * for the first time.
+ */
+/*
+ * [리뷰] scan_get_next_iss_value — 인덱스 스킵 스캔에서 첫 컬럼의 '다음 서로 다른 값'을 B-tree 에서 한 번 읽어, 그 값을 건너뛸 범위(iss_range)의 상수
+ * regu 에 심는다. scan_get_index_oidset 이 부르고 SCAN_CODE 를 돌려준다.
+ * develop: 값을 심을 때 key1·key2 두 곳에서 regu->type = TYPE_DBVAL 과 함께 regu->domain = tp_domain_resolve_default
+ * (DB_VALUE_DOMAIN_TYPE (last_key)) 로 **실행 중에 컴파일된 regu 의 도메인을 그 값의 기본 도메인으로 덮어썼다**.
+ * 이 PR: 타입만 TYPE_DBVAL 로 두고 도메인은 손대지 않는다. 이 값이 어떤 도메인으로 키에 쓰일지는 키 플랜이 첫 인덱스 컬럼의 규칙으로 정한다.
+ * 바뀐 것: 도메인 대입 2줄 삭제(-2), 설명 주석 1줄 추가. '행 처리 경로는 컴파일 노드를 쓰지 않는다'는 이 PR 의 불변을 지키는 변경.
  */
 static SCAN_CODE
 scan_get_next_iss_value (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, INDX_SCAN_ID * isidp)
@@ -872,6 +934,14 @@ scan_init_scan_attrs (SCAN_ATTRS * scan_attrs_p, int num_attrs, ATTR_ID * attr_i
  * max_key_len(in): the maximum key length
  * indx_cov(in/out): index coverage data
  */
+/*
+ * [리뷰] scan_init_indx_coverage — 커버링 인덱스 스캔이 결과를 담을 임시 리스트 파일과 그 타입 리스트·튜플 레코드를 만든다. scan_open_index_scan 이
+ * 부르고 NO_ERROR/에러를 돌려준다.
+ * develop: qdata_get_valptr_type_list (thread_p, output_val_list, indx_cov->type_list) — 타입 리스트를 regu 의 컴파일
+ * 도메인에서 만들었다.
+ * 이 PR: 같은 호출에 vd 를 넘겨, 노드가 이번 실행에서 가진 도메인(qexec_get_node_domain)으로 타입 리스트를 만든다.
+ * 바뀐 것: 호출 인자 1개 추가(±1줄). 커버링 리스트의 컬럼 도메인이 실행 도메인을 따라가게 한 변경.
+ */
 static int
 scan_init_indx_coverage (THREAD_ENTRY * thread_p, int coverage_enabled, valptr_list_node * output_val_list,
 			 regu_variable_list_node * regu_val_list, VAL_DESCR * vd, QUERY_ID query_id, int max_key_len,
@@ -1063,6 +1133,14 @@ scan_fetch_and_coerce_key_limit_lower (THREAD_ENTRY * thread_p, INDX_SCAN_ID * i
  *   Positive NUMERIC overflows fall through (return NO_ERROR); the caller then
  *   handles the positive case (adopt left, leftmost sign-clamp, etc.).
  */
+/*
+ * [리뷰] scan_check_user_given_keylimit_overflow — 사용자가 준 KEYLIMIT 의 NUMERIC 피연산자가 BIGINT 범위를 넘는지 보고 넘으면
+ * isidp->key_limit_upper 를 직접 정리한다. scan_handle_overflow_subtraction_upper 가 부른다.
+ * develop: assert (TP_DOMAIN_TYPE (numeric_operand->domain) == DB_TYPE_NUMERIC) — regu 의 컴파일 도메인을 단언했다.
+ * 이 PR: assert (TP_DOMAIN_TYPE (qexec_get_node_domain (vd, numeric_operand->domain,
+ * numeric_operand->plan_item)) == DB_TYPE_NUMERIC) — 이번 실행에서 그 노드가 실제로 가진 도메인을 단언한다.
+ * 바뀐 것: 단언 한 줄의 도메인 읽기 경로 교체(±2줄). 콜드패스(단언)지만 '도메인은 노드가 아니라 실행에서 읽는다'는 규약을 맞춘 것.
+ */
 static int
 scan_check_user_given_keylimit_overflow (THREAD_ENTRY * thread_p, REGU_VARIABLE * numeric_operand, VAL_DESCR * vd)
 {
@@ -1159,6 +1237,14 @@ scan_handle_it_data_overflow_upper (THREAD_ENTRY * thread_p, INDX_SCAN_ID * isid
  *            - right=INARITH[bigint]
  *   When merged with a user-given KEYLIMIT, case2 / case4 reject a negative NUMERIC
  *   on the right side (see scan_check_user_given_keylimit_overflow ()).
+ */
+/*
+ * [리뷰] scan_handle_overflow_subtraction_upper — KEYLIMIT 상한이 'a - b' 뺄셈이고 그 계산이 넘칠 때 상한을 안전한 값으로 다시 계산한다.
+ * scan_fetch_and_coerce_key_limit_upper 가 부른다.
+ * develop: left_is_numeric = (TP_DOMAIN_TYPE (left->domain) == DB_TYPE_NUMERIC) — 왼쪽 피연산자의 컴파일 도메인으로 NUMERIC
+ * 여부를 판정했다.
+ * 이 PR: qexec_get_node_domain (vd, left->domain, left->plan_item) 으로 실행 도메인을 읽어 같은 판정을 한다.
+ * 바뀐 것: 판정 1줄 교체(±1줄). 호스트 변수로 바인딩된 피연산자의 실제 타입이 반영된다.
  */
 static int
 scan_handle_overflow_subtraction_upper (THREAD_ENTRY * thread_p, INDX_SCAN_ID * isidp, REGU_VARIABLE * key_limit_u,
@@ -1321,6 +1407,15 @@ scan_handle_overflow_subtraction_upper (THREAD_ENTRY * thread_p, INDX_SCAN_ID * 
  * In both cases the sign of the NUMERIC value determines the result:
  *   positive overflow → no upper bound (-1), negative overflow → no rows match (0).
  */
+/*
+ * [리뷰] scan_fetch_and_coerce_key_limit_upper — KEYLIMIT 상한 regu 를 fetch 해 BIGINT 로 변환해 호출자에게 돌려준다(오버플로면 isidp
+ * 에 직접 상한을 쓰고 *out_dbvalp=NULL). scan_init_index_key_limit 이 부른다.
+ * develop: tp_value_coerce (*out_dbvalp, *out_dbvalp, domainp) — fetch_peek 로 받은 값을 **제자리에서** BIGINT 로 변환했다. 그
+ * 값이 다른 곳과 공유되지 않는다는 가정이었다.
+ * 이 PR: 호출자가 스택에 준 coerced 버퍼로 변환하고 *out_dbvalp = coerced 로 바꿔 돌려준다. peek 한 원본은 그대로 둔다.
+ * 바뀐 것: 시그니처에 DB_VALUE *coerced 매개변수 추가, in-place → out-of-place 변환(+3/-1줄). 바인드 값이 resolve_domains 의 값 배열로 여러
+ * 독자에게 공유되기 때문에 필요해진 변경.
+ */
 static int
 scan_fetch_and_coerce_key_limit_upper (THREAD_ENTRY * thread_p, INDX_SCAN_ID * isidp, REGU_VARIABLE * key_limit_u,
 				       VAL_DESCR * vd, DB_VALUE * coerced, DB_VALUE ** out_dbvalp,
@@ -1412,6 +1507,15 @@ scan_fetch_and_coerce_key_limit_upper (THREAD_ENTRY * thread_p, INDX_SCAN_ID * i
 /*
  * scan_init_index_key_limit () - initialize/reset index key limits
  *   return: error code
+ */
+/*
+ * [리뷰] scan_init_index_key_limit — 인덱스 스캔의 상·하한 KEYLIMIT 를 이번 스캔용으로 확정해 isidp->key_limit_lower/upper 에 넣는다.
+ * scan_open_index_scan 이 키 플랜을 연 직후 부른다.
+ * develop: scan_fetch_and_coerce_key_limit_upper (thread_p, isidp, key_limit_u, vd, &dbvalp, is_user_given) 로
+ * 호출했고, 변환은 피호출자가 peek 값 위에서 했다.
+ * 이 PR: 스택에 DB_VALUE coerced 를 두고 db_make_null 한 뒤 그 주소를 함께 넘긴다. 변환 결과는 이 지역 변수에 담기고 dbvalp 가 그것을 가리킨다(BIGINT
+ * 라 별도 해제 불필요).
+ * 바뀐 것: 지역 변수 1개와 호출 인자 1개 추가(+3줄). 나머지 상·하한 보정 로직은 그대로.
  */
 static int
 scan_init_index_key_limit (THREAD_ENTRY * thread_p, INDX_SCAN_ID * isidp, KEY_INFO * key_infop, VAL_DESCR * vd)
@@ -1711,6 +1815,17 @@ range_to_rop (ROP_TYPE * left, ROP_TYPE * right, RANGE range)
  *   num_index_term(in):
  *   return:
  */
+/*
+ * [리뷰] scan_key_compare — 두 탐색 키 값의 순서를 판정하는 이 파일의 유일한 비교 진입점.
+ * compare_val_op·eliminate_duplicated_keys·check_key_vals 의 정렬 비교자·scan_regu_key_to_index_key 가 부르고
+ * DB_LT/EQ/GT/UNK 를 돌려준다.
+ * develop: NULL 처리 뒤, MIDXKEY 면 pr_midxkey_compare(...)로, 아니면 tp_value_compare(val1,val2,1,1) 로 비교했다 — 어느 경우든
+ * 값의 실제 도메인끼리 그때그때 비교.
+ * 이 PR: DOMAIN_SEARCH_KEYS 매개변수를 받아, OTHER 이면 MIDXKEY 는 pr_midxkey_compare_resolved 에
+ * domain_search_key_compare_other 원소 비교자를 넘기고, 단일 값은 두 값의 도메인이 다를 때 domain_search_key_compare_other 를 직접 쓴다(변환
+ * 실패 시 er_clear). 그 밖에는 tp_value_compare 를 쓰며, 디버그에서 '도메인이 서로 다르지 않음'을 단언한다.
+ * 바뀐 것: 시그니처에 DOMAIN_SEARCH_KEYS 추가, 비교 함수 교체 + 분기 1개 신설(+20/-3줄). 비교 규칙이 값에서 읽히는 것에서 플랜이 정한 것으로 옮겨졌다.
+ */
 static int
 scan_key_compare (DB_VALUE * val1, DB_VALUE * val2, int num_index_term, DOMAIN_SEARCH_KEYS search_keys)
 {
@@ -1782,6 +1897,14 @@ scan_key_compare (DB_VALUE * val1, DB_VALUE * val2, int num_index_term, DOMAIN_S
  *   val2(in):
  *   op2(in):
  *   num_index_term(in):
+ */
+/*
+ * [리뷰] compare_val_op — 범위 경계 두 개를 연산자(ROP_TYPE)까지 함께 보고 ROP_EQ/LT/GT/NA 로 답한다. merge_key_ranges 가 범위 병합 가능
+ * 여부를 볼 때 부른다.
+ * develop: compare_val_op(val1,op1,val2,op2,num_index_term) 로 scan_key_compare(val1,val2,num_index_term) 을
+ * 호출했다.
+ * 이 PR: DOMAIN_SEARCH_KEYS 를 받아 그대로 scan_key_compare 에 전달한다. 무한대 경계 처리 등 나머지 논리는 그대로.
+ * 바뀐 것: 시그니처에 매개변수 1개 추가 + 전달(±3줄). 비교 규칙을 호출 체인 끝까지 내려보내기 위한 배관.
  */
 static ROP_TYPE
 compare_val_op (DB_VALUE * val1, ROP_TYPE op1, DB_VALUE * val2, ROP_TYPE op2, int num_index_term,
@@ -1861,6 +1984,13 @@ compare_val_op (DB_VALUE * val1, ROP_TYPE op1, DB_VALUE * val2, ROP_TYPE op2, in
  *   key_vals (in): pointer to array of KEY_VAL_RANGE structure
  *   key_cnt (in): number of keys; size of key_vals
  */
+/*
+ * [리뷰] eliminate_duplicated_keys — 정렬된 키 목록(R_KEYLIST)에서 같은 키를 제거하고 남은 개수를 돌려준다. check_key_vals 가 함수 포인터로 부른다.
+ * develop: tp_value_compare (&curp->key1, &nextp->key1, 1, 1) == DB_EQ 로 중복을 판정했다 — 값 도메인 그대로의 비교.
+ * 이 PR: scan_key_compare (&curp->key1, &nextp->key1, -1, search_keys) == DB_EQ 로 판정한다. -1 은
+ * pr_midxkey_compare_resolved 에서 '전 컬럼'(last = ncolumns)을 뜻하므로 다중 컬럼 키도 전 컬럼 비교이고, 다만 비교 규칙은 플랜이 정한 쪽을 따른다.
+ * 바뀐 것: 시그니처에 DOMAIN_SEARCH_KEYS 추가, 비교 호출 1곳 교체(±2줄).
+ */
 static int
 eliminate_duplicated_keys (KEY_VAL_RANGE * key_vals, int key_cnt, DOMAIN_SEARCH_KEYS search_keys)
 {
@@ -1896,6 +2026,12 @@ eliminate_duplicated_keys (KEY_VAL_RANGE * key_vals, int key_cnt, DOMAIN_SEARCH_
  *   return: number of keys, -1 for error
  *   key_vals (in): pointer to array of KEY_VAL_RANGE structure
  *   key_cnt (in): number of keys; size of key_vals
+ */
+/*
+ * [리뷰] merge_key_ranges — 정렬된 범위 목록(R_RANGELIST)에서 겹치거나 맞닿는 범위를 합치고 남은 개수를 돌려준다. check_key_vals 가 함수 포인터로 부른다.
+ * develop: compare_val_op 를 네 번(상한-하한, 하한-상한, 하한끼리, 상한끼리) 부르며 각각 num_index_term 만 넘겼다.
+ * 이 PR: 같은 네 호출에 search_keys 를 함께 넘긴다. 병합 판정 논리 자체는 그대로.
+ * 바뀐 것: 시그니처에 매개변수 1개 추가 + 호출 4곳 전달(±5줄).
  */
 static int
 merge_key_ranges (KEY_VAL_RANGE * key_vals, int key_cnt, DOMAIN_SEARCH_KEYS search_keys)
@@ -2017,6 +2153,16 @@ merge_key_ranges (KEY_VAL_RANGE * key_vals, int key_cnt, DOMAIN_SEARCH_KEYS sear
  *   key_cnt (in): number of keys; size of key_vals
  *   chk_fn (in): check function for key_vals
  */
+/*
+ * [리뷰] check_key_vals — 키 범위 배열을 키 값 순으로 정렬한 뒤 중복 제거/병합 함수를 적용하고 남은 개수를 돌려준다. scan_get_index_oidset 과
+ * scan_dedup_or_merge_key_ranges 가 부른다.
+ * develop: qsort (key_vals, key_cnt, sizeof(KEY_VAL_RANGE), key_val_compare) 로 정렬했다. key_val_compare 는 파일 정적
+ * 비교 함수로, 비교에 필요한 맥락을 인자로 받을 수 없어 scan_key_compare 를 고정 규칙으로 불렀다.
+ * 이 PR: std::stable_sort 와 search_keys 를 캡처한 람다로 정렬한다 — 비교자가 맥락을 스스로 들고 다니므로 thread-local 이 필요 없고, 같은 키 값들의
+ * 순서가 안정적으로 유지된다. 정렬 뒤 (*key_val_fn)(key_vals, key_cnt, search_keys) 로 넘긴다.
+ * 바뀐 것: 시그니처에 DOMAIN_SEARCH_KEYS 추가, qsort → std::stable_sort + 람다(+11/-1줄), 동반해 key_val_compare 전역 비교 함수
+ * 삭제(-16줄). <algorithm>·<climits> include 추가.
+ */
 static int
 check_key_vals (KEY_VAL_RANGE * key_vals, int key_cnt, QPROC_KEY_VAL_FU * key_val_fn, DOMAIN_SEARCH_KEYS search_keys)
 {
@@ -2041,6 +2187,14 @@ check_key_vals (KEY_VAL_RANGE * key_vals, int key_cnt, QPROC_KEY_VAL_FU * key_va
 }
 
 /* shared with parallel index scan: same dedup/merge serial path runs in scan_open_index_scan. */
+/*
+ * [리뷰] scan_dedup_or_merge_key_ranges — 범위 타입에 따라 중복 제거(R_KEYLIST)나 병합(R_RANGELIST)을 고르는 얇은 분배기. 병렬 인덱스
+ * 스캔(px_scan_index_key_range_list)이 직렬 경로와 같은 처리를 쓰도록 공개돼 있다.
+ * develop: scan_dedup_or_merge_key_ranges (range_type, key_vals, key_cnt) — check_key_vals 에 비교 규칙을 넘길 자리가
+ * 없었다.
+ * 이 PR: DOMAIN_SEARCH_KEYS 를 하나 더 받아 check_key_vals 두 호출에 그대로 전달한다. PX 워커도 리더와 같은 비교 규칙을 쓰게 된다.
+ * 바뀐 것: 시그니처에 매개변수 1개 추가 + 전달 2곳(±4줄).
+ */
 int
 scan_dedup_or_merge_key_ranges (RANGE_TYPE range_type, KEY_VAL_RANGE * key_vals, int key_cnt,
 				DOMAIN_SEARCH_KEYS search_keys)
@@ -2059,6 +2213,14 @@ scan_dedup_or_merge_key_ranges (RANGE_TYPE range_type, KEY_VAL_RANGE * key_vals,
 /* Whether a value is one of a plan domain's: its type and, for a string, its collation - what a mixed key and
  * the type pair comparison table take from the domain. The server holds an object as its OID, and an OID value's own
  * domain is OBJECT (tp_domain_resolve_value), which is the domain resolve_domains records for a constant object. */
+/*
+ * [리뷰] scan_key_value_holds — 어떤 값이 주어진 플랜 도메인에 '속하는가'를 타입과(문자열이면) 콜레이션만으로 판정한다.
+ * scan_key_column·scan_key_single_column 이 해소된 도메인과 실제 바인드 값이 어긋나지 않았는지 확인할 때 부른다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 은 이런 검증 없이 값 도메인을 그때그때 만들어 썼다.
+ * 이 PR: domain 이 NULL 이면 false. 타입이 다르면 OID 값 vs OBJECT 도메인 짝만 참(서버는 객체를 OID 로 들고 있다). 같은 타입이면 문자형일 때만
+ * db_get_string_collation == TP_DOMAIN_COLLATION 을 추가로 본다.
+ * 바뀐 것: 신설(+16줄). 실행 전 게이트가 내린 결정이 실제 값과 맞는지 보는 값싼 검사.
+ */
 static bool
 scan_key_value_holds (const DB_VALUE * value, const TP_DOMAIN * domain)
 {
@@ -2078,6 +2240,14 @@ scan_key_value_holds (const DB_VALUE * value, const TP_DOMAIN * domain)
 #if !defined (NDEBUG)
 /* The debug cross-check of a resolved strict key conversion: tp_value_coerce_strict gives the same outcome, and a
  * kept value leaves no error behind. */
+/*
+ * [리뷰] scan_check_key_strict — 디버그 전용 교차 검증: 플랜이 미리 뽑아 둔 strict 변환기가 tp_value_coerce_strict 와 같은 결과를 내는지, 변환
+ * 실패 시 에러를 남기지 않았는지 단언한다. scan_key_column 이 NDEBUG 아닐 때만 부른다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에는 미리 뽑은 변환기가 없어 매번 tp_value_coerce_strict 를 직접 불렀다.
+ * 이 PR: 기대값을 tp_value_coerce_strict 로 만들어 변환 성공/실패 여부가 같은지, 성공했으면 값이 DB_EQ 인지, 실패했으면 er_errid()==NO_ERROR 인지
+ * 단언하고 기대값을 해제한다.
+ * 바뀐 것: 신설(+13줄, #if !defined(NDEBUG) 안). 릴리스 바이너리에는 없다.
+ */
 static void
 scan_check_key_strict (const DB_VALUE * value, const TP_DOMAIN * column, const DB_VALUE * converted)
 {
@@ -2102,6 +2272,18 @@ scan_check_key_strict (const DB_VALUE * value, const TP_DOMAIN * column, const D
  * The rule is the plan's, or resolve_domains' for an element whose domain it resolved, or a constant resolve_domains
  * converted or kept once: the range runs the resolved strict converter and picks one of the two domains the plan holds.
  * It resolves nothing.
+ */
+/*
+ * [리뷰] scan_key_column — 다중 컬럼 탐색 키의 컬럼 하나를 한 범위에서 확정한다 — 어떤 값으로, 어떤 도메인으로 쓸지, 그 컬럼 때문에 키가 '혼합'이 되는지.
+ * scan_dbvals_to_midxkey 가 컬럼마다 부른다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 같은 일을 scan_dbvals_to_midxkey 안의 두 번 도는 루프가 했다: 타입이 다르면
+ * tp_value_coerce_strict 를 시도하고, 실패하면 need_new_setdomain 을 세워 tp_domain_resolve_value + tp_domain_copy 로 값
+ * 도메인을 새로 만들었다.
+ * 이 PR: 규칙은 플랜이(DOMAIN_KEY_INDEX/KEEP/STRICT) 또는 resolve_domains 가(CONSTANT/LATE_BIND 일 때
+ * resolved_keys->elements[]에서) 이미 정해 뒀고, 이 함수는 그 규칙을 실행만 한다 — INDEX/KEEP 는 도메인을 고르기만, STRICT 는 미리 뽑은
+ * strict_conv 를 key_state->converted[i] 로 돌리고 실패하면 keep 도메인으로 물러난다. LATE_BIND 인데 해소가 없거나 값이 해소 도메인에 속하지 않으면
+ * 미해소 에러.
+ * 바뀐 것: 신설(+78줄). 해소(결정)와 적용(실행)을 분리한 자리 — 어떤 도메인도 만들거나 캐시하지 않는다.
  */
 static int
 scan_key_column (INDX_SCAN_ID * isidp, const domain_plan_key_elem * elem, int column_index, const DB_VALUE ** value,
@@ -2189,6 +2371,15 @@ scan_key_column (INDX_SCAN_ID * isidp, const domain_plan_key_elem * elem, int co
  * A range whose column domains are the last fill's reuses it; otherwise the nodes are filled again by structure copy
  * from domains the plan and resolve_domains hold - no allocation, no domain cache, no resolution.
  */
+/*
+ * [리뷰] scan_key_mixed_domain — 컬럼들이 저마다 다른 도메인으로 쓰인 '혼합 키'의 MIDXKEY 도메인을, 스캔이 open 때 잡아 둔 체인 슬롯에 구조체 복사로 채워
+ * 돌려준다. scan_dbvals_to_midxkey 가 mixed 이고 상수 bound 가 아닐 때 부른다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 은 혼합 키가 생길 때마다 tp_domain_copy 로 컬럼 도메인을 복제해 setdomain 사슬을 만들고
+ * tp_domain_construct + tp_domain_cache 로 전역 도메인 캐시에 올린 뒤 prebuilt_midxkey_domains[key_range_idx] 에 들고 있었다.
+ * 이 PR: bound->mixed_key_cache 가 가리키는 체인 슬롯을 쓴다. last[] 에 적힌 직전 채움(컬럼별 도메인 선택 + 기록한 컬럼 수)이 이번과 같으면 그대로 재사용하고,
+ * 다르면 노드들을 구조체 복사로 다시 채운다(is_cached=1 로 두어 tp_domain_free 가 건드리지 않게 한다). 할당도 도메인 캐시 접근도 없다.
+ * 바뀐 것: 신설(+32줄). develop 의 도메인 복제·캐시 경로(약 -60줄)를 대체.
+ */
 static TP_DOMAIN *
 scan_key_mixed_domain (scan_key_state * state, const domain_plan_key * bound, const TP_DOMAIN * key_type, int written)
 {
@@ -2243,6 +2434,20 @@ scan_key_mixed_domain (scan_key_state * state, const domain_plan_key * bound, co
  * The plan and resolve_domains resolved each column's rule before any row; the range runs the resolved converters,
  * picks between the two domains the plan holds, and writes the key under the index's domain or a mixed one from its
  * mixed key domain cache.
+ */
+/*
+ * [리뷰] scan_dbvals_to_midxkey — 한 범위의 컬럼 값들을 모아 MIDXKEY 탐색 키 DB_VALUE 를 만든다. scan_regu_key_to_index_key 가
+ * key1/key2 각각에 대해 부르고 NO_ERROR/에러와 *indexable 을 돌려준다.
+ * develop: 값들을 fetch 해 인덱스 컬럼 타입과 비교하며 need_new_setdomain 을 판정하고, 필요하면 db_private_alloc 로
+ * coerced_values/has_coerced_values 배열을 잡아 tp_value_coerce_strict 하고, 두 번째 루프에서 다시 fetch 하며
+ * tp_domain_resolve_value/tp_domain_copy 로 setdomain 사슬을 만들고, 끝에서 tp_domain_construct + tp_domain_cache 로 도메인을
+ * 캐시해 *prebuilt_midxkey_domain 에 남겼다. 행마다 도는 경로에서 할당·도메인 캐시·재fetch 가 모두 일어났다.
+ * 이 PR: prebuilt_midxkey_domain 대신 isidp 와 bound_index 를 받는다. 컬럼마다 한 번만 값을 얻고(상수면 resolve_domains 가 이미 변환해 둔
+ * 값을 그대로 읽어 fetch 조차 생략), scan_key_column 이 규칙을 적용해 key_state->values/domains/choices 를 채운다. 키 도메인은 인덱스의 것, 상수
+ * bound 면 resolved_keys->domains[bound_index], 아니면 scan_key_mixed_domain 의 체인. 그 뒤 크기 계산·기록 루프는 저장해 둔 값/도메인
+ * 배열만 읽고, 마지막에 converted[] 를 정리한다.
+ * 바뀐 것: 통째 재작성 — 2패스 fetch·동적 배열 2개·도메인 복제/캐시/해제 경로를 전부 삭제하고(-약 230줄) 플랜 적용 + 1패스 기록으로 대체(+약 120줄). develop 에
+ * 있던 setdomain 노드 수 == precision 디버그 검사도 함께 삭제됐다.
  */
 static int
 scan_dbvals_to_midxkey (THREAD_ENTRY * thread_p, DB_VALUE * retval, bool * indexable, TP_DOMAIN * btree_domainp,
@@ -2493,6 +2698,15 @@ err_exit:
  * It runs at every range, inline, and reads the plan only where it must: a NULL value, or a scan whose plan has
  * no element resolve_domains resolves (no resolutions), is not tested.
  */
+/*
+ * [리뷰] scan_key_single_column — 단일 컬럼 탐색 키 하나가 이번 실행에서 해소된 도메인과 맞는지 확인하는 인라인 검사. scan_regu_key_to_index_key 가
+ * key1/key2 를 fetch 한 직후 부르고 NO_ERROR 또는 미해소 에러를 돌려준다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에는 단일 컬럼 키에 대한 이런 확인이 없었다(값 도메인 그대로 B-tree 가 비교).
+ * 이 PR: 값이 NULL 이거나 resolved_keys 가 없으면 바로 통과한다. 원소가 하나이고 그 규칙이 CONSTANT/LATE_BIND 일 때만
+ * resolved_keys->elements[] 를 보고, LATE_BIND 인데 해소가 안 됐거나 값이 해소 도메인에 속하지 않으면 미해소 에러. 디버그에서는 로드가 고정한 리터럴이 자기
+ * 도메인을 들고 있는지 단언한다.
+ * 바뀐 것: 신설(+47줄, static inline). 행마다 도는 경로에서 플랜을 '꼭 봐야 할 때만' 읽도록 짜여 있다.
+ */
 static inline int
 scan_key_single_column (INDX_SCAN_ID * isidp, int bound_index, const DB_VALUE * value)
 {
@@ -2537,6 +2751,18 @@ scan_key_single_column (INDX_SCAN_ID * isidp, int bound_index, const DB_VALUE * 
 
 /*
  * scan_regu_key_to_index_key:
+ */
+/*
+ * [리뷰] scan_regu_key_to_index_key — 컴파일된 KEY_RANGE(regu 표현) 하나를 실제 탐색 키 쌍 KEY_VAL_RANGE 로 바꾼다.
+ * scan_get_index_oidset 과 병렬 인덱스 스캔의 키범위 변환이 부른다.
+ * develop: key1/key2 가 F_MIDXKEY 면 scan_dbvals_to_midxkey 에 &iscan_id->prebuilt_midxkey_domains[key_range_idx]
+ * 를 넘겼고, 아니면 fetch_copy_dbval 만 했다. 키 플랜 유무를 묻지 않았고 범위 비교도 scan_key_compare(…, num_index_term) 로 했다.
+ * 이 PR: 들머리에서 key_plan 이 없으면 미해소로 거절하고, 이 범위가 ISS 의 fetch 범위인지(key_ranges == &indx_info->iss_range)를 판정해 bound
+ * 색인을 고른다 — fetch 범위면 2*n_ranges, 아니면 key1 은 2*key_range_idx, key2 는 2*key_range_idx+1. 단일 컬럼 분기에는
+ * scan_key_single_column 검사가 붙고, key1/key2 범위 비교는 scan_index_search_keys(iscan_id) 를 함께 넘긴다.
+ * 바뀐 것: 들머리 분기 신설(+10줄), 호출 인자 교체 4곳, 단일 컬럼 검사 2곳 추가(+8줄).
+ * [지적 C10-02]
+ * [지적 X3-03]
  */
 int
 scan_regu_key_to_index_key (THREAD_ENTRY * thread_p, KEY_RANGE * key_ranges, KEY_VAL_RANGE * key_val_range,
@@ -2848,6 +3074,14 @@ scan_regu_key_to_index_key (THREAD_ENTRY * thread_p, KEY_RANGE * key_ranges, KEY
  *   s_id(in): Scan identifier
  *
  * Note: If you feel the need
+ */
+/*
+ * [리뷰] scan_get_index_oidset — 현재 키 범위들로 B-tree 를 훑어 OID 집합 한 묶음을 가져오는 인덱스 스캔의 주 루프.
+ * scan_next_index_scan/scan_next_scan_block 이 부르고 NO_ERROR/에러를 돌려준다.
+ * develop: 첫 호출에서 범위들을 만든 뒤 check_key_vals(key_vals, key_cnt, eliminate_duplicated_keys) / merge_key_ranges /
+ * reverse_key_list 를 비교 규칙 없이 불렀다.
+ * 이 PR: 같은 세 호출에 scan_index_search_keys (iscan_id) 를 함께 넘겨, 중복 제거·병합·역순 정렬이 이 스캔의 키 플랜이 정한 비교 규칙으로 돌게 한다.
+ * 바뀐 것: 호출 3곳에 인자 1개 추가(±6줄). 함수의 나머지 흐름은 그대로.
  */
 static int
 scan_get_index_oidset (THREAD_ENTRY * thread_p, SCAN_ID * s_id, DB_BIGINT * key_limit_upper,
@@ -3688,6 +3922,16 @@ scan_open_class_attr_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id,
  *
  * Note: If you feel the need
  */
+/*
+ * [리뷰] scan_open_index_scan — 인덱스 스캔 식별자를 실제로 여는 곳 — B-tree 루트를 읽어 key_type·속성 정보를 잡고 커버링/MRO/키리밋을 준비한다. qexec
+ * 의 스캔 열기 경로와 PX 워커 초기화가 부른다.
+ * develop: 루트 unfix 뒤 바로 scan_init_index_key_limit 을 불렀고, 함수 끝에서 key_cnt>0 이면 prebuilt_midxkey_domains 배열을
+ * db_private_alloc 로 잡아 NULL 로 채웠다. 실패 경로에는 키 플랜 정리가 없었다.
+ * 이 PR: 루트 unfix 직후 scan_open_index_key_plan (thread_p, isidp, indx_info, vd, BTS->btid_int.key_type) 을 불러 이
+ * 스캔의 비교 방식과 작업 메모리를 확정하고(실패면 exit_on_error), 끝의 prebuilt 배열 할당은 통째로 삭제됐다. exit_on_error 는
+ * scan_close_index_key_plan 으로 시작한다.
+ * 바뀐 것: 게이트 호출 +6줄, prebuilt 배열 할당 -15줄, 실패 경로 정리 +2줄. 페이지 래치를 놓은 뒤에 게이트가 도는 순서다.
+ */
 int
 scan_open_index_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id,
 		      /* fields of SCAN_ID */
@@ -4330,6 +4574,14 @@ scan_open_index_node_info_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id,
  *   pr(in):
  *   regu_list_rest(in):
  */
+/*
+ * [리뷰] scan_open_list_scan — 리스트(임시 파일) 스캔 식별자를 열고, 해시 리스트 스캔이 가능한지 판정해 쓸 방식을 정한다. qexec 가 부르고 NO_ERROR/에러를
+ * 돌려준다.
+ * develop: llsidp->hlsid 를 초기화하고 check_hash_list_scan (llsidp, &val_cnt, hash_list_scan_yn) 으로 방식을 정했다 — 키 타입
+ * 판정이 regu 의 컴파일 도메인(REGU_VARIABLE_GET_TYPE)이었다.
+ * 이 PR: hlsid.key_plan = NULL 을 함께 초기화하고, check_hash_list_scan 에 vd 를 넘겨 이번 실행의 도메인으로 방식을 정한다.
+ * 바뀐 것: 초기화 1줄 + 호출 인자 1개 추가(+2줄).
+ */
 int
 scan_open_list_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id,
 		     /* fields of SCAN_ID */
@@ -4752,6 +5004,16 @@ scan_open_dblink_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id,
  *
  * Note: If you feel the need
  */
+/*
+ * [리뷰] scan_start_scan — 열린 스캔 식별자를 실제로 '시작'시켜 첫 블록을 준비한다 — 스캔 종류별 초기화와 리스트 파일 열기를 한다. qexec_open_scan 이후 실행
+ * 경로가 부르고 NO_ERROR/에러를 돌려준다.
+ * develop: 들머리에 스코프 진입이 없었고, S_LIST_SCAN 은 바로 qfile_open_list_scan 을 불렀다. 리스트 스캔의 미해소 도메인은 행을 돌리는
+ * scan_next_list_scan 이 매 호출마다 resolve_domains_on_list_scan 으로 메웠다.
+ * 이 PR: 들머리에서 qexec_enter_temporary_scope (scan_id->vd, scan_id->val_list) 로 이 블록이 읽는 바깥 값들의 변환 스코프를 연다.
+ * S_LIST_SCAN 은 리스트 파일을 열기 전에 scan_plan_list_scan_domains 로 위치·술어 피연산자의 실행 도메인을 한 번에 확정하고, 실패하면 exit_on_error
+ * 로 간다.
+ * 바뀐 것: 스코프 진입 +2줄, 리스트 스캔 게이트 호출 +7줄. 행마다 하던 도메인 해소가 스캔 시작 1회로 올라온 자리.
+ */
 int
 scan_start_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
 {
@@ -5099,6 +5361,14 @@ exit_on_error:
  *   s_id(in/out): Scan identifier
  *
  * Note: If you feel the need
+ */
+/*
+ * [리뷰] scan_reset_scan_block — 스캔 블록을 처음 상태로 되돌린다 — 바깥 행이 바뀔 때마다 안쪽 스캔을 다시 돌리기 위한 재시작. qexec 의 블록 순회가 부르고
+ * SCAN_CODE 를 돌려준다.
+ * develop: single_fetched/null_fetched 를 내리고 스캔 종류별 재설정만 했다.
+ * 이 PR: 그 직후 qexec_enter_temporary_scope (s_id->vd, s_id->val_list) 를 불러, 다시 도는 안쪽 스캔이 바깥 행의 값들을 새 스코프에서 변환해
+ * 읽게 한다.
+ * 바뀐 것: 호출 1줄 + 주석 1줄 추가(+2줄). 변환 캐시의 생애를 '바깥 행 하나'로 묶는 지점.
  */
 SCAN_CODE
 scan_reset_scan_block (THREAD_ENTRY * thread_p, SCAN_ID * s_id)
@@ -5604,6 +5874,15 @@ scan_free_hash_list_scan (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hlsid_p)
  *   scan_id(in/out): Scan identifier
  *
  * Note: If you feel the need
+ */
+/*
+ * [리뷰] scan_close_scan — 스캔 식별자가 열면서 잡은 자원을 스캔 종류별로 전부 돌려준다. qexec 의 스캔 종료와 XASL 정리가 부른다.
+ * develop: S_INDX_SCAN 에서 prebuilt_midxkey_domains 가 있으면 key_cnt 만큼 돌며 tp_domain_free 로 전역 도메인 캐시에 돌려주고 배열을
+ * db_private_free_and_init 했다. S_PARALLEL_INDEX_SCAN 은 scan_close_parallel_index_scan 만 불렀고, 해시 리스트 스캔은
+ * scan_free_hash_list_scan 만 불렀다.
+ * 이 PR: S_INDX_SCAN 은 scan_close_index_key_plan (thread_p, isidp) 한 줄로 바뀌었고, S_PARALLEL_INDEX_SCAN 도 리더의 키 플랜
+ * 저장소를 같은 함수로 돌려준다(워커들이 공유한 범위가 읽던 것). 해시 리스트 스캔에는 qdata_free_hscan_key_plan 호출이 추가됐다.
+ * 바뀐 것: 인덱스 경로 -14/+1줄, 병렬 경로 +2줄, 해시 경로 +1줄. 해제 대상이 전역 도메인 캐시 참조에서 스레드 사유 블록으로 바뀌었다.
  */
 void
 scan_close_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
@@ -8404,6 +8683,14 @@ scan_finalize (void)
  *   key_vals (in): pointer to array of KEY_VAL_RANGE structure
  *   key_cnt (in): number of keys; size of key_vals
  */
+/*
+ * [리뷰] reverse_key_list — 키 범위 배열을 앞뒤로 뒤집는다 — ORDER BY/GROUP BY 를 인덱스로 건너뛰면서 내림차순일 때 범위 순서를 맞추기 위해
+ * check_key_vals 가 함수 포인터로 부른다.
+ * develop: reverse_key_list (KEY_VAL_RANGE * key_vals, int key_cnt) — QPROC_KEY_VAL_FU 타입에 비교 규칙 인자가 없었다.
+ * 이 PR: 시그니처에만 DOMAIN_SEARCH_KEYS 가 붙었다. 이 함수는 값을 비교하지 않으므로 인자를 쓰지 않는다 — QPROC_KEY_VAL_FU 세 구현(중복제거·병합·역순)의
+ * 모양을 맞추기 위한 변경.
+ * 바뀐 것: 시그니처 1줄만 변경(±1줄). 본문 무변경.
+ */
 static int
 reverse_key_list (KEY_VAL_RANGE * key_vals, int key_cnt, DOMAIN_SEARCH_KEYS search_keys)
 {
@@ -8427,6 +8714,19 @@ reverse_key_list (KEY_VAL_RANGE * key_vals, int key_cnt, DOMAIN_SEARCH_KEYS sear
  *
  * A list position reads its list's column and a value pointer its producer: resolve_domains resolved both once for the
  * execution, a column over a session variable read too.
+ */
+/*
+ * [리뷰] scan_plan_list_scan_domains — 리스트 스캔의 위치(TYPE_POSITION) regu 들과 비교 술어 피연산자들이 이번 실행에서 쓸 도메인을 플랜에서 읽어 한
+ * 번에 확정한다. scan_start_scan 과 scan_build_hash_list_scan 이 부르고 NO_ERROR 또는 미해소 에러를 돌려준다.
+ * develop: develop 에서는 같은 자리에 resolve_domains_on_list_scan + resolve_domain_on_regu_operand 가 있었다. 둘 다 void
+ * 였고, 매 행 스캔(scan_next_list_scan)·해시 빌드마다 불리며 regu 의 domain 과 pos_descr.dom 을 리스트 파일의 type_list.domp[pos] 로
+ * **그 자리에서 덮어썼다**. 피연산자 쪽은 ref_val_list 를 선형 탐색해 DB_VALUE 포인터가 일치하는 위치를 찾았고, 그 비교가 valp->next 가 아니라
+ * ref_val_list->valp->val 과만 비교하는 모양이었다. 해소가 안 되면 조용히 건너뛰었다.
+ * 이 PR: int 를 돌려주는 게이트가 됐다. scan_pred.regu_list 와 rest_regu_list 를 돌며 plan_item 이 '아직 변수'라고 답하는 위치만 골라
+ * qexec_consumer_domain 으로 해소 도메인을 얻고, 없으면 qexec_domain_unresolved 로 에러를 올리며, 있으면 qexec_set_node_domain 으로
+ * **실행측 도메인 배열에** 쓴다(컴파일 노드는 그대로 둔다). 비교 술어는 lhs/rhs 를 배열로 돌며 같은 처리를 한다.
+ * 바뀐 것: 두 함수(약 -110줄)를 하나(+56줄)로 대체. void→int, 값 포인터 선형 탐색 삭제, 노드 제자리 수정 → 실행 도메인 테이블 기록. 호출 지점도 '매 행'에서 '스캔
+ * 시작 1회'로 옮겨졌다.
  */
 static int
 scan_plan_list_scan_domains (const VAL_DESCR * vd, LLIST_SCAN_ID * llsidp)
@@ -8919,6 +9219,17 @@ scan_print_stats_text (FILE * fp, SCAN_ID * scan_id)
  *
  * Note: If an error occurs, S_ERROR is returned.
  */
+/*
+ * [리뷰] scan_build_hash_list_scan — 리스트 파일을 한 번 훑어 해시 테이블(인메모리 또는 하이브리드)을 만든다. scan_start_scan 이후 첫 프로브 전에 불리고
+ * SCAN_CODE 를 돌려준다.
+ * develop: resolve_domains_on_list_scan (llsidp, scan_id->val_list) 를 void 로 불러 도메인을 메우고, 키 복사는
+ * qdata_copy_hscan_key_without_alloc (thread_p, key, llsidp->hlsid.probe_regu_list, new_key) 로 probe regu 목록을
+ * 매 행 다시 읽으며 타입을 맞췄다.
+ * 이 PR: scan_plan_list_scan_domains 를 부르고 실패하면 S_ERROR 를 돌려준다. need_coerce_type 이면 그 앞에서 qdata_plan_hscan_keys
+ * 로 빌드 키마다의 복사/변환 계획을 한 번 세우고, 행 루프의 복사는 그 계획(llsidp->hlsid.key_plan)을 읽는다.
+ * 바뀐 것: 해소 호출을 에러 검사 있는 게이트로 교체(+4줄), 키 계획 수립 +5줄, 행 루프의 인자 교체(probe_regu_list → key_plan). 행마다 regu 목록을 해석하던
+ * 것이 스캔당 1회 계획으로 올라갔다.
+ */
 static SCAN_CODE
 scan_build_hash_list_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
 {
@@ -9323,6 +9634,15 @@ scan_hash_probe_next (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, QFILE_TUPLE * 
  *      5. type of regu var is not oid && vobj
  *      6. list file from dptr is not allowed
 */
+/*
+ * [리뷰] check_hash_list_scan — 이 리스트 스캔에 해시 리스트 스캔을 쓸 수 있는지(인메모리/하이브리드/불가)를 판정한다. scan_open_list_scan 이 부르고
+ * HASH_METHOD 를 돌려준다.
+ * develop: 빌드/프로브 regu 쌍의 타입을 REGU_VARIABLE_GET_TYPE(&probe->value) / (&build->value) 로 읽었다 — regu 의 컴파일
+ * 도메인(또는 TYPE_DBVAL 의 값 타입) 기준이라, 호스트 변수로 늦게 결정되는 타입은 반영되지 않았다.
+ * 이 PR: vd 를 받아 TP_DOMAIN_TYPE (qexec_get_node_domain (vd, …->value.domain, …->value.plan_item)) 로 읽는다 — 이번
+ * 실행에서 그 노드가 이미 도메인을 가졌으면 그것을, 아니면 컴파일 도메인을 본다. OBJECT/OID/VOBJ 조합을 걸러 리스트 스캔으로 되돌리는 판정 자체는 그대로.
+ * 바뀐 것: 시그니처에 const VAL_DESCR *vd 추가, 타입 읽기 2줄 교체(±5줄).
+ */
 static HASH_METHOD
 check_hash_list_scan (LLIST_SCAN_ID * llsidp, int *val_cnt, int hash_list_scan_yn, const VAL_DESCR * vd)
 {

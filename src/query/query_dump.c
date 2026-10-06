@@ -1240,6 +1240,14 @@ qdump_data_type_string (DB_TYPE type)
  *   return:
  *   value(in):
  */
+/*
+ * [리뷰] qdump_print_value — qdump_print_xasl 계열이 REGU_VARIABLE 한 개를 사람이 읽는 형태로 foutput 에 찍는 덤프 보조 함수(성공 true).
+ * develop: develop(1240)은 NULL 검사 뒤 바로 REGU_VARIABLE_HIDDEN_COLUMN 플래그부터 찍었다. plan_item 이라는 개념 자체가 없었다.
+ * 이 PR: NULL 검사 다음에 #if defined (SERVER_MODE) || defined (SA_MODE) 블록이 들어가, 이 regu 에 매달린 DOMAIN_PLAN_ITEM 을
+ * {plan class=… slot=… ref=… flags=…} 로 찍는다 — 컴파일이 표시한 GATE 슬롯이 덤프에서 바로 보인다.
+ * 바뀐 것: 분기 1개 추가(+9줄)와 모드 가드 1쌍. 아래 switch 는 develop 과 동일.
+ * [지적 A2-04]
+ */
 static bool
 qdump_print_value (REGU_VARIABLE * value_p)
 {
@@ -2374,6 +2382,14 @@ qdump_print_connect_by_proc_node (XASL_NODE * xasl_p)
  * qdump_print_xasl () -
  *   return:
  *   xasl(in):
+ */
+/*
+ * [리뷰] qdump_print_xasl — 플랜 덤프 요청 시 XASL 트리의 한 노드 전체를 foutput 에 찍는 덤프 진입 함수 —
+ * qexec_execute_query·parser_generate_xasl 등이 부른다.
+ * develop: develop(2366)은 "<start of xasl structure %p>" 를 찍고 곧바로 qdump_print_xasl_type 을 불렀다.
+ * 이 PR: 그 사이에 SERVER_MODE/SA_MODE 가드로 xasl_p->domain_plan 요약(items/slots/refs(+추가분)/late_bind_nodes)을 한 줄 찍는다
+ * — 로드가 도출한 DOMAIN_PLAN 의 규모를 덤프에서 확인할 수 있다.
+ * 바뀐 것: 분기 1개 추가(+8줄). 나머지 460줄은 그대로.
  */
 bool
 qdump_print_xasl (xasl_node * xasl_p)

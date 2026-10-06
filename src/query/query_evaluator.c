@@ -168,6 +168,14 @@ eval_logical_result (DB_LOGICAL res1, DB_LOGICAL res2)
 
 /* tp_value_compare_with_error on the values (comparison method VALUES): a NULL element, a side the plan leaves
  * variable, a comparison no resolution holds; constant-initialized */
+/*
+ * [리뷰] eval_values_comparison — "해결된 것이 없다 = 두 DB_VALUE 를 tp_value_compare_with_error 로 그냥 비교" 를 뜻하는
+ * DOMAIN_COMPARE 상수를 만든다 — 정적 상수 eval_Compare_values 의 초기값이고, 모든 폴백 경로가 이 주소를 돌려준다.
+ * develop: develop 에 없음 — 이 PR 이 신설(develop 에는 DOMAIN_COMPARE 타입 자체가 없다).
+ * 이 PR: method=DOMAIN_COMPARE_VALUES, value[0]=value[1]=-1(양쪽 모두 행의 값), codeset_side=-1, compare_index=-1 로 채워
+ * 돌려주는 constexpr 함수.
+ * 바뀐 것: 신설 +12줄. 주석대로 GCC 8.5 의 constexpr ICE 때문에 대입을 한 줄씩 쪼갰다.
+ */
 static constexpr DOMAIN_COMPARE
 eval_values_comparison ()
 {
@@ -185,6 +193,13 @@ static constexpr DOMAIN_COMPARE eval_Compare_values = eval_values_comparison ();
 
 /* The element comparisons of a set or list comparison: the collections' elements are their data, so the comparison
  * reads the key pair table by the two values' keys. */
+/*
+ * [리뷰] eval_keys_comparison — 컬렉션 원소끼리의 비교(= 두 값의 키 쌍표로 비교)를 뜻하는 DOMAIN_COMPARE 상수 — 정적 상수
+ * eval_Compare_elements 의 초기값.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: eval_values_comparison () 결과를 받아 method 만 DOMAIN_COMPARE_KEYS 로 바꿔 돌려준다.
+ * 바뀐 것: 신설 +7줄.
+ */
 static constexpr DOMAIN_COMPARE
 eval_keys_comparison (void)
 {
@@ -200,6 +215,16 @@ static constexpr DOMAIN_COMPARE eval_Compare_elements = eval_keys_comparison ();
  *			  resolve_domains' for a comparison resolve_domains resolves
  *   return: comparison method VALUES with its reason where the row compares by value: a late-bind comparison read
  *	     without resolve_domains' state
+ */
+/*
+ * [리뷰] eval_resolved_comparison — 비교항이 들고 있는 DOMAIN_COMPARE_PLAN 에서 '이번 실행이 쓸 해결 결과' 하나를 골라 돌려준다 — 행마다 불리는
+ * 조회자로, 결정은 하지 않는다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 로드가 고정한 fixed 를 기본으로 쓰고, method 가 LATE_BIND(_SESSION) 이면
+ * vd->xasl_state->resolved_domain.compares[compare_index] 로 바꿔 돌려준다. vd·xasl_state·compares 중 하나라도 없으면
+ * eval_Compare_values 로 떨어진다. PX 워커 클론이 리더와 같은 번호를 쓰는지는 assert 로 교차검증한다.
+ * 바뀐 것: 신설 +23줄, static inline. 실행 전 게이트가 채운 표를 행이 번호로 읽는 구조의 핵심 접근자.
+ * [지적 A2-06]
  */
 static inline const DOMAIN_COMPARE *
 eval_resolved_comparison (const DOMAIN_COMPARE_PLAN * comparison, const val_descr * vd)
@@ -230,6 +255,14 @@ eval_resolved_comparison (const DOMAIN_COMPARE_PLAN * comparison, const val_desc
  *   return: its resolved comparison's resolution; a term without one is the load's omission: every load plans its
  *	     terms, a predicate stream's included
  */
+/*
+ * [리뷰] eval_resolved_compare — COMP_EVAL_TERM(비교 술어 한 항)에 대해 이번 실행의 DOMAIN_COMPARE 를 돌려주는 얇은 래퍼 —
+ * eval_compare_term·eval_value_rel_cmp 가 쓴다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: et_comp->domain_compare 가 NULL(=로드가 계획을 붙이지 않은 항)이면 eval_Compare_values 를, 아니면
+ * eval_resolved_comparison 의 결과를 돌려준다.
+ * 바뀐 것: 신설 +10줄.
+ */
 static inline const DOMAIN_COMPARE *
 eval_resolved_compare (const COMP_EVAL_TERM * et_comp, const val_descr * vd)
 {
@@ -243,6 +276,13 @@ eval_resolved_compare (const COMP_EVAL_TERM * et_comp, const val_descr * vd)
 
 /* A computed collection's elements against the item's row of the type pair comparison table; an item whose key has no
  * row (domain_compare_key_row) compares each element by the two values' keys. */
+/*
+ * [리뷰] eval_element_row — ALL/SOME 의 오른쪽이 계산된 컬렉션일 때 원소를 '아이템 타입의 행(타입쌍 비교표 row)' 으로 비교할지를 EVAL_ELEMENTS 에
+ * 적는다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: elements->row 에 row 를 쓰고, row<0(그 타입의 행이 없음)이면 each 를 eval_Compare_elements(키 쌍 비교)로 되돌린다.
+ * 바뀐 것: 신설 +9줄.
+ */
 static inline void
 eval_element_row (int row, EVAL_ELEMENTS * elements)
 {
@@ -259,6 +299,17 @@ eval_element_row (int row, EVAL_ELEMENTS * elements)
  * The load's resolved comparison or table, or the resolved domains: the row reads them and resolves nothing. Where
  * neither holds, the comparisons are tp_value_compare_with_error on the values (comparison method VALUES), and the
  * unresolved-domain check (execution) stops one whose values would resolve a domain.
+ */
+/*
+ * [리뷰] eval_resolved_elements — ALSM_EVAL_TERM 하나에 대해 '이번 실행에서 원소들을 무엇으로 비교하나' 를
+ * EVAL_ELEMENTS(all/each/row/constant) 한 덩어리로 채운다 — eval_pred·eval_pred_alsm4·eval_pred_alsm5 가 집합/리스트 평가 직전에
+ * 한 번만 부른다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 이 개념이 없어 eval_some_eval 등이 원소마다 tp_value_compare_with_error
+ * 안에서 코어션을 했다.
+ * 이 PR: 기본값은 all=each=eval_Compare_values, row=-1, constant=NULL. 계획의 kind 가 DOMAIN_ELEMENTS_PAIR 면 그 비교를(KEYS
+ * 면 each 도 같게), ROW 면 행 번호를 쓰고, 그 밖이면 vd 의 resolved.elements[resolved_elements_index] 를 읽어 read
+ * 종류(POSITIONS/ROW/PAIR)별로 채운다.
+ * 바뀐 것: 신설 +53줄. 원소당 결정을 스캔당 1회 도출로 끌어올린 자리.
  */
 static inline void
 eval_resolved_elements (const ALSM_EVAL_TERM * et_alsm, const val_descr * vd, EVAL_ELEMENTS * elements)
@@ -315,6 +366,13 @@ eval_resolved_elements (const ALSM_EVAL_TERM * et_alsm, const val_descr * vd, EV
 }
 
 /* The resolution an item's row holds for an element: by its type and, for a string or an ENUM, its collation. */
+/*
+ * [리뷰] eval_element_compare — 아이템 타입의 행(row)과 원소 값 하나로 타입쌍 비교표에서 비교 한 건을 꺼낸다 — eval_some_eval 의 원소 루프가 쓴다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: domain_compare_row_entry (row, element) 가 NULL 이면 eval_Compare_values 로 떨어진다.
+ * 바뀐 것: 신설 +6줄.
+ * [지적 A2-02]
+ */
 static inline const DOMAIN_COMPARE *
 eval_element_compare (int row, const DB_VALUE * element)
 {
@@ -323,6 +381,12 @@ eval_element_compare (int row, const DB_VALUE * element)
 }
 
 /* The value side i compares: the constant resolve_domains converted once, or the row's value. */
+/*
+ * [리뷰] eval_compare_side — 비교 한쪽이 '게이트가 한 번 변환해 vd 에 넣어둔 상수' 인지 '행에서 온 값' 인지 골라 돌려주는 최하단 접근자 — 행마다 두 번 불린다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: compare->value[side] >= 0 이면 vd->dbval_ptr + value[side], 아니면 row_value.
+ * 바뀐 것: 신설 +5줄.
+ */
 static inline const DB_VALUE *
 eval_compare_side (const DOMAIN_COMPARE * compare, const val_descr * vd, int side, const DB_VALUE * row_value)
 {
@@ -334,6 +398,17 @@ eval_compare_side (const DOMAIN_COMPARE * compare, const val_descr * vd, int sid
  *			     comparison method the resolved comparison names, on the row's values and
  *			     resolve_domains' own values of the constant sides
  *   comparison(in): the resolved comparison; a side it names fixed for a scope comes in converted once per scope
+ */
+/*
+ * [리뷰] eval_compare_resolved — 해결된 DOMAIN_COMPARE 하나를 실제 두 값에 적용하는 핵심 — NULL 규칙을 먼저 적용하고 비교 method 로 한 번만 분기해
+ * DB_VALUE_COMPARE_RESULT 를 돌려준다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서 이 자리는 eval_value_rel_cmp(153) 안의 '상수 측 1회 코어션 +
+ * tp_value_compare_with_error' 였다.
+ * 이 PR: DIRECT 면 compare->cmp->cmpval 직접 호출, CONVERT 면 상관(correlated) 측을 스코프당 한 번만 qexec_execution_temporary 로
+ * 변환한 뒤 domain_compare_converted, OBJECT/KEYS 면 domain_compare_by_type_pair, 그 밖(RANK·COLLATIONS)은
+ * domain_compare_values.
+ * 바뀐 것: 신설 +51줄. 행당 타입 판정·코어션 분기가 method switch 한 번으로 줄었다.
+ * [지적 A2-03]
  */
 static DB_VALUE_COMPARE_RESULT
 eval_compare_resolved (THREAD_ENTRY * thread_p, const DOMAIN_COMPARE * compare, const DOMAIN_COMPARE_PLAN * comparison,
@@ -390,6 +465,14 @@ eval_compare_resolved (THREAD_ENTRY * thread_p, const DOMAIN_COMPARE * compare, 
 #if !defined (NDEBUG)
 /* One side of a resolved comparison in the debug cross-checks' report: the regu, its domain, and the plan's view of
  * it. */
+/*
+ * [리뷰] eval_report_resolved_side — 디버그 진단 출력 — 비교 한쪽의 regu 타입·opcode·도메인/콜레이션, 계획 슬롯, 고정 도메인, 해결된 도메인을 stderr
+ * 에 한 줄로 찍는다. eval_report_resolved_compare 만 부른다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: qexec_get_node_domain 으로 regu 의 실행 도메인을, item->resolved_index 로 해결표의 도메인을 함께 찍어 '계획이 정한 것 vs 실제' 를 나란히
+ * 보여준다.
+ * 바뀐 것: 신설 +25줄, NDEBUG 아닐 때만 컴파일.
+ */
 static void
 eval_report_resolved_side (const char *name, const REGU_VARIABLE * regu, const DOMAIN_PLAN_ITEM * item,
 			   const val_descr * vd)
@@ -417,6 +500,15 @@ eval_report_resolved_side (const char *name, const REGU_VARIABLE * regu, const D
 }
 
 /* The debug cross-checks' report of a resolved comparison and its values (optdebug), before they assert. */
+/*
+ * [리뷰] eval_report_resolved_compare — 계획된 비교가 기대와 어긋났을 때 무엇이
+ * 어긋났는지(method·first·source·collation·codeset_side·value 와 양쪽 값의 실제 타입/콜레이션)를 stderr 에 찍는 디버그 보고자 — 세 assert
+ * 보조함수와 미해결 도메인(boundary) 경로가 부른다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 양쪽 값의 타입·collation·codeset 을 문자열로 만들어 찍고, et_comp 가 있으면 계획
+ * 측(fixed.method·compare_index·constant/literal 유무)과 양쪽 side 보고까지 이어 찍는다.
+ * 바뀐 것: 신설 +33줄, 디버그 전용.
+ */
 static void
 eval_report_resolved_compare (const char *what, const DOMAIN_COMPARE * compare, const DB_VALUE * dbval1,
 			      const DB_VALUE * dbval2, const COMP_EVAL_TERM * et_comp, const val_descr * vd)
@@ -456,6 +548,13 @@ eval_report_resolved_compare (const char *what, const DOMAIN_COMPARE * compare, 
  *				  its converters and cmpval were resolved for (a constant side compares resolve_domains'
  *				  own value)
  */
+/*
+ * [리뷰] eval_assert_resolved_sides — 비교 실행 직전의 디버그 교차검증 — 행에서 읽은 쪽의 실제 타입이 해결 당시 기록한 source 타입과 같은지 assert 한다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: OBJECT/KEYS 는 값의 키로 비교하므로 면제. 그 외는 (상수라서 value[side]!=-1) 또는 NULL 또는 타입 일치여야 하고, 어긋나면
+ * eval_report_resolved_compare 로 찍은 뒤 assert.
+ * 바뀐 것: 신설 +19줄, 디버그 전용.
+ */
 static void
 eval_assert_resolved_sides (const DOMAIN_COMPARE * compare, const DB_VALUE * dbval1, const DB_VALUE * dbval2,
 			    const COMP_EVAL_TERM * et_comp, const val_descr * vd)
@@ -481,6 +580,13 @@ eval_assert_resolved_sides (const DOMAIN_COMPARE * compare, const DB_VALUE * dbv
  *				    same values gives the resolved comparison's result, comparability and error
  *   asks_comparable(in): the caller asks whether the values compare (tp_value_compare_with_error's contract); false
  *			  for tp_value_compare's, which asks nothing
+ */
+/*
+ * [리뷰] eval_assert_resolved_compare — 계획된 비교의 결과를 develop 의 경로(tp_value_compare_with_error)로 다시 계산해 같은지 assert
+ * — 이 PR 의 전환이 답을 바꾸지 않았음을 디버그 빌드가 행마다 보증하는 장치.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: er_stack_push/pop 으로 대조용 에러를 격리하고 결과·comparable·errid 세 가지를 모두 비교, 다르면 보고 후 assert.
+ * 바뀐 것: 신설 +22줄, 디버그 전용. 릴리스에서는 사라진다.
  */
 static void
 eval_assert_resolved_compare (const DOMAIN_COMPARE * compare, const DB_VALUE * dbval1, const DB_VALUE * dbval2,
@@ -516,6 +622,14 @@ eval_assert_resolved_compare (const DOMAIN_COMPARE * compare, const DB_VALUE * d
  *   vd(in): value descriptor of the execution (the resolved domains and converted constants)
  *   can_compare(out): NULL for tp_value_compare's contract, which asks nothing: values that do not compare answer by
  *		       their rank without an error
+ */
+/*
+ * [리뷰] eval_compare_values_resolved — 술어 항 바깥에서 두 값을 '계획이 정한 대로' 비교해 달라는 외부 진입점(비정적) — px_scan 의 instnum 한계
+ * 해결(resolve_instnum_limit) 등이 부른다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: comparison 에서 이번 실행의 해결을 집어, method 가 VALUES 가 아니면 eval_compare_resolved 로, VALUES 인데 두 값의 도메인이 다르면
+ * 미해결 도메인 검사(domain_unresolved_error)로 *can_compare=false·DB_UNK, 같으면 tp_value_compare_with_error.
+ * 바뀐 것: 신설 +39줄.
  */
 DB_VALUE_COMPARE_RESULT
 eval_compare_values_resolved (THREAD_ENTRY * thread_p, const DOMAIN_COMPARE_PLAN * comparison, const val_descr * vd,
@@ -574,6 +688,19 @@ STATIC_INLINE DB_LOGICAL eval_rel_result (REL_OP rel_operator, int result, const
  *		  (eval_compare_term); NULL: the term's
  *   unconverted2(in): the right side as the term holds it where dbval2 is resolve_domains' converted copy of it,
  *		       which the debug cross-checks compare (an optdebug build reads it); NULL: dbval2
+ */
+/*
+ * [리뷰] eval_value_rel_cmp — 비교 한 건을 REL_OP 로 읽어 DB_LOGICAL 을 돌려주는 범용 경로 — 집합/리스트 평가와 DIRECT 가 아닌 모든 비교가 여기로
+ * 모인다.
+ * develop: develop(153)은 (thread_p, dbval1, dbval2, rel_operator, et_comp) 5인자. 기본 분기에서 rhs 가
+ * REGU_VARIABLE_FETCH_ALL_CONST 이면 **행마다** vtype1/vtype2 를 보고 tp_value_coerce 로 dbval2 를 그 자리에서 덮어썼고(문자↔수치,
+ * 문자↔날짜, 일반성 비교), 그 뒤 tp_value_compare_with_error 를 불렀다. 결과 해석 switch 는 함수 꼬리에 인라인돼 있었다.
+ * 이 PR: 인자가 8개(vd·compare·unconverted2 추가). 상수 코어션 블록(#if 0 보관분 포함 약 100줄)이 통째로 사라지고, 해결된 비교가 있으면
+ * eval_compare_resolved 로, 없고 두 값의 도메인이 다르면 미해결 도메인으로 V_ERROR, 같으면 tp_value_compare_with_error. 꼬리 switch 는
+ * eval_rel_result 로 분리했다.
+ * 바뀐 것: 시그니처 +3인자, 행당 코어션 삭제(약 -100줄), 분기 재구성, 결과 해석 분리. 이 팩에서 성격이 가장 큰 변경이다.
+ * [지적 A2-05]
+ * [지적 A2-01]
  */
 static DB_LOGICAL
 eval_value_rel_cmp (THREAD_ENTRY * thread_p, DB_VALUE * dbval1, DB_VALUE * dbval2, REL_OP rel_operator,
@@ -659,6 +786,14 @@ eval_value_rel_cmp (THREAD_ENTRY * thread_p, DB_VALUE * dbval1, DB_VALUE * dbval
  *   result(in): DB_VALUE_COMPARE_RESULT of the comparison
  *   dbval1(in), dbval2(in): the values the comparison was given
  */
+/*
+ * [리뷰] eval_rel_result — 비교 결과(DB_VALUE_COMPARE_RESULT)를 REL_OP 로 읽어 V_TRUE/V_FALSE/V_UNKNOWN/V_ERROR 로 바꾸는 순수
+ * 함수 — eval_value_rel_cmp 와 DIRECT 연산자 함수 8개가 공유한다.
+ * develop: develop 에는 독립 함수가 없었고, 똑같은 switch(UNK 처리와 R_NULLSAFE_EQ 의 두 값 검사 포함)가 eval_value_rel_cmp(153) 꼬리에
+ * 인라인돼 있었다.
+ * 이 PR: STATIC_INLINE + ALWAYS_INLINE 로 분리됐다. 본문 로직은 develop 과 줄 단위로 같다.
+ * 바뀐 것: 추출(+60줄, develop 쪽 같은 분량 삭제). 동작 변화 없음 — DIRECT 경로가 같은 해석을 재사용하기 위한 분리다.
+ */
 STATIC_INLINE DB_LOGICAL
 eval_rel_result (REL_OP rel_operator, int result, const DB_VALUE * dbval1, const DB_VALUE * dbval2)
 {
@@ -741,6 +876,14 @@ eval_rel_result (REL_OP rel_operator, int result, const DB_VALUE * dbval1, const
  */
 /* *INDENT-OFF* */
 template <REL_OP rel_operator>
+/*
+ * [리뷰] eval_operator_function_direct — DOMAIN_COMPARE_DIRECT 로 해결된 비교항의 행 경로 — REL_OP 를 템플릿 인자로 받아 method 분기도
+ * 연산자 분기도 없이 cmpval 한 번 + 결과 해석만 한다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: eval_compare_side 로 양쪽 값을 고르고 NULL 규칙(total_order 면 NULL 을 최소로)을 적용한 뒤 compare->cmp->cmpval 을 해결된
+ * collation·coercion 으로 부르고, eval_rel_result 로 읽는다.
+ * 바뀐 것: 신설 +23줄(템플릿 1개 → 8개 인스턴스). 행당 비용을 간접호출 1회로 줄이는 것이 목적.
+ */
 static DB_LOGICAL
 eval_operator_function_direct (const DOMAIN_COMPARE * compare, const val_descr * vd, DB_VALUE * dbval1,
 			       DB_VALUE * dbval2)
@@ -772,6 +915,15 @@ struct EVAL_DIRECT_OPERATOR_FUNCTIONS
   DOMAIN_COMPARE_OPERATOR_FUNCTION by_operator[R_NULLSAFE_EQ + 1];
 };
 
+/*
+ * [리뷰] eval_direct_operator_functions — REL_OP 로 색인되는 DIRECT 연산자 함수표를 컴파일 타임에 만든다 — 정적 상수
+ * eval_Direct_operator_functions 의 초기값.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: R_EQ/NE/GT/GE/LT/LE/EQ_TORDER/NULLSAFE_EQ 8칸만 채우고 나머지(집합 비교 등)는 값초기화로 NULL 이라, 호출자가 NULL 을 보면 일반 경로로
+ * 떨어진다.
+ * 바뀐 것: 신설 +14줄. 배열 크기는 R_NULLSAFE_EQ+1 이고 xasl_predicate.hpp 의 REL_OP 에서 R_NULLSAFE_EQ 가 마지막이라 모든 연산자 값이 범위
+ * 안이다(확인함).
+ */
 static constexpr EVAL_DIRECT_OPERATOR_FUNCTIONS
 eval_direct_operator_functions (void)
 {
@@ -792,6 +944,15 @@ static constexpr EVAL_DIRECT_OPERATOR_FUNCTIONS eval_Direct_operator_functions =
 
 /* domain_compare_set_operator_functions () - declared with DOMAIN_COMPARE (domain_rules.h); the load and
  * resolve_domains call it where they resolve a term's comparison, and the operator functions it names are these */
+/*
+ * [리뷰] domain_compare_set_operator_functions — query_evaluator.c 바깥(로드: domain_plan.c, 실행 전 게이트:
+ * domain_resolve.c)이 해결한 DOMAIN_COMPARE 에 행 경로 함수표를 꽂아 주는 유일한 통로 — 함수 포인터는 XASL 스트림으로 나를 수 없으므로 해결 시점마다 여기서 다시
+ * 세운다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: method 가 DOMAIN_COMPARE_DIRECT 면 eval_Direct_operator_functions.by_operator 를, 아니면 NULL 을 넣는다. 호출처는
+ * domain_plan.c:3555·4320, domain_resolve.c:1300·1385 네 곳.
+ * 바뀐 것: 신설 +6줄. 선언은 domain_rules.h:210.
+ */
 void
 domain_compare_set_operator_functions (DOMAIN_COMPARE * compare)
 {
@@ -803,6 +964,13 @@ domain_compare_set_operator_functions (DOMAIN_COMPARE * compare)
 /*
  * eval_assert_operator_function () - debug cross-check of a term's operator function: eval_value_rel_cmp's evaluation
  *			 of the term, the path the function takes the place of, gives the function's answer
+ */
+/*
+ * [리뷰] eval_assert_operator_function — 디버그 교차검증 — DIRECT 연산자 함수가 낸 답을 범용 경로 eval_value_rel_cmp 로 다시 구해 같은지
+ * assert 한다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 다르면 eval_report_resolved_compare 로 양쪽을 찍고 rel_op·두 결과를 stderr 에 남긴 뒤 assert.
+ * 바뀐 것: 신설 +13줄, 디버그 전용(eval_compare_term 안에서 #if !defined (NDEBUG) 로 감싸 호출).
  */
 static void
 eval_assert_operator_function (THREAD_ENTRY * thread_p, const COMP_EVAL_TERM * et_comp, const val_descr * vd,
@@ -827,6 +995,14 @@ STATIC_INLINE DB_LOGICAL eval_compare_term (THREAD_ENTRY * thread_p, const COMP_
  *			  comparison in this execution names for the term's operator, or eval_value_rel_cmp on that
  *			  resolution
  *   return: DB_LOGICAL (V_TRUE, V_FALSE, V_UNKNOWN or V_ERROR)
+ */
+/*
+ * [리뷰] eval_compare_term — 비교 술어 한 항의 행 경로 진입점 — eval_pred 의 T_COMP_EVAL_TERM 분기와 eval_pred_comp0 이 양쪽 값을
+ * fetch 한 뒤 부른다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 은 같은 자리에서 eval_value_rel_cmp(…, et_comp) 를 직접 불렀다.
+ * 이 PR: 이번 실행의 해결(eval_resolved_compare)을 집고, 그 연산자의 DIRECT 함수가 있으면 그것을, 없으면 eval_value_rel_cmp 를 부른다. 디버그 빌드는
+ * 두 결과를 대조한다.
+ * 바뀐 것: 신설 +17줄, ALWAYS_INLINE. 주석에 적힌 대로 qexec_eval_instnum_pred 가 <= 를 < 로 바꿔 평가하므로 '행에서 보는 연산자' 로 표를 찾는다.
  */
 STATIC_INLINE DB_LOGICAL
 eval_compare_term (THREAD_ENTRY * thread_p, const COMP_EVAL_TERM * et_comp, val_descr * vd, DB_VALUE * dbval1,
@@ -856,6 +1032,15 @@ eval_compare_term (THREAD_ENTRY * thread_p, const COMP_EVAL_TERM * et_comp, val_
  *   vd(in): value descriptor of the term's execution
  */
 
+/*
+ * [리뷰] eval_some_eval — SOME/ANY 집합 비교 — 아이템과 집합 원소를 차례로 비교해 하나라도 참이면 V_TRUE, 끝까지 아니면 V_FALSE/V_UNKNOWN.
+ * develop: develop(354)은 (thread_p, item, set, rel_operator) 4인자. 루프 조건마다 set_size(set) 를 다시 부르고, 원소마다
+ * set_get_element 로 꺼내 eval_value_rel_cmp(…, NULL) 로 비교했다 — 비교 방식 결정이 원소마다 tp_value_compare_with_error 안에서
+ * 일어났다.
+ * 이 PR: elements·vd 2인자가 추가됐다. set_size 를 루프 밖에서 한 번만 읽고, 게이트가 상수 집합을 해결해 뒀으면(elements->constant) 변환된 값
+ * value[i] 와 번호로 꺼낸 비교를 쓰고 집합에서 꺼내지 않는다(디버그에서만 원본을 꺼내 대조용 unconverted 로 넘긴다). 아니면 NULL/row/each 중에서 비교를 고른다.
+ * 바뀐 것: 시그니처 +2, 상수 경로 분기 추가, set_size 호이스팅(+28줄).
+ */
 static DB_LOGICAL
 eval_some_eval (THREAD_ENTRY * thread_p, DB_VALUE * item, DB_SET * set, REL_OP rel_operator,
 		const EVAL_ELEMENTS * elements, const val_descr * vd)
@@ -947,6 +1132,12 @@ eval_some_eval (THREAD_ENTRY * thread_p, DB_VALUE * item, DB_SET * set, REL_OP r
  *              V_ERROR:    - an error occurred.
  *
  */
+/*
+ * [리뷰] eval_all_eval — ALL 집합 비교 — 연산자를 뒤집어 eval_some_eval 을 부르고 결과를 부정한다.
+ * develop: develop(418)은 4인자였고, 같은 연산자 뒤집기 switch 뒤 eval_some_eval(…, rel_operator) 를 불렀다.
+ * 이 PR: elements·vd 를 받아 그대로 eval_some_eval 에 넘긴다.
+ * 바뀐 것: 시그니처 +2인자, 전달만. 뒤집기 로직은 develop 과 동일.
+ */
 static DB_LOGICAL
 eval_all_eval (THREAD_ENTRY * thread_p, DB_VALUE * item, DB_SET * set, REL_OP rel_operator,
 	       const EVAL_ELEMENTS * elements, const val_descr * vd)
@@ -1009,6 +1200,14 @@ eval_all_eval (THREAD_ENTRY * thread_p, DB_VALUE * item, DB_SET * set, REL_OP re
  *              relationship, the returned value means the cardinality of the
  *              given element in the set and must always be less than equal
  *              to 1 for the case of basic sets.
+ */
+/*
+ * [리뷰] eval_item_card_set — 집합 안에서 아이템과 주어진 관계를 만족하는 원소 개수(카디널리티)를 센다 — 다중집합 부분집합 판정(eval_sub_*)이 쓴다. NULL 원소를
+ * 만나면 UNKNOWN_CARD.
+ * develop: develop(480)은 eval_value_rel_cmp (thread_p, item, &elem_val, rel_operator, NULL) 로 5인자 호출했다.
+ * 이 PR: 호출이 (…, rel_operator, NULL, NULL, &eval_Compare_elements, NULL) 로 바뀌어 원소 비교를 '두 값의 키 쌍표' 로 못박는다. 함수
+ * 자신의 시그니처와 루프는 그대로.
+ * 바뀐 것: 호출 인자만 변경(1줄).
  */
 static int
 eval_item_card_set (THREAD_ENTRY * thread_p, DB_VALUE * item, DB_SET * set, REL_OP rel_operator)
@@ -1081,6 +1280,13 @@ eval_item_card_set (THREAD_ENTRY * thread_p, DB_VALUE * item, DB_SET * set, REL_
  *
  *  Note: The IN relationship can be stated as item has the equality rel. with
  *        one of the list elements.
+ */
+/*
+ * [리뷰] eval_some_list_eval — 오른쪽이 리스트파일인 SOME/ANY 비교 — 리스트를 스캔하며 아이템과 비교해 하나라도 참이면 즉시 V_TRUE.
+ * develop: develop(550)은 4인자였고 비교가 eval_value_rel_cmp(…, NULL) 였다.
+ * 이 PR: compare(호출자가 eval_resolved_elements 로 구한 elements.all)와 vd 를 받아 그대로 비교에 넘긴다. 스캔 열기/닫기·NULL·종료 코드 처리는
+ * develop 과 동일.
+ * 바뀐 것: 시그니처 +2인자, 호출 인자 전달(+2줄).
  */
 static DB_LOGICAL
 eval_some_list_eval (THREAD_ENTRY * thread_p, DB_VALUE * item, QFILE_LIST_ID * list_id, REL_OP rel_operator,
@@ -1180,6 +1386,12 @@ eval_some_list_eval (THREAD_ENTRY * thread_p, DB_VALUE * item, QFILE_LIST_ID * l
  *              V_ERROR:    - an error occurred.
  *
  */
+/*
+ * [리뷰] eval_all_list_eval — 리스트 상대 ALL 비교 — 연산자를 뒤집어 eval_some_list_eval 을 부르고 결과를 부정한다.
+ * develop: develop(645)은 4인자, 같은 뒤집기 switch.
+ * 이 PR: compare·vd 를 그대로 전달한다.
+ * 바뀐 것: 시그니처 +2인자. 본문 로직 동일.
+ */
 static DB_LOGICAL
 eval_all_list_eval (THREAD_ENTRY * thread_p, DB_VALUE * item, QFILE_LIST_ID * list_id, REL_OP rel_operator,
 		    const DOMAIN_COMPARE * compare, const val_descr * vd)
@@ -1227,6 +1439,13 @@ eval_all_list_eval (THREAD_ENTRY * thread_p, DB_VALUE * item, QFILE_LIST_ID * li
  *              which are determined to hold the equality relationship with
  *              specified item value. The list file values must have already
  *              been sorted.
+ */
+/*
+ * [리뷰] eval_item_card_sort_list — 정렬된 리스트파일에서 아이템과 같은 값의 개수를 센다(앞쪽 작은 값은 R_LT 로 건너뛰고 같은 구간만 R_EQ 로 센다) — 부분집합
+ * 판정용.
+ * develop: develop(692)은 두 eval_value_rel_cmp 호출이 모두 5인자(마지막 NULL)였다.
+ * 이 PR: 두 호출 모두 (…, NULL, NULL, &eval_Compare_elements, NULL) 로 바뀌어 키 쌍표 비교를 명시한다. 시그니처와 스캔 로직은 그대로.
+ * 바뀐 것: 호출 인자만 변경(2줄).
  */
 static int
 eval_item_card_sort_list (THREAD_ENTRY * thread_p, DB_VALUE * item, QFILE_LIST_ID * list_id)
@@ -1323,6 +1542,13 @@ eval_item_card_sort_list (THREAD_ENTRY * thread_p, DB_VALUE * item, QFILE_LIST_I
  *
  * Note: in a sorted list file of one column , ALL the NULL values, tuples
  *       appear at the beginning of the list file.
+ */
+/*
+ * [리뷰] eval_sub_multi_set_to_sort_list — 다중집합이 정렬 리스트의 부분집합인지 판정 — 이미 센 값은 건너뛰고, 값마다 집합 쪽(eval_item_card_set)과
+ * 리스트 쪽(eval_item_card_sort_list) 카디널리티를 비교한다.
+ * develop: develop(788)과 본문이 같고, 중복 탐지용 eval_value_rel_cmp 호출만 5인자였다.
+ * 이 PR: 그 호출이 (…, R_EQ, NULL, NULL, &eval_Compare_elements, NULL) 로 바뀌었다.
+ * 바뀐 것: 호출 인자만 변경(1줄).
  */
 static DB_LOGICAL
 eval_sub_multi_set_to_sort_list (THREAD_ENTRY * thread_p, DB_SET * set1, QFILE_LIST_ID * list_id)
@@ -1437,6 +1663,14 @@ eval_sub_multi_set_to_sort_list (THREAD_ENTRY * thread_p, DB_SET * set1, QFILE_L
  *
  * Note: in a sorted list file of one column , ALL the NULL values, tuples
  *       appear at the beginning of the list file.
+ */
+/*
+ * [리뷰] eval_sub_sort_list_to_multi_set — 정렬 리스트가 다중집합의 부분집합인지 판정 — 리스트를 훑으며 값이 바뀌는 지점마다 집합 쪽 카디널리티와 비교한다.
+ * develop: develop(902)과 본문이 같다. 직전 튜플 사본을 qfile_slot_set_tuple_ptr_and_layout 로 바인딩하고 읽는 것도 develop 에 이미 있다.
+ * 비교 호출만 5인자였다.
+ * 이 PR: 두 eval_value_rel_cmp 중 중복 판정 호출이 &eval_Compare_elements 를 받는 형태로 바뀌었다. 나머지(p_tplrec alloc/realloc 과
+ * end 라벨의 단일 해제)는 그대로.
+ * 바뀐 것: 호출 인자만 변경(1줄).
  */
 static DB_LOGICAL
 eval_sub_sort_list_to_multi_set (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id, DB_SET * set)
@@ -1614,6 +1848,12 @@ end:
  *
  * Note: in a sorted list file of one column , ALL the NULL values, tuples
  *       appear at the beginning of the list file.
+ */
+/*
+ * [리뷰] eval_sub_sort_list_to_sort_list — 정렬 리스트 1이 정렬 리스트 2의 부분집합인지 판정 — 값 구간마다 양쪽 카디널리티를 비교한다.
+ * develop: develop(1079)과 본문이 같고, 중복 판정 eval_value_rel_cmp 호출만 5인자였다.
+ * 이 PR: 그 호출이 (…, R_EQ, NULL, NULL, &eval_Compare_elements, NULL) 로 바뀌었다. 스캔·p_tplrec 관리·end 라벨 정리는 그대로.
+ * 바뀐 것: 호출 인자만 변경(1줄).
  */
 static DB_LOGICAL
 eval_sub_sort_list_to_sort_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id1, QFILE_LIST_ID * list_id2)
@@ -2196,6 +2436,17 @@ eval_set_list_cmp (THREAD_ENTRY * thread_p, const COMP_EVAL_TERM * et_comp, val_
  *              and returns V_TRUE, V_FALSE or V_UNKNOWN. If an error occurs,
  *              necessary error code is set and V_ERROR is returned.
  */
+/*
+ * [리뷰] eval_pred — 술어 트리 전체를 재귀로 평가하는 서버 실행의 중심 — qexec_intprt_fnc·qexec_merge_fnc·px_scan 등 21개 호출처가 행마다 부른다.
+ * V_TRUE/V_FALSE/V_UNKNOWN/V_ERROR 반환.
+ * develop: develop(1660)의 T_COMP_EVAL_TERM 은 eval_value_rel_cmp(…, et_comp) 로 갔고, T_ALSM_EVAL_TERM 은
+ * eval_all/some_eval·eval_all/some_list_eval 을 4인자로 불렀으며, 오른쪽이 집합도 리스트도 아니면 eval_value_rel_cmp(…, NULL) 로
+ * 떨어졌다. 원소 비교 방식은 매 원소에서 결정됐다.
+ * 이 PR: 비교항은 eval_compare_term(계획이 정한 비교)로 가고, ALSM 항은 lhs/rhs fetch 뒤 EVAL_ELEMENTS elements 를 선언해
+ * eval_resolved_elements 를 **한 번** 부른 뒤 그 결과를 리스트/집합 경로에 넘긴다. 집합도 리스트도 아닐 때 게이트가 상수 하나를 해결해
+ * 뒀으면(elements.constant, n==1) 그 변환된 값과 번호로 꺼낸 비교로 평가하는 분기가 새로 생겼다.
+ * 바뀐 것: 비교 호출 교체, ALSM 에 elements 도출 1회 + 분기 1개 추가(약 +20줄). '결정은 스캔당 1회, 행은 읽기만' 이 술어 평가에 드러나는 자리.
+ */
 DB_LOGICAL
 eval_pred (THREAD_ENTRY * thread_p, const PRED_EXPR * pr, val_descr * vd, OID * obj_oid)
 {
@@ -2692,6 +2943,15 @@ exit:
  *
  * Note: single node regular comparison predicate
  */
+/*
+ * [리뷰] eval_pred_comp0 — 비교 술어 하나짜리 단말 술어 전용 평가자 — eval_fnc 가 술어 모양을 보고 골라 둔 빠른 경로로, 양쪽을 fetch_peek_dbval 로
+ * 가져와 비교한다.
+ * develop: develop(2144)은 두 값을 fetch 한 뒤 eval_value_rel_cmp (…, et_comp->rel_op, et_comp) 로 넘겼고, 주석은
+ * "db_value_compare 가 필요한 코어션을 알아서 한다" 였다.
+ * 이 PR: 마지막 호출이 eval_compare_term (thread_p, et_comp, vd, peek_val1, peek_val2) 로 바뀌고 주석도 "행 이전에 해결된 그대로 비교한다"
+ * 로 교체됐다. fetch·NULL(R_NULLSAFE_EQ 예외) 처리는 동일.
+ * 바뀐 것: 마지막 호출 1줄 + 주석 교체(-6/+2줄).
+ */
 DB_LOGICAL
 eval_pred_comp0 (THREAD_ENTRY * thread_p, const PRED_EXPR * pr, val_descr * vd, OID * obj_oid)
 {
@@ -2892,6 +3152,14 @@ eval_pred_comp3 (THREAD_ENTRY * thread_p, const PRED_EXPR * pr, val_descr * vd, 
  *
  * Note: single node all/some predicate with a set
  */
+/*
+ * [리뷰] eval_pred_alsm4 — 오른쪽이 집합(컬렉션)인 ALL/SOME 단말 술어 전용 평가자 — 빈 집합 ANSI 규칙과 비집합 타입
+ * 에러(ER_QPROC_INVALID_DATATYPE)를 먼저 처리한다.
+ * develop: develop(2347)은 lhs fetch 직후 바로 eval_all_eval/eval_some_eval 을 4인자로 불렀다.
+ * 이 PR: 그 앞에 EVAL_ELEMENTS elements; eval_resolved_elements (et_alsm, vd, &elements); 가 들어가고 &elements 와 vd 를
+ * 넘긴다. 앞쪽 검사들은 그대로.
+ * 바뀐 것: +3줄, 호출 인자 +2.
+ */
 DB_LOGICAL
 eval_pred_alsm4 (THREAD_ENTRY * thread_p, const PRED_EXPR * pr, val_descr * vd, OID * obj_oid)
 {
@@ -2959,6 +3227,12 @@ eval_pred_alsm4 (THREAD_ENTRY * thread_p, const PRED_EXPR * pr, val_descr * vd, 
  *   obj_oid(in): Object Identifier
  *
  * Note: single node all/some  predicate with a list file
+ */
+/*
+ * [리뷰] eval_pred_alsm5 — 오른쪽이 리스트파일(연결된 부질의 결과)인 ALL/SOME 단말 술어 전용 평가자 — 연결 질의를 실행하고 빈 리스트 ANSI 규칙을 먼저 처리한다.
+ * develop: develop(2413)은 lhs fetch 직후 eval_all_list_eval/eval_some_list_eval 을 4인자로 불렀다.
+ * 이 PR: EVAL_ELEMENTS elements; eval_resolved_elements (…) 로 이번 실행의 원소 비교를 구해 elements.all 과 vd 를 넘긴다.
+ * 바뀐 것: +3줄, 호출 인자 +2.
  */
 DB_LOGICAL
 eval_pred_alsm5 (THREAD_ENTRY * thread_p, const PRED_EXPR * pr, val_descr * vd, OID * obj_oid)

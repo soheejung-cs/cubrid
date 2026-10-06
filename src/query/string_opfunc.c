@@ -7301,6 +7301,17 @@ error_return:
  * result (out) : result
  * domain (in)	: the domain of the return type
  */
+/*
+ * [리뷰] db_add_time — ADDTIME/SUBTIME 의 값 계산기 — fetch_peek_arith 가 T_ADDTIME 노드에서 left·right DB_VALUE 와 컴파일된 결과
+ * 도메인을 넘겨 부르고, result DB_VALUE 를 채운다.
+ * develop: domain 이 NULL 이 아니면 assert (TP_DOMAIN_TYPE (domain) == result_type) 로 '컴파일 도메인 = 계산된 결과 타입' 을 무조건
+ * 요구했다. 문자열 인자가 타임존을 달고 와 result_type 이 DATETIMETZ 가 되면, 디버그는 assert 로 죽고 릴리스는 VARCHAR 자리에 DATETIMETZ 값을 넣었다.
+ * 이 PR: zone_to_string(= 도메인이 VARCHAR 인데 결과 타입이 DATETIMETZ) 이라는 예외를 하나 두고, 그때는 assert 를 건너뛰고 DATETIMETZ 를
+ * db_datetimetz_to_string 으로 문자열화해 도메인의 코드셋·콜레이션으로 VARCHAR 결과를 만든다. 추가로 디버그 전용 블록에서
+ * domain_resolve(DOMAIN_CTX_FUNC_ARG, T_ADDTIME) 가 같은 타입을 답하는지 교차검증한다.
+ * 바뀐 것: 분기 1개 추가(+14줄의 결과 생성 경로), 디버그 교차검증 블록 1개 추가(+20줄). res_s 는 기존 VARCHAR 가지와 같은 need_clear=true 규약을 따르고
+ * error_return 이 해제하므로 누수 짝은 맞다. 릴리스 동작이 바뀌는 몇 안 되는 지점이다.
+ */
 int
 db_add_time (const DB_VALUE * left, const DB_VALUE * right, DB_VALUE * result, const TP_DOMAIN * domain)
 {
@@ -22521,6 +22532,14 @@ parse_digits (char *s, int *nr, int cnt)
  * Note:
  *    inverse function for date_format - compose a date/time from some format
  *    specifiers and some informations.
+ */
+/*
+ * [리뷰] db_str_to_date — STR_TO_DATE 의 값 계산기 — fetch_peek_arith 가 str·format·(선택적) 결과 도메인을 넘겨 부르고 res_type 에 맞는
+ * DATE/TIME/DATETIME(TZ) 값을 result 에 채운다.
+ * develop: 포맷 문자열에서 res_type 을 정한 뒤 바로 포맷 해석 루프로 들어갔다. 새 도메인 해결 모듈과 대조하는 지점이 없었다.
+ * 이 PR: 포맷 해석 직전에 디버그 전용(!NDEBUG && (SERVER_MODE||SA_MODE)) 블록이 들어가, domain_classify_value 로 분류한 format 과 str
+ * 로 domain_resolve(DOMAIN_CTX_FUNC_ARG, T_STR_TO_DATE) 를 불러 그 답이 res_type 과 같고 late-bind 가 필요 없음을 assert 한다.
+ * 바뀐 것: 릴리스 코드 변경 없음, 디버그 교차검증 블록만 +19줄. 새 도메인 규칙 테이블이 기존 인라인 타이핑과 어긋나는 순간 optdebug 에서 멈추게 하는 안전망이다.
  */
 int
 db_str_to_date (const DB_VALUE * str, const DB_VALUE * format, const DB_VALUE * date_lang, DB_VALUE * result,

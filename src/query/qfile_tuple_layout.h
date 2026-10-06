@@ -512,6 +512,13 @@ qfile_value_body_size (const QFILE_COL_LAYOUT * column_layout, const DB_VALUE * 
  * qfile_tuple_check_col_type () - writer-side probe: a value written into the column at column_index must have the column's type
  *   (compatible pairs sharing a layout kind are accepted; an unresolved column accepts anything).
  */
+/*
+ * [리뷰] qfile_tuple_check_col_type — 디버그 빌드 전용 writer 측 점검 — 리스트 컬럼에 쓰려는 DB_VALUE 의 타입이 그 컬럼 도메인의 타입과
+ * 맞는지(문자열·집합·OID 끼리는 허용) 단언한다. qfile_tuple_fill 이 컬럼마다 부른다.
+ * develop: 코드는 같고, ctype != DB_TYPE_VARIABLE 단언의 근거 주석이 '크기 패스(qfile_tuple_resolve_column)가 해결해 준다' 였다.
+ * 이 PR: 같은 단언이지만 근거가 '크기 패스가 VARIABLE 컬럼에 값 쓰기를 거부했다' 로 바뀌었다 — 단언을 지켜 주는 주체가 '해결'에서 '거부'로 넘어갔다.
+ * 바뀐 것: 주석 1줄만(+1/-1). 실행 동작은 동일하고, 이 PR 의 큰 그림(행은 읽기만 한다)에서 이 단언의 근거가 바뀐 것을 기록하는 변경이다.
+ */
 inline void
 qfile_tuple_check_col_type (const QFILE_TUPLE_VALUE_TYPE_LIST * type_list, int column_index, const DB_VALUE * val)
 {
@@ -535,6 +542,14 @@ qfile_tuple_check_col_type (const QFILE_TUPLE_VALUE_TYPE_LIST * type_list, int c
  *   domain is still VARIABLE: a list opens with the plan's domains, so no row resolves a column's domain
  *   return: ER_FAILED, with ER_QPROC_DOMAIN_UNRESOLVED set
  */
+/*
+ * [리뷰] qfile_tuple_column_unresolved — 크기 패스가 VARIABLE 도메인 컬럼에 NULL 아닌 값이 들어오는 것을 발견했을 때 부르는 실패 지점 —
+ * ER_QPROC_DOMAIN_UNRESOLVED 를 세우고 ER_FAILED 를 돌려준다. qfile_tuple_size 와 qfile_tuple_size_from_values 가 부른다.
+ * develop: 같은 자리에 qfile_tuple_resolve_column 이 있었다 — 첫 바인드 값에서 tp_domain_resolve_value 로 도메인을 골라
+ * type_list->domp[column_index] 에 써넣고 바뀌었으면 true 를 돌려줬다. 즉 행 하나가 리스트 레이아웃을 바꿀 수 있었다.
+ * 이 PR: 해결을 전혀 하지 않는다. assert (false) 로 디버그 빌드는 멈추고, 릴리스는 컬럼 인덱스와 VARIABLE 타입 이름을 담은 오류를 올리고 끝낸다.
+ * 바뀐 것: 함수 통째 교체(+10/-21). 시그니처가 (type_list, column_index, val) → (column_index) 로, 반환이 bool → int 로 바뀌었다.
+ */
 inline int
 qfile_tuple_column_unresolved (int column_index)
 {
@@ -551,6 +566,16 @@ qfile_tuple_column_unresolved (int column_index)
  *		 check, qfile_tuple_column_unresolved)
  *   src(in/out): a val source gets its column_data size stored in column_data_size
  *   has_null(out): at least one column is NULL
+ */
+/*
+ * [리뷰] qfile_tuple_size — 튜플 조립의 크기 패스 — 컬럼 소스 배열을 훑어 NULL 여부를 확정하고 각 값의 본문 크기를 재서 헤더 포함 최종 튜플 길이(4 배수)를 돌려준다.
+ * 실패하면 ER_FAILED. qfile_tuple_fill 앞에 반드시 돌고, 정렬 튜플 생성(qfile_build_sort_rec·qfile_generate_sort_tuple) 등이
+ * 호출자다.
+ * develop: 값이 있는 컬럼마다 qfile_tuple_resolve_column 을 돌려 VARIABLE 컬럼을 그 값으로 해결하고, 하나라도 바뀌면 qfile_set_layout 으로
+ * 레이아웃을 다시 계산한 다음 크기를 쟀다(changed 지역 변수).
+ * 이 PR: VARIABLE 컬럼(column_layout_array[i].type_id 로 판정)에 NULL 아닌 값이 오면 그 자리에서 qfile_tuple_column_unresolved 로
+ * 실패한다. 크기 패스 안에서 type_list 가 바뀌지 않아 레이아웃 재계산 경로 자체가 없어졌다.
+ * 바뀐 것: 해결·재레이아웃 삭제(-8), 조건부 실패로 교체(+4), 지역 변수 changed 제거. 문서 주석의 type_list 가 in/out 에서 in 으로 바뀌었다.
  */
 inline int
 qfile_tuple_size (QFILE_TUPLE_VALUE_TYPE_LIST * type_list, QFILE_TUPLE_COL_SRC * src, int n, bool * has_null)
@@ -819,6 +844,17 @@ qfile_tuple_size_finalize (const QFILE_TUPLE_VALUE_TYPE_LIST * type_list, int va
 /*
  * qfile_tuple_size_from_values () / qfile_tuple_fill_from_values () - T_NORMAL overload over f_valp[]; the size pass
  *   records each column_data length in lens[] so the fill pass need not recompute it.
+ */
+/*
+ * [리뷰] qfile_tuple_size_from_values — 리스트 파일에 튜플을 쓰기 직전, 컬럼 레이아웃(type_list->column_layout_array)을 보고 각 값의 인코딩
+ * 길이를 lens[] 에 기록하며 튜플 전체 크기를 돌려준다. qexec_topn_tuples_to_list_id · qdata_save_agg_hentry_to_list 등 리스트 조립 경로가
+ * fill 패스 직전에 부른다.
+ * develop: 컬럼이 DB_TYPE_VARIABLE 이고 값이 NULL 이 아니면 그 자리에서 qfile_tuple_resolve_column() 으로 값의 타입을 컬럼에 심고
+ * qfile_set_layout() 으로 레이아웃을 다시 만든 뒤 `goto restart` 로 처음부터 전 컬럼을 다시 재니, 행을 쓰는 중에 리스트의 도메인이 확정됐다.
+ * 이 PR: 미해결 컬럼을 만나면 재해결하지 않고 qfile_tuple_column_unresolved(i) 로 즉시 에러를 돌려준다. 리스트 도메인은 실행 전 게이트에서 이미 확정돼 있어야
+ * 한다는 전제를 이 함수가 검사만 한다.
+ * 바뀐 것: 행 시점 도메인 확정(late resolve + 레이아웃 재생성 + restart 루프) 삭제, 에러 반환으로 교체 — 약 -6줄. restart 레이블과 goto 가 사라져 루프가
+ * 단일 패스가 됐다.
  */
 inline int
 qfile_tuple_size_from_values (QFILE_TUPLE_VALUE_TYPE_LIST * type_list, DB_VALUE ** vals, int *lens, int n,

@@ -12108,6 +12108,17 @@ exit:
  *   attr_chg_properties(out): map of attribute changes to build
  *
  */
+/*
+ * [리뷰] build_attr_change_map — ALTER ... CHANGE/MODIFY 한 컬럼에 대해 무엇이 바뀌는지(이름·타입·제약·인덱스)를 SM_ATTR_PROP_CHG 맵으로
+ * 채우는 함수로, check_change_attribute 가 부르고 여기서 저장된 제약 정보로 인덱스가 뒤에 재생성된다.
+ * develop: develop(src/query/execute_schema.c:12142)에서는 클래스 제약의 키 속성 목록에서 그 컬럼을 찾았을 때만 sm_save_constraint_info
+ * 로 제약을 저장했다 — 키에 그 컬럼이 없는 인덱스는 손대지 않았다.
+ * 이 PR: 키에 없더라도 인덱스 계열 제약이고 필터 조건자(filter_predicate)가 att_ids 로 그 컬럼을 읽고 있으면 같은 저장 경로를 타게 해, 컬럼 타입이 바뀔 때 조건자
+ * 스트림이 다시 컴파일되고 인덱스가 재생성되게 한다.
+ * 바뀐 것: else if 분기 신설(+21줄). 도메인·콜레이션이 컴파일 시점에 고정된 조건자 스트림이 ALTER 뒤에도 남는 구멍을 막는, 이 PR 의 게이트 전제를 스키마 변경 쪽에서 지키는
+ * 변경.
+ * [지적 C5-07]
+ */
 static int
 build_attr_change_map (PARSER_CONTEXT * parser, DB_CTMPL * ctemplate, PT_NODE * attr_def, PT_NODE * attr_old_name,
 		       PT_NODE * constraints, SM_ATTR_PROP_CHG * attr_chg_properties)

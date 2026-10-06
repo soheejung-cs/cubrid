@@ -974,6 +974,16 @@ cleanup:
  * left (in)  :
  * right (in) :
  */
+/*
+ * [리뷰] partition_do_regu_variables_match — 파티션 가지치기에서 질의 술어 쪽 regu 와 파티션 식 쪽 regu 가 같은 것인지 판정한다(bool).
+ * partition_match_pred_expr 가 부르고, 그 위로 partition_prune_heap_scan/index_scan/prune_spec 이 있다.
+ * develop: TYPE_DBVAL·TYPE_CONSTANT·TYPE_POS_VALUE 세 분기 모두 tp_value_compare 로 두 값을 비교했다. TYPE_POS_VALUE 는
+ * (DB_VALUE *) pinfo->vd->dbval_ptr + value.val_pos 로 호스트 변수 슬롯을 직접 계산해 읽었다.
+ * 이 PR: 비교는 domain_compare_by_type_pair — 키 쌍 표에서 두 값의 타입·콜레이션 키 조합에 해당하는 비교를 찾아 쓴다(파티션 식은 resolve_domains 가
+ * 돌지 않는 카탈로그 스트림이라 플랜이 가진 비교가 없다). 값은 REGU_RESOLVED_VALUE (vd, regu) 로 플랜 아이템이 가리키는 슬롯에서 읽고, 지역 포인터는 const
+ * DB_VALUE * 가 됐다.
+ * 바뀐 것: 비교 3건·값 읽기 2건 교체(+8/-7). 분기 구조와 반환 조건은 그대로.
+ */
 static bool
 partition_do_regu_variables_match (PRUNING_CONTEXT * pinfo, const REGU_VARIABLE * left, const REGU_VARIABLE * right)
 {
@@ -1338,6 +1348,14 @@ cleanup:
  * op (in)	   : operator to apply
  * pruned (in/out) : pruned partitions
  */
+/*
+ * [리뷰] partition_prune_range — RANGE 파티션에서 값 하나를 각 파티션의 min/max 경계와 맞춰 살아남는 파티션을 비트셋에 표시하고 MATCH_STATUS 를
+ * 돌려준다. INSERT 의 파티션 결정(partition_prune_insert)과 SELECT 의 가지치기 양쪽에서 쓰인다.
+ * develop: 경계 비교 두 곳 모두 tp_value_compare (…, 1, 1) 로, 호출 시점에 두 값의 도메인을 맞춰 비교했다.
+ * 이 PR: domain_compare_by_type_pair (…, 1, 1, NULL) — 경계는 카탈로그가 가진 파티션 식의 타입이고 비교 대상은 질의의 값이므로, 플랜이 아니라 키 쌍 표가
+ * 두 타입의 비교를 준다.
+ * 바뀐 것: 비교 2건 교체(+4/-2, 근거 주석 2줄 포함). max 감소 처리 등 나머지 분기는 불변.
+ */
 static MATCH_STATUS
 partition_prune_range (PRUNING_CONTEXT * pinfo, const DB_VALUE * val, const PRUNING_OP op, PRUNING_BITSET * pruned)
 {
@@ -1619,6 +1637,15 @@ partition_prune (PRUNING_CONTEXT * pinfo, const REGU_VARIABLE * arg, const PRUNI
  * value_p (in/out) : holder for the value of regu
  * is_value (in/out): true if the conversion was successful
  */
+/*
+ * [리뷰] partition_get_value_from_regu_var — 가지치기가 스캔을 시작하기 전(그래서 fetch_peek_dbval 을 못 쓴다) regu 하나에서 DB_VALUE 를
+ * 떠내 value_p 에 복제하고 is_value 로 성공 여부를 알린다. partition_prune 이 부른다.
+ * develop: TYPE_POS_VALUE 분기에서 (DB_VALUE *) pinfo->vd->dbval_ptr + regu->value.val_pos 로 호스트 변수 슬롯을 직접 계산해
+ * pr_clone_value 했다.
+ * 이 PR: REGU_RESOLVED_VALUE (pinfo->vd, regu) 로 플랜 아이템의 ref 가 가리키는 슬롯에서 읽는다 — 실행 전 게이트가 그 참조에 대해 확정해 둔 값이다.
+ * 타입은 const DB_VALUE *.
+ * 바뀐 것: 한 줄 교체(+1/-1). 나머지 분기·에러 경로는 불변.
+ */
 static int
 partition_get_value_from_regu_var (PRUNING_CONTEXT * pinfo, const REGU_VARIABLE * regu, DB_VALUE * value_p,
 				   bool * is_value)
@@ -1783,6 +1810,15 @@ partition_is_reguvar_const (const REGU_VARIABLE * regu_var)
  * key (in)		: index key
  * attr_key (in/out)	: the requested value
  * is_present (in/out)	: set to true if the value was successfully fetched
+ */
+/*
+ * [리뷰] partition_get_value_from_key — 인덱스 키 regu 에서 파티션 키로 쓸 값을 떠내 attr_key 에 복제하고 is_present 로 성공을 알린다.
+ * partition_get_value_from_regu_var 가 키 경로에서 부른다.
+ * develop: TYPE_POS_VALUE 분기에서 (DB_VALUE *) pinfo->vd->dbval_ptr + key->value.val_pos 로 슬롯을 직접 계산해
+ * pr_clone_value 했다.
+ * 이 PR: REGU_RESOLVED_VALUE (pinfo->vd, key) 로 플랜 아이템이 가리키는 슬롯에서 읽는다(const DB_VALUE *). 주석도 'val_pos 로 호스트 변수
+ * 참조'에서 '각 참조가 자기 값을 읽는다'로 바뀌었다.
+ * 바뀐 것: 한 줄 + 주석 교체(+2/-2).
  */
 static int
 partition_get_value_from_key (PRUNING_CONTEXT * pinfo, const REGU_VARIABLE * key, DB_VALUE * attr_key,

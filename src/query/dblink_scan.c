@@ -638,6 +638,15 @@ dblink_bind_dbval_to_param (int conn_handle, int stmt_handle, int param_index, D
   return NO_ERROR;
 }
 
+/*
+ * [리뷰] dblink_bind_param — DBLINK 스캔이 원격 CCI 문장에 호스트 변수를 바인딩한다. host_vars->index[] 가 가리키는 위치의 DB_VALUE 를 cci
+ * 파라미터 1..n 으로 넘기고 첫 실패에서 에러 코드를 반환한다.
+ * develop: develop 은 `&vd->dbval_ptr[i]` 를 바인딩했다 — 즉 실행이 쓰는 값 배열을 그대로 넘겼다(src/query/dblink_scan.c:649).
+ * 이 PR: `&vd->xasl_state->resolved_domain.in[i]` 를 바인딩한다. RESOLVED_DOMAIN_TABLE.in 은 '클라이언트가 보낸 원본 복사본, 빌려온
+ * 것이고 쓰이지 않는다'(domain_plan.h:449), vals(=dbval_ptr) 는 게이트가 변환해 둔 값이다. 원격 서버에는 변환 전 원본이 간다.
+ * 바뀐 것: 바인딩 소스를 한 줄 교체(dbval_ptr → resolved_domain.in) + 이유 주석 1줄. ±3줄.
+ * [지적 C3-05]
+ */
 static int
 dblink_bind_param (int conn_handle, int stmt_handle, VAL_DESCR * vd, DBLINK_HOST_VARS * host_vars)
 {

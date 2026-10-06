@@ -210,6 +210,18 @@ stx_map_stream_to_xasl_node_header (THREAD_ENTRY * thread_p, xasl_node_header * 
  * Note: the caller is responsible for freeing the memory of
  * xasl_unpack_info_ptr. The free function is free_xasl_unpack_info().
  */
+/*
+ * [리뷰] stx_map_stream_to_xasl — 직렬화된 XASL 스트림을 서버 메모리의 XASL 트리로 복원하는 로드 진입점. qexec/xasl_cache 가 부르고 트리와 언팩 정보를
+ * 넘겨준다.
+ * develop: 스트림을 복원하고 헤더 값을 채운 뒤 end: 에서 stx_free_visited_ptrs 만 하고 에러코드를 돌려줬다. 도메인 관련 사전 계산은 없었고, 각 노드는
+ * original_domain 에 컴파일 도메인 사본을 들고 실행 중에 domain 을 고쳐 썼다.
+ * 이 PR: query_in_progress 를 내린 직후 stx_build_domain_plan (thread_p, xasl, unpack_info_p) 을 불러 이 스트림의
+ * DOMAIN_PLAN 을 도출한다 — 이 PR 의 '로드가 플랜을 만든다' 단계. 실패하면 에러코드를 세우고 *xasl_tree/*xasl_unpack_info_ptr 를 NULL 로 돌린 뒤,
+ * end: 에서 stx_free_visited_ptrs 를 먼저 하고 그 다음 free_xasl_unpack_info 를 한다(방문 포인터 블록이 언팩 정보 안에 있으므로 순서가 중요하다). SA
+ * 빌드에서는 전역 포인터도 NULL 로 되돌린다.
+ * 바뀐 것: 지역 변수 1개 + 플랜 도출 블록(+8줄) + end: 의 정리 블록(+9줄). #include "domain_plan.h" 추가. 같은 파일에서 original_domain 저장이
+ * 전부 plan_item=NULL 로 교체되고 stx_set_fast_peek 가 신설됐다.
+ */
 int
 stx_map_stream_to_xasl (THREAD_ENTRY * thread_p, xasl_node ** xasl_tree, bool use_xasl_clone, char *xasl_stream,
 			int xasl_stream_size, XASL_UNPACK_INFO ** xasl_unpack_info_ptr)
@@ -299,6 +311,16 @@ end:
  * POS or node - has no resolution anywhere. The catalog streams carry none (no host variable reaches a stored
  * predicate); one is refused rather than evaluated with a variable domain.
  */
+/*
+ * [리뷰] stx_index_stream_rejected — 필터 인덱스·함수 인덱스 스트림의 로드측 미해소 검사. stx_map_stream_to_filter_pred 와
+ * stx_map_stream_to_func_pred 가 복원 직후 불러, 거절이면 true 를 돌려주고 호출자는 end: 로 빠진다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에는 이 검사가 없었고, 변수 도메인은 실행 중에 메워졌다.
+ * 이 PR: 언팩 중 stx_build_regu_variable 이 regu_is_variable_pos 로 표시해 둔 unpack_info_p->index_stream_late_bind 를
+ * 본다. 켜져 있으면 ER_QPROC_DOMAIN_UNRESOLVED 를 올리고 에러코드를 세운 뒤 언팩 정보를 해제하고 true. 카탈로그 스트림에는 호스트 변수가 닿지 않으므로
+ * resolve_domains 가 돌지 않는 이 스트림은 변수 도메인으로 평가하지 않고 거절한다는 계약이다.
+ * 바뀐 것: 신설(+13줄) + 호출 2곳(+8줄) + 두 로드 함수에 unpack_info_p->index_stream = true 표시(+2줄).
+ * [지적 C10-01]
+ */
 static bool
 stx_index_stream_rejected (THREAD_ENTRY * thread_p, XASL_UNPACK_INFO * unpack_info_p)
 {
@@ -327,6 +349,16 @@ stx_index_stream_rejected (THREAD_ENTRY * thread_p, XASL_UNPACK_INFO * unpack_in
  *       (*pred)->unpack_info by calling free_xasl_unpack_info().
  *       *pred is private_alloced separatedly of (*pred)->unpack_info and
  *       needs to be freed after it
+ */
+/*
+ * [리뷰] stx_map_stream_to_filter_pred — 필터 인덱스에 박힌 술어 스트림을 서버에서 PRED_EXPR_WITH_CONTEXT 트리로 복원해 *pred 로 돌려주는 진입점
+ * — fpcache_claim(locator_eval_filter_predicate 경로)과 xbtree_load_index/xbtree_load_online_index 가 부른다.
+ * develop: develop 에서는 스트림을 언팩해 pwc 를 만들고 pwc->unpack_info 를 채워 돌려주는 것이 전부였다. 도메인과 관련된 확인도, 비교 확정도 이 지점에 없었다.
+ * 이 PR: 언팩 정보에 index_stream=true 를 세워 '이 스트림은 resolve_domains 가 돌지 않는다'고 표시하고, 복원 직후
+ * stx_index_stream_rejected() 로 변수 도메인 regu 가 섞였는지 확인해 있으면 거부한다. 통과하면 domain_plan_stream_compares() 가 술어의 비교를
+ * 행을 읽기 전에 한 번에 확정한다.
+ * 바뀐 것: 분기 2개 추가(+12줄). 이 PR 의 '실행 전 게이트'가 카탈로그 스트림 경로에서는 '스트림 로드 직후'에 놓인 형태다. 두 실패 경로 모두
+ * free_xasl_unpack_info 를 호출해 짝을 유지한다.
  */
 int
 stx_map_stream_to_filter_pred (THREAD_ENTRY * thread_p, pred_expr_with_context ** pred, char *pred_stream,
@@ -397,6 +429,14 @@ end:
  *   xasl_stream(in)    : pointer to xasl stream
  *   xasl_stream_size(in)       : # of bytes in xasl_stream
  *   xasl_unpack_info_ptr(in)   : pointer to where to return the pack info
+ */
+/*
+ * [리뷰] stx_map_stream_to_func_pred — 함수 인덱스·파티션 식의 FUNC_PRED 스트림을 복원해 *xasl 과 *xasl_unpack_info_ptr 로 돌려주는 진입점
+ * — partition_load_partition_predicate 와 xbtree_load_index 계열이 부른다.
+ * develop: develop 에서는 스트림 복원 후 p_xasl 과 unpack_info 를 그대로 호출자에게 넘겼다. 게이트에 해당하는 처리가 없었다.
+ * 이 PR: index_stream=true 표시 → stx_index_stream_rejected() 거부 확인 → domain_plan_stream_compares(thread_p, NULL,
+ * p_xasl->func_regu) 로 식의 비교를 확정하는 세 단계를 거친 뒤에만 결과를 넘긴다.
+ * 바뀐 것: filter_pred 쪽과 같은 형태의 분기 2개 추가(+12줄). 두 함수가 동일한 게이트 3단계를 각각 복제하고 있다.
  */
 int
 stx_map_stream_to_func_pred (THREAD_ENTRY * thread_p, func_pred ** xasl, char *xasl_stream, int xasl_stream_size,
@@ -1793,6 +1833,15 @@ stx_build_xasl_header (THREAD_ENTRY * thread_p, char *ptr, XASL_NODE_HEADER * xa
   return ptr;
 }
 
+/*
+ * [리뷰] stx_build_xasl_node — XASL 노드 하나를 스트림 버퍼에서 읽어 XASL_NODE 구조체를 채우고 다음 버퍼 위치를 돌려주는 로드 본체 —
+ * stx_restore_xasl_node 가 부르고, 그 위는 qmgr_process_query → stx_map_stream_to_xasl 이다.
+ * develop: develop 의 XASL_NODE 에는 domain_plan·limit_compare 필드 자체가 없었다. 도메인은 각 regu/arith/aggregate 가 들고 있는
+ * original_domain 으로 실행 시마다 되돌려 다시 풀었다.
+ * 이 PR: 함수 첫 두 줄에서 xasl->domain_plan 과 xasl->limit_compare 를 NULL 로 깐다. 둘 다 스트림에 없고 로드가 파생하는 필드로, domain_plan
+ * 은 트리 전체 DOMAIN_PLAN 포인터(xasl.h:1139), limit_compare 는 LIMIT 비교 계획(xasl.h:1180)이다.
+ * 바뀐 것: +2줄. 다만 선언(`int offset;`) 앞에 실행문이 오는 배치라 이 파일의 C 스타일에서 벗어난다.
+ */
 static char *
 stx_build_xasl_node (THREAD_ENTRY * thread_p, char *ptr, XASL_NODE * xasl)
 {
@@ -3189,6 +3238,14 @@ stx_build_buildvalue_proc (THREAD_ENTRY * thread_p, char *ptr, BUILDVALUE_PROC_N
   return ptr;
 }
 
+/*
+ * [리뷰] stx_build_mergelist_proc — MERGELIST_PROC_NODE(정렬 머지 조인 노드)의 바깥/안쪽 XASL·spec·val_list 와 ls_merge 정보를
+ * 스트림에서 복원한다 — stx_build_xasl_node 가 PROC 타입별로 부른다.
+ * develop: develop 에는 merge_compares 필드가 없었고, 머지 비교는 실행 시 ls_merge 의 도메인으로 그때그때 결정됐다.
+ * 이 PR: ls_merge 복원 뒤 merge_list_info->merge_compares 를 NULL 로 깐다 — 머지 키 비교 계획(xasl.h:378)의 자리를 비워 두고, 채우는 일은
+ * 뒤따르는 DOMAIN_PLAN 도출이 맡는다.
+ * 바뀐 것: +1줄. 자료구조에 로드-파생 포인터가 하나 늘고 그 초기화가 여기에 붙었다.
+ */
 static char *
 stx_build_mergelist_proc (THREAD_ENTRY * thread_p, char *ptr, MERGELIST_PROC_NODE * merge_list_info)
 {
@@ -4469,6 +4526,14 @@ stx_build_eval_term (THREAD_ENTRY * thread_p, char *ptr, EVAL_TERM * eval_term)
   return ptr;
 }
 
+/*
+ * [리뷰] stx_build_comp_eval_term — 비교 술어 항(COMP_EVAL_TERM: lhs rel_op rhs)을 스트림에서 복원한다 — stx_build_eval_term →
+ * stx_build_pred_expr 경로로 술어 트리를 세울 때 불린다.
+ * develop: develop 은 lhs/rhs regu 와 rel_op·type 만 읽고 끝냈다. 비교에 쓸 함수는 실행 시 두 값의 타입으로 매번 골랐다.
+ * 이 PR: 마지막에 comp_eval_term->domain_compare = NULL 을 둬, 이 항의 비교 계획(DOMAIN_COMPARE_PLAN,
+ * xasl_predicate.hpp:117) 슬롯을 비운 상태로 넘긴다. 실제 채우기는 실행 전 게이트(DOMAIN_PLAN 도출 또는 domain_plan_stream_compares)가 한다.
+ * 바뀐 것: +1줄. '컴파일이 슬롯을 표시하고 로드가 비워 두면 게이트가 채운다'는 이 PR 의 3단 구조에서 '비워 두는' 자리다.
+ */
 static char *
 stx_build_comp_eval_term (THREAD_ENTRY * thread_p, char *ptr, COMP_EVAL_TERM * comp_eval_term)
 {
@@ -4515,6 +4580,14 @@ stx_build_comp_eval_term (THREAD_ENTRY * thread_p, char *ptr, COMP_EVAL_TERM * c
   return ptr;
 }
 
+/*
+ * [리뷰] stx_build_alsm_eval_term — ALL/SOME 집합 비교 항(ALSM_EVAL_TERM: elem rel_op ANY/ALL elemset)을 스트림에서 복원한다 —
+ * stx_build_eval_term 이 부른다.
+ * develop: elem/elemset regu 와 eq_flag·rel_op·item_type 만 읽었다. 원소 비교는 실행 시 결정됐다.
+ * 이 PR: alsm_eval_term->domain_compare = NULL 을 추가해 원소 비교 계획(DOMAIN_ELEMENT_COMPARE_PLAN,
+ * xasl_predicate.hpp:129) 슬롯을 비운다.
+ * 바뀐 것: +1줄. comp_eval_term 과 같은 패턴.
+ */
 static char *
 stx_build_alsm_eval_term (THREAD_ENTRY * thread_p, char *ptr, ALSM_EVAL_TERM * alsm_eval_term)
 {
@@ -4855,6 +4928,15 @@ error:
   return NULL;
 }
 
+/*
+ * [리뷰] stx_build_indx_info — 인덱스 접근 스펙의 INDX_INFO(btid, 키 범위, ISS/ILS, 커버링 리스트 등)를 스트림에서 복원한다 —
+ * stx_restore_indx_info(stream_to_xasl.c:724)가 부르고 다음 버퍼 위치를 돌려준다.
+ * develop: develop 의 INDX_INFO 에는 key_type·key_plan 필드가 없었고(access_spec.hpp 의 필드 끝은 ils_prefix_len), 인덱스 키
+ * 도메인은 서버가 루트 헤더에서 glean 해 쓰는 것뿐이었다.
+ * 이 PR: func_idx_col_id 다음에 or_unpack_domain 으로 B-tree 키 도메인(key_type)을 읽고, indx_info->key_plan 은 NULL 로 깐다.
+ * 로드가 이 key_type 으로부터 키 플랜을 파생하고, 그 플랜이 스캔의 search_keys/search_compare 선택 근거가 된다.
+ * 바뀐 것: 스트림 포맷 변경(+4줄). xts_process_indx_info(pack)·xts_sizeof_indx_info(size)와 3인 1조로 맞아야 하는 계약이 새로 생겼다.
+ */
 static char *
 stx_build_indx_info (THREAD_ENTRY * thread_p, char *ptr, INDX_INFO * indx_info)
 {
@@ -5580,6 +5662,14 @@ error:
   return NULL;
 }
 
+/*
+ * [리뷰] stx_build_val_list — VAL_LIST(스캔/서브쿼리가 쓰는 DB_VALUE 슬롯 묶음)를 스트림에서 복원해 QPROC_DB_VALUE_LIST 체인을 만든다 —
+ * stx_restore_val_list 를 거쳐 stx_build_xasl_node 가 부른다.
+ * develop: develop 은 val_cnt 를 읽고 값 슬롯 체인만 할당했다. 스코프라는 개념이 없었다.
+ * 이 PR: val_cnt 를 읽은 직후 val_list->domain_scope = 0 으로 초기화한다 — 이 값 묶음이 어느 도메인 스코프(블록 단위 임시 변환 세대)에 속하는지는 뒤따르는
+ * DOMAIN_PLAN 도출이 정한다.
+ * 바뀐 것: +2줄(주석 포함). stx_alloc_struct 가 0 초기화를 하지 않으므로(xasl_stream.cpp:223) 이 한 줄이 없으면 스코프 번호가 쓰레기 값이 된다.
+ */
 static char *
 stx_build_val_list (THREAD_ENTRY * thread_p, char *ptr, VAL_LIST * val_list)
 {
@@ -5684,6 +5774,18 @@ stx_build_db_value_list (THREAD_ENTRY * thread_p, char *ptr, QPROC_DB_VALUE_LIST
 }
 #endif
 
+/*
+ * [리뷰] stx_build_regu_variable — REGU_VARIABLE 하나(도메인·타입·플래그·값)를 스트림에서 복원하는, 실행 엔진에서 가장 많이 불리는 로드 함수 —
+ * stx_restore_regu_variable 을 통해 술어·식·스펙 전역에서 불린다.
+ * develop: 도메인을 읽은 뒤 regu_var->original_domain = regu_var->domain 으로 컴파일 도메인을 따로 보관했다. 이것이 실행 때마다
+ * qexec_resolve_domains_* 가 domain 을 되돌려(query_executor.c:1501) 다시 푸는 근거였다. 또 FETCH_ALL_CONST/FETCH_NOT_CONST
+ * 플래그가 직렬화되지 않았음을 assert 두 개로 확인했다.
+ * 이 PR: original_domain 보관이 사라지고 regu_var->plan_item = NULL 로 바뀐다 — 실행 시 도메인은 DOMAIN_PLAN 의 항목이 쥔다. assert 두 개
+ * 자리에는, index_stream 인데 변수 POS regu 가 나오면 unpack_info->index_stream_late_bind 를 세우는 분기가 들어간다. 값 언팩이 성공하면
+ * stx_set_fast_peek() 로 빠른 peek 가능 여부를 로드 시점에 확정한다.
+ * 바뀐 것: 필드 교체(original_domain→plan_item), assert 2개 삭제 후 분기 1개 추가, 호출 1개 추가(약 +10/−5줄). 이 PR 에서 '행은 읽기만 한다'를
+ * 성립시키는 핵심 지점.
+ */
 static char *
 stx_build_regu_variable (THREAD_ENTRY * thread_p, char *ptr, REGU_VARIABLE * regu_var)
 {
@@ -5750,6 +5852,15 @@ error:
  *   attribute, a literal, a value pointer without a linked subquery, whose compiled domain fixes its values. A bind
  *   reference gets it with its plan item, and a regu with a variable domain gets it with its execution domain
  *   (domain_plan.c). A COLLATE modifier's regu takes the slow path, which applies the collation.
+ */
+/*
+ * [리뷰] stx_set_fast_peek — REGU_VARIABLE 에 REGU_VARIABLE_FAST_PEEK(regu_var.hpp:175)를 세울지 로드 시점에 판정하는 새 정적 함수
+ * — stx_build_regu_variable 과 stx_build_regu_value_list 가 부르고, 인라인 fetch_peek_dbval(fetch.h:62)이 이 플래그를 보고 값
+ * 포인터를 바로 돌려준다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 fetch_peek_dbval 이 매번 regu 타입을 보고 분기했다.
+ * 이 PR: COLLATE 수식자(REGU_VARIABLE_APPLY_COLLATION)·도메인 NULL·변수 도메인은 제외하고,
+ * TYPE_ATTR_ID/SHARED_ATTR_ID/CLASS_ATTR_ID/DBVAL 과 '하위 질의가 달리지 않은 값 포인터'인 TYPE_CONSTANT 에만 플래그를 세운다.
+ * 바뀐 것: 신설 +33줄. '컴파일 도메인이 값을 고정하는 regu' 라는 조건을 로드에서 한 번 판정해 행당 분기를 없애는 쪽으로 비용을 옮겼다.
  */
 static void
 stx_set_fast_peek (REGU_VARIABLE * regu_var)
@@ -5973,6 +6084,14 @@ stx_build_attr_descr (THREAD_ENTRY * thread_p, char *ptr, ATTR_DESCR * attr_desc
   return ptr;
 }
 
+/*
+ * [리뷰] stx_build_pos_descr — 리스트 파일 튜플 안의 값 위치(QFILE_TUPLE_VALUE_POSITION: pos_no + 도메인)를 스트림에서 복원한다 —
+ * stx_build_sort_list 와 stx_unpack_regu_variable_value 가 부른다.
+ * develop: position_descr->original_domain = position_descr->dom 으로 컴파일 도메인을 보관했고, 실행 시 query_executor.c:1755
+ * 가 dom 을 거기서 되돌렸다.
+ * 이 PR: original_domain 보관 대신 position_descr->plan_item = NULL 로 계획 항목 슬롯을 비운다 — 위치의 실행 도메인도 DOMAIN_PLAN 이 쥔다.
+ * 바뀐 것: 필드 교체 1줄(±1).
+ */
 static char *
 stx_build_pos_descr (char *ptr, QFILE_TUPLE_VALUE_POSITION * position_descr)
 {
@@ -5983,6 +6102,14 @@ stx_build_pos_descr (char *ptr, QFILE_TUPLE_VALUE_POSITION * position_descr)
   return ptr;
 }
 
+/*
+ * [리뷰] stx_build_arith_type — 산술/함수 노드(ARITH_TYPE: 결과 도메인, leftptr/rightptr, opcode)를 스트림에서 복원한다 —
+ * stx_unpack_regu_variable_value 가 TYPE_INARITH/TYPE_OUTARITH 일 때 부른다.
+ * develop: arith_type->original_domain = arith_type->domain 으로 컴파일 결과 도메인을 보관했다(실행 시 query_executor.c 가 되돌려
+ * 재해결).
+ * 이 PR: arith_type->plan_item = NULL 로 바뀐다 — 식의 실행 결과 도메인은 게이트가 만든 DOMAIN_PLAN 항목에서 온다.
+ * 바뀐 것: 필드 교체 1줄(±1). regu_variable·pos_descr 와 같은 치환.
+ */
 static char *
 stx_build_arith_type (THREAD_ENTRY * thread_p, char *ptr, ARITH_TYPE * arith_type)
 {
@@ -6087,6 +6214,15 @@ error:
   return NULL;
 }
 
+/*
+ * [리뷰] stx_build_aggregate_type — 집계 노드(AGGREGATE_TYPE: 결과 도메인, accumulator, operands, sort_list 등)를 스트림에서
+ * 복원한다 — stx_restore_aggregate_type 경로로 BUILDLIST/BUILDVALUE 노드 로드 때 불린다.
+ * develop: aggregate->original_domain = aggregate->domain 과 aggregate->original_opr_dbtype =
+ * aggregate->opr_dbtype 두 가지를 보관했다. 실행 시 qexec_resolve_domains_for_group_by 가 이 둘을 되돌려 매 실행
+ * 재해결했다(query_executor.c:2287·2342).
+ * 이 PR: 둘 다 사라지고 aggregate->plan_item = NULL 하나만 남는다. 집계의 결과 도메인과 연산 타입은 실행 전 게이트가 확정해 계획 항목에 넣는다.
+ * 바뀐 것: 보관 필드 2개 삭제, 계획 포인터 1개 초기화 추가(+1/−2줄).
+ */
 static char *
 stx_build_aggregate_type (THREAD_ENTRY * thread_p, char *ptr, AGGREGATE_TYPE * aggregate)
 {
@@ -6363,6 +6499,13 @@ stx_build_function_type (THREAD_ENTRY * thread_p, char *ptr, FUNCTION_TYPE * fun
   return ptr;
 }
 
+/*
+ * [리뷰] stx_build_analytic_type — 분석 함수 노드(ANALYTIC_TYPE: 결과 도메인, operand, 파티션/정렬 정보)를 스트림에서 복원한다 — 분석 함수가 있는
+ * BUILDLIST 노드 로드 경로에서 불린다.
+ * develop: analytic->original_domain 과 analytic->original_opr_dbtype 을 보관하고 실행 시 되돌려 재해결했다(aggregate 와 같은 규약).
+ * 이 PR: analytic->plan_item = NULL 하나로 대체된다.
+ * 바뀐 것: 보관 필드 2개 삭제, 초기화 1개 추가(+1/−2줄). aggregate 와 완전히 같은 형태.
+ */
 static char *
 stx_build_analytic_type (THREAD_ENTRY * thread_p, char *ptr, ANALYTIC_TYPE * analytic)
 {
@@ -6899,6 +7042,14 @@ stx_regu_value_item_alloc_and_init (THREAD_ENTRY * thread_p)
  *   tmp(in)    :
  *   ptr(in)    : pointer to REGU_VALUE_LIST
  */
+/*
+ * [리뷰] stx_build_regu_value_list — REGU_VALUE_LIST(TYPE_REGU_VAR_LIST 가 가리키는 regu 묶음)를 스트림에서 복원해 항목 수만큼
+ * REGU_VALUE_ITEM 을 잇는다 — stx_unpack_regu_variable_value 가 부른다.
+ * develop: 항목마다 regu->domain = domain 과 regu->original_domain = domain 을 함께 넣었다.
+ * 이 PR: original_domain 대입이 빠지고, 항목의 값 언팩이 끝난 뒤 stx_set_fast_peek(regu) 를 불러 이 항목도 빠른 peek 대상인지 로드에서 판정한다.
+ * 바뀐 것: −2줄 / +1줄. 묶음 안의 regu 도 stx_build_regu_variable 과 같은 로드 규약을 따르게 맞췄다.
+ * [지적 X1-03]
+ */
 static char *
 stx_build_regu_value_list (THREAD_ENTRY * thread_p, char *ptr, REGU_VALUE_LIST * regu_value_list, TP_DOMAIN * domain)
 {
@@ -7015,6 +7166,13 @@ stx_build_regu_variable_list (THREAD_ENTRY * thread_p, char *ptr, REGU_VARIABLE_
  * init_regu_variable () -
  *   return:
  *   regu(in):    :
+ */
+/*
+ * [리뷰] stx_init_regu_variable — REGU_VARIABLE 한 개를 기본값(TYPE_POS_VALUE, 플래그 0, 도메인 NULL)으로 초기화하는 정적 헬퍼 —
+ * stx_build_regu_value_list(6943)가 항목을 만들 때 부른다.
+ * develop: plan_item 필드 자체가 없었으므로 type/flags/value/vfetch_to/domain/xasl 여섯 개만 깔았다.
+ * 이 PR: 맨 앞에 regu->plan_item = NULL 이 추가돼 일곱 개를 깐다.
+ * 바뀐 것: +1줄. stx_alloc_struct 가 0 초기화를 하지 않으므로(xasl_stream.cpp:223) 이 한 줄이 로드-파생 포인터의 유일한 초기화다.
  */
 static void
 stx_init_regu_variable (REGU_VARIABLE * regu)

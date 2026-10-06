@@ -1048,6 +1048,15 @@ tz_get_timezone_offset (const char *tz_str, int tz_size, char *result, DB_DATETI
  * src_is_utc(in): if true, than source DATETIME is considered in UTC, otherwise in in session timezone
  * tz_id(out): result TZ_ID
  */
+/*
+ * [리뷰] tz_create_session_tzid_for_datetime_core — 세션 타임존으로 DATETIME 에 맞는 `TZ_ID`(오프셋+DST 규칙까지 확정된 것)를 만들어 준다.
+ * DATETIMELTZ 계열 변환기(object_domain_convert.cpp)가 행마다 부른다.
+ * develop: `tz_create_session_tzid_for_datetime` 라는 이름의 본체였고, 내부에서 발행형 `tz_datetime_utc_conv` 를
+ * 불렀다(tz_support.c:1039).
+ * 이 PR: 이름에 `_core` 가 붙고 `date_conversion_error *` 를 마지막 인자로 받아, 발행형 대신 `tz_datetime_utc_conv_core` 에 그 포인터를
+ * 넘긴다. 계산 자체는 동일하다.
+ * 바뀐 것: 시그니처 +1 인자, 호출 대상 1곳을 `_core` 로 교체. 분기·자료구조 변화 없음.
+ */
 int
 tz_create_session_tzid_for_datetime_core (const DB_DATETIME * src_dt, bool src_is_utc, TZ_ID * tz_id,
 					  date_conversion_error * date_error)
@@ -1072,6 +1081,14 @@ tz_create_session_tzid_for_datetime_core (const DB_DATETIME * src_dt, bool src_i
   return er_status;
 }
 
+/*
+ * [리뷰] tz_create_session_tzid_for_datetime — 세션 타임존 TZ_ID 생성의 레거시 진입점.
+ * parser(`pt_dbval_to_value`)·db_value_printer 처럼 게이트 밖에서 값을 찍는 경로가 쓴다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 같은 이름이 본체였고, 그 본체가 `_core` 로 옮겨갔다.
+ * 이 PR: 스택에 `date_conversion_error` 를 하나 만들어 `tz_create_session_tzid_for_datetime_core` 에 넘기고, 돌아온 뒤
+ * `error.publish ()` 로 기록된 에러 하나를 그제서야 `er_set`/`er_clear` 한다. 반환값은 core 의 것을 그대로 돌려준다.
+ * 바뀐 것: 신설 8~12줄짜리 얇은 래퍼. 계산 코드는 없고 '에러를 언제 발행하나'만 담당한다 — 발행 지점이 이 한 곳으로 모인다.
+ */
 int
 tz_create_session_tzid_for_datetime (const DB_DATETIME * src_dt, bool src_is_utc, TZ_ID * tz_id)
 {
@@ -1089,6 +1106,14 @@ tz_create_session_tzid_for_datetime (const DB_DATETIME * src_dt, bool src_is_utc
  * tz_id(out): result TZ_ID
  *
  */
+/*
+ * [리뷰] tz_create_session_tzid_for_timestamp_core — TIMESTAMP(UTC 초)를 DATETIME 으로 풀어 세션 타임존의 `TZ_ID` 를 얻는다.
+ * TIMESTAMPLTZ 변환기들이 행마다 부른다.
+ * develop: `tz_create_session_tzid_for_timestamp` 본체(tz_support.c:1070). 발행형
+ * `tz_create_session_tzid_for_datetime` 호출.
+ * 이 PR: `_core` 로 개명 + `date_conversion_error *` 를 받아 `tz_create_session_tzid_for_datetime_core` 로 넘긴다.
+ * 바뀐 것: 시그니처 +1 인자, 호출 1곳 교체. 본문 로직 무변경.
+ */
 int
 tz_create_session_tzid_for_timestamp_core (const DB_UTIME * src_ts, TZ_ID * tz_id, date_conversion_error * date_error)
 {
@@ -1103,6 +1128,14 @@ tz_create_session_tzid_for_timestamp_core (const DB_UTIME * src_ts, TZ_ID * tz_i
   return tz_create_session_tzid_for_datetime_core (&dt, true, tz_id, date_error);
 }
 
+/*
+ * [리뷰] tz_create_session_tzid_for_timestamp — TIMESTAMP 용 세션 TZ_ID 생성의 레거시 진입점.
+ * `db_timestampltz_to_string`·`qdata_add_dbval` 등이 쓴다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 같은 이름이 본체였고, 그 본체가 `_core` 로 옮겨갔다.
+ * 이 PR: 스택에 `date_conversion_error` 를 하나 만들어 `tz_create_session_tzid_for_timestamp_core` 에 넘기고, 돌아온 뒤
+ * `error.publish ()` 로 기록된 에러 하나를 그제서야 `er_set`/`er_clear` 한다. 반환값은 core 의 것을 그대로 돌려준다.
+ * 바뀐 것: 신설 8~12줄짜리 얇은 래퍼. 계산 코드는 없고 '에러를 언제 발행하나'만 담당한다 — 발행 지점이 이 한 곳으로 모인다.
+ */
 int
 tz_create_session_tzid_for_timestamp (const DB_UTIME * src_ts, TZ_ID * tz_id)
 {
@@ -1199,6 +1232,14 @@ tz_get_zone_id_by_name (const char *name, const int name_size)
  *    - " +08:00 "
  *    - " Europe/Berlin "
  *    - " Europe/Berlin +08:00 "
+ */
+/*
+ * [리뷰] tz_str_timezone_decode_core — 'Asia/Seoul KST' 나 '+09:00' 같은 타임존 문자열을 `TZ_DECODE_INFO` 로 파싱하고, 파싱이 끝난
+ * 위치를 `tz_end` 로 돌려준다. 문자열→DATETIMETZ/TIMESTAMPTZ 변환의 첫 단계.
+ * develop: `tz_str_timezone_decode` 라는 static 함수였고(tz_support.c:1172), 잘못된 존·DST 문자열에 대해 그 자리에서 `er_set (…
+ * ER_TZ_INVALID_TIMEZONE/ER_TZ_INVALID_DST …)` 를 4번 호출했다.
+ * 이 PR: `_core` 로 개명하고 `date_conversion_error *` 를 받아, 같은 4곳을 `date_error->set (…)` 으로 기록만 한다. 반환 코드는 그대로다.
+ * 바뀐 것: 시그니처 +1 인자, `er_set`→`date_error->set` 4곳. 레거시 이름의 발행형 래퍼는 만들지 않았다 — 이 파일 안에서만 쓰이기 때문.
  */
 static int
 tz_str_timezone_decode_core (const char *tz_str, const int tz_str_size, TZ_DECODE_INFO * tz_info, const char **tz_end,
@@ -1414,6 +1455,14 @@ tz_str_to_region (const char *tz_str, const int tz_str_size, TZ_REGION * tz_regi
  *    - " Europe/Berlin "
  *    - " Europe/Berlin +08:00 "
  */
+/*
+ * [리뷰] tz_create_datetimetz_core — DATETIME + 타임존 문자열(또는 기본 리전)로 `DB_DATETIMETZ`(UTC 값 + TZ_ID)를 만든다.
+ * 문자열→DATETIMETZ 캐스트 경로의 몸통.
+ * develop: `tz_create_datetimetz` 본체(tz_support.c:1385). 내부에서 발행형
+ * `tz_str_timezone_decode`·`tz_datetime_utc_conv` 를 불렀다.
+ * 이 PR: `_core` 로 개명 + `date_conversion_error *` 수용. 두 하위 호출을 모두 `_core` 형으로 바꿔 같은 에러 운반체를 아래까지 흘린다.
+ * 바뀐 것: 시그니처 +1 인자, 하위 호출 2곳 교체. 분기·goto 구조 그대로.
+ */
 int
 tz_create_datetimetz_core (const DB_DATETIME * dt, const char *tz_str, const int tz_size,
 			   const TZ_REGION * default_tz_region, DB_DATETIMETZ * dt_tz, const char **end_tz_str,
@@ -1453,6 +1502,13 @@ exit:
   return err_status;
 }
 
+/*
+ * [리뷰] tz_create_datetimetz — 문자열 타임존을 붙여 DATETIMETZ 를 만드는 공개 진입점.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 같은 이름이 본체였고, 그 본체가 `_core` 로 옮겨갔다.
+ * 이 PR: 스택에 `date_conversion_error` 를 하나 만들어 `tz_create_datetimetz_core` 에 넘기고, 돌아온 뒤 `error.publish ()` 로 기록된
+ * 에러 하나를 그제서야 `er_set`/`er_clear` 한다. 반환값은 core 의 것을 그대로 돌려준다.
+ * 바뀐 것: 신설 8~12줄짜리 얇은 래퍼. 계산 코드는 없고 '에러를 언제 발행하나'만 담당한다 — 발행 지점이 이 한 곳으로 모인다.
+ */
 int
 tz_create_datetimetz (const DB_DATETIME * dt, const char *tz_str, const int tz_size,
 		      const TZ_REGION * default_tz_region, DB_DATETIMETZ * dt_tz, const char **end_tz_str)
@@ -1476,6 +1532,15 @@ tz_create_datetimetz (const DB_DATETIME * dt, const char *tz_str, const int tz_s
  * default_tz_region(in): default timezone region to apply if input string does not contain a valid zone information
  * ts_tz(out): object containing timestamp value and timezone info
  *
+ */
+/*
+ * [리뷰] tz_create_timestamptz_core — DATE+TIME+타임존 문자열로 `DB_TIMESTAMPTZ` 를 만든다. UTC 로 환산한 뒤
+ * `db_timestamp_encode_utc_core` 로 TIMESTAMP 범위에 들어가는지까지 본다.
+ * develop: `tz_create_timestamptz` 본체(tz_support.c:1437). 발행형
+ * `tz_str_timezone_decode`·`tz_datetime_utc_conv`·`db_timestamp_encode_utc` 를 불렀다.
+ * 이 PR: `_core` 로 개명 + `date_conversion_error *` 수용. 세 하위 호출을 전부 `_core` 로 바꿨다 — compat 모듈(db_date.c)의 core 까지
+ * 같은 운반체가 넘어간다.
+ * 바뀐 것: 시그니처 +1 인자, 하위 호출 3곳 교체. base→compat 방향 의존은 develop 과 같다.
  */
 int
 tz_create_timestamptz_core (const DB_DATE * date, const DB_TIME * time, const char *tz_str, const int tz_size,
@@ -1528,6 +1593,13 @@ exit:
   return err_status;
 }
 
+/*
+ * [리뷰] tz_create_timestamptz — 문자열 타임존을 붙여 TIMESTAMPTZ 를 만드는 공개 진입점.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 같은 이름이 본체였고, 그 본체가 `_core` 로 옮겨갔다.
+ * 이 PR: 스택에 `date_conversion_error` 를 하나 만들어 `tz_create_timestamptz_core` 에 넘기고, 돌아온 뒤 `error.publish ()` 로
+ * 기록된 에러 하나를 그제서야 `er_set`/`er_clear` 한다. 반환값은 core 의 것을 그대로 돌려준다.
+ * 바뀐 것: 신설 8~12줄짜리 얇은 래퍼. 계산 코드는 없고 '에러를 언제 발행하나'만 담당한다 — 발행 지점이 이 한 곳으로 모인다.
+ */
 int
 tz_create_timestamptz (const DB_DATE * date, const DB_TIME * time, const char *tz_str, const int tz_size,
 		       const TZ_REGION * default_tz_region, DB_TIMESTAMPTZ * ts_tz, const char **end_tz_str)
@@ -1545,6 +1617,12 @@ tz_create_timestamptz (const DB_DATE * date, const DB_TIME * time, const char *t
  * dt(in): decoded local datetime value (as appears in the user string)
  * dt_tz(out): object containing datetime value (adjusted to UTC) and timezone info
  *
+ */
+/*
+ * [리뷰] tz_create_datetimetz_from_ses_core — 타임존 문자열 없이 세션 리전만으로 DATETIME 을 `DB_DATETIMETZ` 로 올린다.
+ * develop: `tz_create_datetimetz_from_ses` 본체(tz_support.c:1495). 발행형 `tz_datetime_utc_conv` 호출.
+ * 이 PR: `_core` 로 개명 + `date_conversion_error *` 수용, `tz_datetime_utc_conv_core` 호출.
+ * 바뀐 것: 시그니처 +1 인자, 호출 1곳 교체.
  */
 int
 tz_create_datetimetz_from_ses_core (const DB_DATETIME * dt, DB_DATETIMETZ * dt_tz, date_conversion_error * date_error)
@@ -1569,6 +1647,13 @@ exit:
   return err_status;
 }
 
+/*
+ * [리뷰] tz_create_datetimetz_from_ses — 세션 리전만으로 DATETIMETZ 를 만드는 공개 진입점.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 같은 이름이 본체였고, 그 본체가 `_core` 로 옮겨갔다.
+ * 이 PR: 스택에 `date_conversion_error` 를 하나 만들어 `tz_create_datetimetz_from_ses_core` 에 넘기고, 돌아온 뒤 `error.publish
+ * ()` 로 기록된 에러 하나를 그제서야 `er_set`/`er_clear` 한다. 반환값은 core 의 것을 그대로 돌려준다.
+ * 바뀐 것: 신설 8~12줄짜리 얇은 래퍼. 계산 코드는 없고 '에러를 언제 발행하나'만 담당한다 — 발행 지점이 이 한 곳으로 모인다.
+ */
 int
 tz_create_datetimetz_from_ses (const DB_DATETIME * dt, DB_DATETIMETZ * dt_tz)
 {
@@ -1633,6 +1718,15 @@ tz_conv_tz_time_w_zone_name (const DB_TIME * time_source, const char *source_zon
  * dt_local(out): object containing datetime value (adjusted to timezone contained in tz_id)
  *
  */
+/*
+ * [리뷰] tz_utc_datetimetz_to_local_core — UTC DATETIME 과 `TZ_ID` 를 받아 그 존의 벽시계 시각으로 되돌린다. TZ 값을 보여주거나 비교할 때 행마다
+ * 타는 경로.
+ * develop: `tz_utc_datetimetz_to_local` 본체(tz_support.c:1573). `TZ_INVALID_OFFSET` 일 때 `er_set (…
+ * ER_TZ_INTERNAL_ERROR …)`, 마지막에 발행형 `db_add_int_to_datetime` 호출.
+ * 이 PR: `_core` 로 개명 + `date_conversion_error *` 수용. `er_set` 1곳 → `date_error->set`, 덧셈은
+ * `db_add_int_to_datetime_core` 로.
+ * 바뀐 것: 시그니처 +1 인자, `er_set` 1곳 교체, 하위 호출 1곳 교체. `#if !defined (CS_MODE)` assert 는 그대로.
+ */
 int
 tz_utc_datetimetz_to_local_core (const DB_DATETIME * dt_utc, const TZ_ID * tz_id, DB_DATETIME * dt_local,
 				 date_conversion_error * date_error)
@@ -1683,6 +1777,13 @@ tz_utc_datetimetz_to_local_core (const DB_DATETIME * dt_utc, const TZ_ID * tz_id
   return err_status;
 }
 
+/*
+ * [리뷰] tz_utc_datetimetz_to_local — UTC+TZ_ID → 로컬 DATETIME 의 공개 진입점. 값 출력·비교 경로가 쓴다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 같은 이름이 본체였고, 그 본체가 `_core` 로 옮겨갔다.
+ * 이 PR: 스택에 `date_conversion_error` 를 하나 만들어 `tz_utc_datetimetz_to_local_core` 에 넘기고, 돌아온 뒤 `error.publish ()`
+ * 로 기록된 에러 하나를 그제서야 `er_set`/`er_clear` 한다. 반환값은 core 의 것을 그대로 돌려준다.
+ * 바뀐 것: 신설 8~12줄짜리 얇은 래퍼. 계산 코드는 없고 '에러를 언제 발행하나'만 담당한다 — 발행 지점이 이 한 곳으로 모인다.
+ */
 int
 tz_utc_datetimetz_to_local (const DB_DATETIME * dt_utc, const TZ_ID * tz_id, DB_DATETIME * dt_local)
 {
@@ -1700,6 +1801,13 @@ tz_utc_datetimetz_to_local (const DB_DATETIME * dt_utc, const TZ_ID * tz_id, DB_
  * dt_local(out): object containing datetime value (adjusted to session timezone)
  *
  */
+/*
+ * [리뷰] tz_datetimeltz_to_local_core — DATETIMELTZ(UTC 로 저장된 값)를 세션 타임존 벽시계로 바꾼다 — 세션 TZ_ID 를 구한 뒤 로컬 환산까지 두
+ * 단계.
+ * develop: `tz_datetimeltz_to_local` 본체(tz_support.c:1630). 발행형 두 함수를 연달아 불렀다.
+ * 이 PR: `_core` 로 개명 + `date_conversion_error *` 수용, 두 하위 호출 모두 `_core` 형.
+ * 바뀐 것: 시그니처 +1 인자, 하위 호출 2곳 교체.
+ */
 int
 tz_datetimeltz_to_local_core (const DB_DATETIME * dt_ltz, DB_DATETIME * dt_local, date_conversion_error * date_error)
 {
@@ -1715,6 +1823,13 @@ tz_datetimeltz_to_local_core (const DB_DATETIME * dt_ltz, DB_DATETIME * dt_local
   return tz_utc_datetimetz_to_local_core (dt_ltz, &ses_tz_id, dt_local, date_error);
 }
 
+/*
+ * [리뷰] tz_datetimeltz_to_local — DATETIMELTZ → 세션 로컬 DATETIME 의 공개 진입점.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 같은 이름이 본체였고, 그 본체가 `_core` 로 옮겨갔다.
+ * 이 PR: 스택에 `date_conversion_error` 를 하나 만들어 `tz_datetimeltz_to_local_core` 에 넘기고, 돌아온 뒤 `error.publish ()` 로
+ * 기록된 에러 하나를 그제서야 `er_set`/`er_clear` 한다. 반환값은 core 의 것을 그대로 돌려준다.
+ * 바뀐 것: 신설 8~12줄짜리 얇은 래퍼. 계산 코드는 없고 '에러를 언제 발행하나'만 담당한다 — 발행 지점이 이 한 곳으로 모인다.
+ */
 int
 tz_datetimeltz_to_local (const DB_DATETIME * dt_ltz, DB_DATETIME * dt_local)
 {
@@ -2414,6 +2529,14 @@ tz_str_to_seconds (const char *str, const char *str_end, int *seconds, const cha
  * ds_rule_julian_date(out): julian date
  * date_diff(out): date difference between the two dates
  */
+/*
+ * [리뷰] tz_get_ds_change_julian_date_diff_core — 서머타임 규칙(`TZ_DS_RULE`)이 해당 연도에 발효되는 율리우스 일자를 구하고, 원하면 원본 시각과의
+ * 차이도 돌려준다. DST 판정의 최하위 계산 단위.
+ * develop: `tz_get_ds_change_julian_date_diff` 본체(tz_support.c:2335). 요일 계산이 실패하면 `er_set (…
+ * ER_TZ_INTERNAL_ERROR …)`.
+ * 이 PR: `_core` 로 개명 + `date_conversion_error *` 수용, 그 한 곳을 `date_error->set` 으로.
+ * 바뀐 것: 시그니처 +1 인자, `er_set` 1곳 교체. 윤년 보정 분기 등 계산은 무변경.
+ */
 int
 tz_get_ds_change_julian_date_diff_core (const int src_julian_date, const TZ_DS_RULE * ds_rule, const int year,
 					int *ds_rule_julian_date, full_date_t * date_diff,
@@ -2459,6 +2582,13 @@ tz_get_ds_change_julian_date_diff_core (const int src_julian_date, const TZ_DS_R
   return NO_ERROR;
 }
 
+/*
+ * [리뷰] tz_get_ds_change_julian_date_diff — DST 규칙 발효일 계산의 공개 진입점. 타임존 컴파일러(timezone 유틸) 쪽에서도 쓰인다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 같은 이름이 본체였고, 그 본체가 `_core` 로 옮겨갔다.
+ * 이 PR: 스택에 `date_conversion_error` 를 하나 만들어 `tz_get_ds_change_julian_date_diff_core` 에 넘기고, 돌아온 뒤
+ * `error.publish ()` 로 기록된 에러 하나를 그제서야 `er_set`/`er_clear` 한다. 반환값은 core 의 것을 그대로 돌려준다.
+ * 바뀐 것: 신설 8~12줄짜리 얇은 래퍼. 계산 코드는 없고 '에러를 언제 발행하나'만 담당한다 — 발행 지점이 이 한 곳으로 모인다.
+ */
 int
 tz_get_ds_change_julian_date_diff (const int src_julian_date, const TZ_DS_RULE * ds_rule, const int year,
 				   int *ds_rule_julian_date, full_date_t * date_diff)
@@ -2480,6 +2610,13 @@ tz_get_ds_change_julian_date_diff (const int src_julian_date, const TZ_DS_RULE *
  * src_year(in): year of date
  * src_month(in): month of date
  * ds_rule_id(out): found rule
+ */
+/*
+ * [리뷰] tz_fast_find_ds_rule_core — 한 룰셋 안에서 주어진 날짜에 적용될 DST 규칙 id 를 찾는다. 못 찾으면 `*ds_rule_id = -1`.
+ * develop: `tz_fast_find_ds_rule` 본체(tz_support.c:2390), static. 내부에서 발행형 `tz_get_ds_change_julian_date_diff`
+ * 를 3곳에서 호출.
+ * 이 PR: `_core` 로 개명 + `date_conversion_error *` 수용, 3곳 모두 `_core` 형으로 교체. 자체 `er_set` 은 원래도 없다.
+ * 바뀐 것: 시그니처 +1 인자, 하위 호출 3곳 교체. 레거시 발행형 래퍼 없음(파일 내부용).
  */
 static int
 tz_fast_find_ds_rule_core (const TZ_DATA * tzd, const TZ_DS_RULESET * ds_ruleset, const int src_julian_date,
@@ -2695,6 +2832,14 @@ tz_offset (const bool src_is_utc, const TZ_TIME_TYPE until_time_type, const int 
  * direction(in): flag that tells in which direction to search
  * date_diff(out): date difference
  */
+/*
+ * [리뷰] get_date_diff_from_ds_rule_core — 한 DST 규칙의 발효 시각과 원본 시각의 차(`full_date_t`)를 방향(FORWARD/BACKWARD)에 맞춰
+ * 계산한다.
+ * develop: `get_date_diff_from_ds_rule` 본체(tz_support.c:2603), static. 발행형 `tz_get_ds_change_julian_date_diff`
+ * 호출.
+ * 이 PR: `_core` 로 개명 + `date_conversion_error *` 수용, 하위 호출 1곳 교체.
+ * 바뀐 것: 시그니처 +1 인자, 하위 호출 1곳 교체.
+ */
 static int
 get_date_diff_from_ds_rule_core (const int src_julian_date, const int src_time_sec, const TZ_DS_RULE * ds_rule,
 				 const DS_SEARCH_DIRECTION direction, full_date_t * date_diff,
@@ -2743,6 +2888,13 @@ exit:
  * tzd(in): pointer to the tzdata
  * direction(in): input flag that tells us in which direction to search
  */
+/*
+ * [리뷰] get_closest_ds_rule_core — 룰셋 전체를 훑어 주어진 시각에 가장 가까운 DST 규칙 id 를 돌려준다. 실패하면 -1 을 반환하고 에러는 운반체에 남는다.
+ * develop: `get_closest_ds_rule` 본체(tz_support.c:2650), static. 발행형 `get_date_diff_from_ds_rule` 호출.
+ * 이 PR: `_core` 로 개명 + `date_conversion_error *` 수용, 하위 호출 교체.
+ * 바뀐 것: 시그니처 +1 인자, 하위 호출 1곳 교체. 에러를 반환값 -1 로 섞어 내는 구조(규칙 id 0 과 -1 의 구분이 호출자 몫)는 develop 그대로다.
+ * [지적 MEAS-07-auto]
+ */
 static int
 get_closest_ds_rule_core (const int src_julian_date, const int src_time_sec, const TZ_DS_RULESET * ds_ruleset,
 			  const TZ_DATA * tzd, const DS_SEARCH_DIRECTION direction, date_conversion_error * date_error)
@@ -2787,6 +2939,12 @@ get_closest_ds_rule_core (const int src_julian_date, const int src_time_sec, con
  * tzd(in): timezone data
  * save_time(out): output daylight saving time
  *
+ */
+/*
+ * [리뷰] get_saving_time_from_offset_rule_core — 오프셋 규칙이 끝나는 날의 서머타임 보정치(초)를 구한다. 규칙 경계에서 이전 구간의 시각을 되짚을 때 쓰인다.
+ * develop: `get_saving_time_from_offset_rule` 본체(tz_support.c:2694), static. 발행형 `tz_fast_find_ds_rule` 호출.
+ * 이 PR: `_core` 로 개명 + `date_conversion_error *` 수용, 하위 호출 교체.
+ * 바뀐 것: 시그니처 +1 인자, 하위 호출 1곳 교체.
  */
 static int
 get_saving_time_from_offset_rule_core (const TZ_OFFSET_RULE * offset_rule, const TZ_DATA * tzd, int *save_time,
@@ -2911,6 +3069,16 @@ get_year_to_apply_rule (const int src_year, const TZ_DS_RULE * ds_rule)
  *		       datetime arithmetic)
  * dt_dest(out): object containing destination datetime
  *
+ */
+/*
+ * [리뷰] tz_datetime_utc_conv_core — 타임존 변환의 심장. 존 오프셋 규칙과 DST 규칙을 날짜에 맞춰 골라 로컬↔UTC 를 환산하고, `tz_info` 에 확정된
+ * 오프셋/DST id 를 되돌려 준다. 이 파일의 거의 모든 상위 함수가 여기로 모인다.
+ * develop: `tz_datetime_utc_conv` 본체(tz_support.c:2817), static, 약 910줄. 모호한 시각·존 불일치 등에 `er_set` 을 14곳에서 불렀고,
+ * 하위 DST 계산도 전부 발행형을 썼다.
+ * 이 PR: `_core` 로 개명 + `date_conversion_error *` 수용. `er_set` 14곳이 `date_error->set` 으로,
+ * `tz_get_ds_change_julian_date_diff`·`get_saving_time_from_offset_rule`·`tz_fast_find_ds_rule`·`get_closest_ds_rule`·`db_add_int_to_datetime`
+ * 호출 17곳이 `_core` 형으로 바뀌었다.
+ * 바뀐 것: 시그니처 +1 인자, `er_set`→`date_error->set` 14곳, 하위 호출 17곳 교체. 약 910줄 중 규칙 선택 로직은 한 줄도 바뀌지 않았다.
  */
 static int
 tz_datetime_utc_conv_core (const DB_DATETIME * src_dt, TZ_DECODE_INFO * tz_info, bool src_is_utc, bool only_tz_adjust,
@@ -3827,6 +3995,14 @@ exit:
   return err_status;
 }
 
+/*
+ * [리뷰] tz_datetime_utc_conv — 로컬↔UTC 환산의 파일 내부 진입점(static). PR 이후에도
+ * `tz_create_datetimetz_from_zoneid_and_tzd`(tz_support.c:1027)·1907줄 두 곳이 발행형을 쓴다 — 이 둘은 아직 운반체를 받지 않는다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 같은 이름이 본체였고, 그 본체가 `_core` 로 옮겨갔다.
+ * 이 PR: 스택에 `date_conversion_error` 를 하나 만들어 `tz_datetime_utc_conv_core` 에 넘기고, 돌아온 뒤 `error.publish ()` 로 기록된
+ * 에러 하나를 그제서야 `er_set`/`er_clear` 한다. 반환값은 core 의 것을 그대로 돌려준다.
+ * 바뀐 것: 신설 8~12줄짜리 얇은 래퍼. 계산 코드는 없고 '에러를 언제 발행하나'만 담당한다 — 발행 지점이 이 한 곳으로 모인다.
+ */
 static int
 tz_datetime_utc_conv (const DB_DATETIME * src_dt, TZ_DECODE_INFO * tz_info, bool src_is_utc, bool only_tz_adjust,
 		      DB_DATETIME * dest_dt)
@@ -3847,6 +4023,14 @@ tz_datetime_utc_conv (const DB_DATETIME * src_dt, TZ_DECODE_INFO * tz_info, bool
  * dest_dt(out): destination datetime value
  * src_zone_info_out(out): complete timezone information for source
  * dest_zone_info_out(out): complete timezone information for destination
+ */
+/*
+ * [리뷰] tz_conv_tz_datetime_w_zone_info_core — 존 정보(`TZ_DECODE_INFO`) 두 개를 받아 DATETIME 을 한 존에서 다른 존으로 옮긴다 — 중간에
+ * UTC 를 거친다.
+ * develop: `tz_conv_tz_datetime_w_zone_info` 본체(tz_support.c:3732), static. 발행형 `tz_datetime_utc_conv` 를 두 번
+ * 불렀다.
+ * 이 PR: `_core` 로 개명 + `date_conversion_error *` 수용, 두 호출 모두 `_core` 형.
+ * 바뀐 것: 시그니처 +1 인자, 하위 호출 2곳 교체.
  */
 static int
 tz_conv_tz_datetime_w_zone_info_core (const DB_DATETIME * src_dt, const TZ_DECODE_INFO * src_zone_info_in,
@@ -3931,6 +4115,13 @@ exit:
  * src_tz_id_out(out): compressed timezone identifier of the source
  * dest_tz_id_out(out): compressed timezone identifier of the destination
  */
+/*
+ * [리뷰] tz_conv_tz_datetime_w_region_core — `TZ_REGION` 두 개(출발/도착)로 존 변환을 하고, 원하면 확정된 출발/도착 `TZ_ID` 도 돌려준다.
+ * db_date.c 의 TIMESTAMP 인코딩·디코딩이 이걸 부른다.
+ * develop: `tz_conv_tz_datetime_w_region` 본체(tz_support.c:3814). 발행형 `tz_conv_tz_datetime_w_zone_info` 호출.
+ * 이 PR: `_core` 로 개명 + `date_conversion_error *` 수용, 하위 호출 교체.
+ * 바뀐 것: 시그니처 +1 인자, 하위 호출 1곳 교체.
+ */
 int
 tz_conv_tz_datetime_w_region_core (const DB_DATETIME * src_dt, const TZ_REGION * src_tz_region,
 				   const TZ_REGION * dest_tz_region, DB_DATETIME * dest_dt, TZ_ID * src_tz_id_out,
@@ -3966,6 +4157,15 @@ tz_conv_tz_datetime_w_region_core (const DB_DATETIME * src_dt, const TZ_REGION *
   return err_status;
 }
 
+/*
+ * [리뷰] tz_conv_tz_datetime_w_region — 리전 간 DATETIME 변환의 공개 진입점. db_date.c 의
+ * `db_timestamp_encode_w_reg_core`/`db_timestamp_decode_w_reg_core` 는 이제 `_core` 쪽을 쓰므로, 이 이름은 그 밖의 레거시 호출자용으로
+ * 남았다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 같은 이름이 본체였고, 그 본체가 `_core` 로 옮겨갔다.
+ * 이 PR: 스택에 `date_conversion_error` 를 하나 만들어 `tz_conv_tz_datetime_w_region_core` 에 넘기고, 돌아온 뒤 `error.publish
+ * ()` 로 기록된 에러 하나를 그제서야 `er_set`/`er_clear` 한다. 반환값은 core 의 것을 그대로 돌려준다.
+ * 바뀐 것: 신설 8~12줄짜리 얇은 래퍼. 계산 코드는 없고 '에러를 언제 발행하나'만 담당한다 — 발행 지점이 이 한 곳으로 모인다.
+ */
 int
 tz_conv_tz_datetime_w_region (const DB_DATETIME * src_dt, const TZ_REGION * src_tz_region,
 			      const TZ_REGION * dest_tz_region, DB_DATETIME * dest_dt, TZ_ID * src_tz_id_out,

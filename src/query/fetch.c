@@ -644,6 +644,15 @@ fetch_agg_expr_eval_dbl (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_
  * assigns converts into the variable-length string resolve_domains gave it, whose longest precision holds it. A read
  * outside an execution with resolved-domain state reads the value as it is.
  */
+/*
+ * [리뷰] fetch_session_read_value — fetch_peek_arith 의 T_EVALUATE_VARIABLE 가지가 session_get_variable 로 읽어 온 세션 변수
+ * 값을 그 노드에 실행 전 게이트가 매긴 late-bind 도메인과 대조해 NO_ERROR 또는 타입 오류를 돌려준다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 의 T_EVALUATE_VARIABLE(fetch.c:4026-4034)은 regu 에 NOT_CONST 플래그를
+ * 세우고 session_get_variable 만 불렀을 뿐, 읽어 온 값의 타입·collation 을 검사하지 않았다.
+ * 이 PR: qexec_late_bind_domain 으로 이 실행의 해결 도메인을 얻어, 타입이 같고 (문자형이면) codeset·collation 도 같으면 통과시킨다. CHAR 값이 최대길이
+ * VARCHAR 타깃일 때만 tp_value_cast 로 맞추고, 그 밖의 불일치는 qexec_session_variable_type_error 로 거절한다.
+ * 바뀐 것: 신설 31줄. 세션 변수처럼 실행 중에 값이 바뀌는 입력이 게이트가 정한 타입을 깨면 행에서 조용히 흘려보내지 않고 오류로 만드는 자리다.
+ */
 static int
 fetch_session_read_value (const VAL_DESCR * vd, ARITH_TYPE * arithptr, const DB_VALUE * name)
 {
@@ -709,6 +718,16 @@ static int fetch_arith_binary_operand_coercion (THREAD_ENTRY * thread_p, const v
  * resolve_domains resolved every late-binding node before the main block (qexec_resolve_domains); the row reads that
  * resolution and never derives one from a value, except where the reading says LATE.
  */
+/*
+ * [리뷰] fetch_arith_resolved_domain — fetch_peek_arith 가 variable 도메인 노드를 만났을 때 이 실행의 해결 도메인을
+ * FETCH_RESOLVED_DOMAIN / NO_VALUE / UNRESOLVED 세 상태로 돌려주는 판정기.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 은 노드별 해결 상태가 없어, 계산이 끝난 뒤 결과값에서 tp_domain_resolve_value 로 도메인을
+ * 역산했다(fetch_peek_arith 끝의 original_domain 복원 블록).
+ * 이 PR: CAST/CAST_WRAP/CAST_NOFAIL 은 컴파일된 타깃 도메인을 그대로 쓰고 타깃이 VARIABLE 이면 NO_VALUE 로 본다. 그 밖에는
+ * vd->xasl_state->resolved_domain 에서 DOMAIN_PLAN_LATE_BIND 플래그가 있고 소유권이 있는 item 의 resolved_index 를 읽는다. vd 나
+ * xasl_state 가 없으면 UNRESOLVED.
+ * 바뀐 것: 신설 35줄. 행이 도메인을 '정하는' 대신 게이트가 정해 둔 것을 '읽는' 구조로 넘어가는 분기점이다.
+ */
 static inline FETCH_RESOLVED_READING
 fetch_arith_resolved_domain (const VAL_DESCR * vd, const ARITH_TYPE * arithptr, const TP_DOMAIN ** resolved_domain)
 {
@@ -752,6 +771,16 @@ fetch_arith_resolved_domain (const VAL_DESCR * vd, const ARITH_TYPE * arithptr, 
  *   return: NO_ERROR, the conversion's error, or ER_QPROC_DOMAIN_UNRESOLVED (the unresolved-domain check (execution))
  *	     for a value of a type resolve_domains chose no converter for
  */
+/*
+ * [리뷰] fetch_convert_to_branch_value — fetch_convert_to_resolved_branch 가 부르는 실제 변환기 — 값의 타입(VARCHAR/CHAR)에 맞는
+ * 변환 함수 포인터 resolved_domain->conv[0|1] 로 값을 해결 도메인으로 바꿔 끼우고 NO_ERROR / ER_TP_CANT_COERCE 를 돌려준다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 타입에 맞는 conv 가 없으면 domain_unresolved_error 로 즉시 실패하고, 있으면 tp_value_convert 로 변환한 뒤 원래 값을 pr_clear_value
+ * 하고 교체한다.
+ * 바뀐 것: 신설 23줄. 변환 함수를 행마다 고르지 않고 게이트가 심어 둔 포인터를 쓴다.
+ * [지적 C6-06]
+ * [지적 C6-05]
+ */
 static int
 fetch_convert_to_branch_value (const val_descr * vd, const DOMAIN_PLAN_ITEM * item,
 			       const RESOLVED_DOMAIN * resolved_domain, DB_VALUE * value)
@@ -779,6 +808,13 @@ fetch_convert_to_branch_value (const val_descr * vd, const DOMAIN_PLAN_ITEM * it
 /* The row's test before fetch_convert_to_branch_value, inline: a collation late-binding node's resolution carries
  * converters only for merged branches (a type-dependent node's are its operands'), so any other node costs a flag
  * test. */
+/*
+ * [리뷰] fetch_convert_to_resolved_branch — fetch_peek_dbval_slow 이 값 하나를 돌려주기 직전에 거치는 게이트 — item 이
+ * DOMAIN_PLAN_LATE_BIND_COLLATION 이고 변환기가 있고 값이 NULL 이 아닐 때만 fetch_convert_to_branch_value 로 넘긴다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 은 collation 이 변수인 결과를 노드 도메인 재계산(regu_var->domain 덮어쓰기)으로 처리했다.
+ * 이 PR: 위 세 조건을 다 만족할 때만 변환하고, 아니면 NO_ERROR 로 지나간다.
+ * 바뀐 것: 신설 15줄. collation 확정 지점을 분기 하나로 좁혔다.
+ */
 static inline int
 fetch_convert_to_resolved_branch (const val_descr * vd, const DOMAIN_PLAN_ITEM * item, DB_VALUE * value)
 {
@@ -797,6 +833,13 @@ fetch_convert_to_resolved_branch (const val_descr * vd, const DOMAIN_PLAN_ITEM *
 
 /* The resolved comparison k an arithmetic node makes: its plan item carries them. A stream's
  * FIELD, NULLIF, LEAST or GREATEST has a bare item for them. */
+/*
+ * [리뷰] fetch_arith_compare — ARITH 노드의 k 번째 비교 계획(DOMAIN_COMPARE_PLAN)을 꺼내 주는 접근자 — fetch_least_or_greatest 가
+ * eval_compare_values_resolved 에 넘길 계획을 여기서 얻는다.
+ * develop: develop 에 없음 — 이 PR 이 신설(DOMAIN_COMPARE_PLAN 자체가 이 PR 이 들여온 것).
+ * 이 PR: item 과 item->compares 가 있으면 compares[k], 아니면 NULL.
+ * 바뀐 것: 신설 6줄.
+ */
 static inline const DOMAIN_COMPARE_PLAN *
 fetch_arith_compare (const ARITH_TYPE * arithptr, int k)
 {
@@ -807,6 +850,17 @@ fetch_arith_compare (const ARITH_TYPE * arithptr, int k)
 /* Whether resolve_domains already evaluated this constant expression: its value is in resolve_domains' array.
  * It replaces fetch's FETCH_ALL_CONST mark, which the first computation set on the plan. The value's index is the
  * plan's, inside every execution's array, a PX worker's copy included: asserted, not tested at every row. */
+/*
+ * [리뷰] fetch_constant_evaluated — fetch_peek_arith 와 fetch_peek_dbval_slow(TYPE_FUNC)가 맨 앞에서 묻는 질문 — 이 노드는 실행
+ * 전 게이트(resolve_domains)가 이미 한 번 계산해 둔 상수인가. true 면 호출자는 vd->dbval_ptr[item->ref] 를 그대로 돌려준다.
+ * develop: develop 은 REGU_VARIABLE_FETCH_ALL_CONST 플래그를 첫 실행 때 regu 노드에 써 두고 다음 행부터 arithptr->value /
+ * funcp->value 를 재사용했다 — 공유 XASL 클론에 실행 중 쓰기였다.
+ * 이 PR: 플래그 대신 vd->xasl_state->resolved_domain.value_states[item->ref] == DOMAIN_VALUE_EVALUATED 를 읽는다. 값도 노드가
+ * 아니라 실행별 배열에 있다.
+ * 바뀐 것: 신설 11줄. 상수 판정의 저장소가 노드(공유) → 실행 상태(격리)로 교체됐고, 이것이 fetch_peek_arith·fetch_peek_dbval_slow 의
+ * ALL_CONST/NOT_CONST 로직 전체 삭제를 떠받친다.
+ * [지적 C6-02]
+ */
 static inline bool
 fetch_constant_evaluated (const VAL_DESCR * vd, const DOMAIN_PLAN_ITEM * item)
 {
@@ -823,6 +877,15 @@ fetch_constant_evaluated (const VAL_DESCR * vd, const DOMAIN_PLAN_ITEM * item)
  * fetch_least_or_greatest () - LEAST or GREATEST of an arithmetic node's two operands, compared as the load or
  *				resolve_domains resolved
  *   return: NO_ERROR, or ER_FAILED where they do not compare
+ */
+/*
+ * [리뷰] fetch_least_or_greatest — fetch_peek_arith 의 T_LEAST/T_GREATEST 가지가 부르는 헬퍼 — 두 피연산자를 계획된 비교로 한 번 비교하고 그
+ * 결과로 작은/큰 쪽을 arithptr->value 에 쓴다.
+ * develop: develop 에 없음 — develop 은 db_least_or_greatest (peek_left, peek_right, arithptr->value, least) 가
+ * 비교까지 내부에서 했다(fetch.c:3912·3943).
+ * 이 PR: eval_compare_values_resolved (thread_p, fetch_arith_compare (arithptr, 0), vd, …) 로 비교하고, 그 결과와
+ * can_compare 를 새 db_least_or_greatest_by 에 넘긴다.
+ * 바뀐 것: 신설 10줄 + 호출부 2곳 교체. 비교 주체가 '값 두 개를 보고 그때 정하는 비교'에서 '게이트가 정해 둔 비교'로 옮겨졌다.
  */
 static int
 fetch_least_or_greatest (THREAD_ENTRY * thread_p, ARITH_TYPE * arithptr, val_descr * vd, DB_VALUE * peek_left,
@@ -847,6 +910,15 @@ fetch_least_or_greatest (THREAD_ENTRY * thread_p, ARITH_TYPE * arithptr, val_des
  * Inline at every call, with the operator called directly: the operand coercion's frame - its execution temporary
  * arrays, the stack protector they bring, the calls it makes - is fetch_arith_binary_operand_coercion's, which only a
  * plan that converts an operand, or a missing plan, reaches.
+ */
+/*
+ * [리뷰] fetch_arith_binary — fetch_peek_arith 의 T_ADD/T_SUB/T_MUL/T_DIV 가지 전체 — 피연산자 변환이 필요 없으면 qdata_*_dbval 을
+ * 직접 부르고, 필요하면 fetch_arith_binary_operand_coercion 으로 넘긴다.
+ * develop: develop 에 없음 — develop 은 이 네 opcode 를 fetch_peek_arith 안에서 qdata_add_dbval 등으로 바로 불렀고, 피연산자 강제 변환은
+ * 각 qdata_* 가 값 타입을 보고 행마다 했다.
+ * 이 PR: item->fixed(컴파일 시 고정)을 기본으로 삼고, LATE_BIND 이면서 LATE_BIND_COLLATION 이 아니면 qexec_late_bind_domain 으로 이
+ * 실행의 RESOLVED_DOMAIN 을 고른다. conv[0]·conv[1] 이 둘 다 NULL 일 때만 타입 연산자를 직접 부른다.
+ * 바뀐 것: 신설 29줄. 변환 여부를 행이 아니라 계획이 결정한다.
  */
 static inline int
 fetch_arith_binary (THREAD_ENTRY * thread_p, const val_descr * vd, ARITH_TYPE * arithptr, DB_VALUE * left,
@@ -880,6 +952,14 @@ fetch_arith_binary (THREAD_ENTRY * thread_p, const val_descr * vd, ARITH_TYPE * 
 
 /* fetch_arith_binary's operand coercion: the operands the plan converts, a scope's execution temporary, or the
  * unresolved-domain check (execution) of a node without its plan (out of line) */
+/*
+ * [리뷰] fetch_arith_binary_operand_coercion — fetch_arith_binary 이 '변환이 필요하다'고 판단했을 때의 경로 — 범위가 고정하는 피연산자는 스코프당
+ * 한 번만 변환해 두고(qexec_execution_temporary) qdata_coerce_arith_operands 로 넘긴다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 은 매 행 qdata_* 안에서 피연산자를 다시 변환했다.
+ * 이 PR: plan 이 없는데 양쪽 피연산자가 모두 비-NULL 이면 qexec_domain_unresolved 로 '게이트가 빠뜨린 노드' 오류를 낸다. temporaries 가 있는
+ * 피연산자만 스코프 임시값으로 한 번 변환해 재사용한다.
+ * 바뀐 것: 신설 34줄.
+ */
 static int
 fetch_arith_binary_operand_coercion (THREAD_ENTRY * thread_p, const val_descr * vd, ARITH_TYPE * arithptr,
 				     const RESOLVED_DOMAIN * plan, DB_VALUE * left, DB_VALUE * right,
@@ -921,6 +1001,14 @@ fetch_arith_binary_operand_coercion (THREAD_ENTRY * thread_p, const val_descr * 
  *   (domain_fixed_operand): the cast skips its per-value lookup for a value of that type
  *   force(in): tp_value_cast_force's coercion, else tp_value_cast's
  */
+/*
+ * [리뷰] fetch_cast_operand — CAST·NVL·IFNULL·COALESCE·NVL2 가 피연산자 i 의 값을 노드 도메인으로 캐스팅할 때 부르는 래퍼 — 계획이 그 피연산자의
+ * 컴파일 타입에 맞춰 찾아 둔 변환기가 있으면 그것으로, 없으면 기존 tp_value_cast(_force) 로 간다.
+ * develop: develop 에 없음 — develop 은 tp_value_cast / tp_value_cast_force 를 직접 불렀고 그 안에서 값마다 변환기를 찾았다.
+ * 이 PR: item->fixed.conv[i] 가 있고 item->fixed.operand_domain[i] 가 이번 타깃 domain 과 같은 포인터이며 피연산자 regu 가 도메인을 가질
+ * 때만 tp_value_cast_with_converter 로 값당 조회를 건너뛴다.
+ * 바뀐 것: 신설 14줄. 적중 판정이 TP_DOMAIN 포인터 동일성에 달려 있다.
+ */
 static inline TP_DOMAIN_STATUS
 fetch_cast_operand (const ARITH_TYPE * arithptr, int i, const DB_VALUE * value, DB_VALUE * result,
 		    const TP_DOMAIN * domain, bool force)
@@ -944,6 +1032,23 @@ fetch_cast_operand (const ARITH_TYPE * arithptr, int i, const DB_VALUE * value, 
  *   obj_oid(in): Object Identifier
  *   tplrec(in): tuple slot (record + layout descriptor)
  *   peek_dbval(out): Set to the value resulting from the fetch operation
+ */
+/*
+ * [리뷰] fetch_peek_arith — REGU 가 TYPE_INARITH/TYPE_OUTARITH 일 때 산술·함수 노드 하나를 평가해 결과 DB_VALUE 포인터를 돌려주는 행당 핵심
+ * 함수. fetch_peek_dbval_slow 이 부른다.
+ * develop: develop(fetch.c:643-4613)은 세 가지를 공유 XASL 노드에 써 가며 돌았다 — ① REGU_VARIABLE_FETCH_ALL_CONST 플래그로 상수
+ * 재사용, ② regu_var->domain 이 VARIABLE 이면 original_domain 에 빼돌리고 regu_var->domain = NULL 로 만든 뒤 계산 끝에
+ * tp_domain_resolve_value 로 역산한 도메인을 regu_var->domain 과 arithptr->domain 에 써 넣기, ③ 끝에서 피연산자 플래그를 세어
+ * ALL_CONST/NOT_CONST 를 노드에 기록하기. 에러 경로에서는 original_domain 을 복원했다.
+ * 이 PR: ① 맨 앞에서 fetch_constant_evaluated 로 묻고 참이면 vd->dbval_ptr[item->ref] 를 돌려준다. ② 노드 도메인을 지역 변수 domain /
+ * arith_domain 에 qexec_get_node_domain 으로 담고, VARIABLE 이면 fetch_arith_resolved_domain 의 세 상태로 분기한다 — DOMAIN 이면
+ * qexec_set_node_domain 으로 실행별 슬롯에만 기록, NO_VALUE 면 컴파일 도메인을 no_value_domain 에 보관하고 결과가 NULL 임을 확인, UNRESOLVED
+ * 면 domain_unresolved_error 로 즉시 실패. ③ 상수 판정 블록은 통째로 없어지고 디버그 assert 는 plan_item->operand_class ==
+ * OPERAND_NON_CACHEABLE 로 바뀌었다. 에러 경로에 복원할 것이 없다.
+ * 바뀐 것: 함수 전역에서 regu_var->domain / arithptr->domain 직접 참조를 지역 domain / arith_domain 으로 치환(수십 곳), 상수 판정 약 60줄
+ * 삭제, 도메인 역산 약 25줄 삭제, 게이트 읽기 약 35줄 추가. T_LEAST/T_GREATEST 는 tp_infer_common_domain 폴백을 잃고 미해결이면
+ * qexec_domain_unresolved 로 오류가 된다.
+ * [지적 C2-03]
  */
 static int
 fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr * vd, OID * obj_oid,
@@ -4879,6 +4984,16 @@ error:
  * it for the statement. A bind value is the one resolve_domains saw: a comparison converts its constant into a value of
  * its own, not in place.
  */
+/*
+ * [리뷰] fetch_read_plan_domain — fetch_peek_dbval_slow 이 값이 있는 regu 를 돌려주기 직전, 그 regu 의 컴파일 도메인이 variable 이면
+ * 게이트가 정해 둔 도메인을 이 실행의 슬롯에 세팅한다. 성공이면 NO_ERROR, 해결이 없으면 ER_QPROC_DOMAIN_UNRESOLVED.
+ * develop: develop 에 없음 — develop 은 같은 자리에서 `regu_var->domain = tp_domain_resolve_value (*peek_dbval, NULL);`
+ * 로 값에서 역산한 도메인을 공유 regu 노드에 직접 썼다.
+ * 이 PR: qexec_plan_domain 으로 읽고 qexec_set_node_domain 으로 실행 슬롯에만 쓴다. 디버그 빌드에서는 값에서 역산한 도메인과
+ * 타입·codeset·collation 이 같은지(precision 만 다를 수 있음) assert 하고, TYPE_POSITION 이면 리스트 스캔이 이미 같은 도메인을 채워 뒀음도 assert
+ * 한다.
+ * 바뀐 것: 신설 약 40줄, develop 의 2줄 대입 삭제. '행이 도메인을 쓴다'가 '행이 도메인을 읽는다'로 바뀌는 대표 자리다.
+ */
 static inline int
 fetch_read_plan_domain (REGU_VARIABLE * regu_var, val_descr * vd, const DB_VALUE * value)
 {
@@ -4921,6 +5036,19 @@ fetch_read_plan_domain (REGU_VARIABLE * regu_var, val_descr * vd, const DB_VALUE
  *   tplrec(in): tuple slot (record + layout descriptor)
  *   peek_dbval(out): Set to the value ref resulting from the fetch operation
  *
+ */
+/*
+ * [리뷰] fetch_peek_dbval_slow — fetch_peek_dbval 의 인라인 빠른 경로가 처리하지 못하는 모든 REGU 타입을 타입별로 분기해 값 포인터를 돌려주는 본체 — 모든
+ * 행 평가의 입구다.
+ * develop: 타입마다 REGU_VARIABLE_FETCH_ALL_CONST / NOT_CONST 를 노드에 기록했고, TYPE_POSITION 은 pos_descr.dom 을 그대로 컬럼
+ * 도메인으로 썼고, TYPE_POS_VALUE 는 vd->dbval_ptr + val_pos 를 읽었고, 끝에서 variable·collation 도메인이면 regu_var->domain 을
+ * 값에서 역산해 덮어썼으며, 안정적인 regu 에 REGU_VARIABLE_FAST_PEEK 를 실행 중에 세웠다. TYPE_SP 는 fetch_force_not_const_recursive 로
+ * 하위 트리의 플래그를 강제했다.
+ * 이 PR: 플래그 기록이 전부 사라졌다(상수 판정은 fetch_constant_evaluated). TYPE_POSITION 은 qexec_get_node_domain 이 준 실행 도메인으로
+ * 컬럼을 읽고, TYPE_POS_VALUE 는 plan_item 이 있으면 REGU_RESOLVED_VALUE 로 바인드 참조별 자기 값을 읽는다. variable 이면
+ * fetch_read_plan_domain, APPLY_COLLATION 도 실행 도메인으로 적용하고, REGUVAL_LIST 의 행별 타입 대조도 실행 도메인끼리 한다. FAST_PEEK 를
+ * 실행 중에 세우는 블록은 통째로 삭제됐다(이제 로드가 세운다).
+ * 바뀐 것: 약 250줄 삭제(플래그 기록·함수 상수 판정 switch·FAST_PEEK 설정), 약 60줄 추가. 이 함수가 공유 regu 노드에 쓰는 일이 없어졌다.
  */
 int
 fetch_peek_dbval_slow (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr * vd, OID * class_oid,
@@ -5533,6 +5661,12 @@ fetch_copy_dbval (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
  *   tplrec(in): tuple slot (record + layout descriptor)
  *   peek(int):
  */
+/*
+ * [리뷰] fetch_val_list — regu 리스트 전체를 한 튜플에서 채우는 함수 — 스캔·필터가 행마다 부르고 NO_ERROR/ER_code 를 돌려준다.
+ * develop: 리스트가 전부 TYPE_POSITION 이면 fetch_peek_dbval_pos (regu_list, tplrec) 로 넘겼다.
+ * 이 PR: 같은 자리에서 vd 를 함께 넘긴다 — 위치가 자기 실행 도메인으로 컬럼을 읽어야 하기 때문이다.
+ * 바뀐 것: 호출 인자 1개 추가(1줄).
+ */
 int
 fetch_val_list (THREAD_ENTRY * thread_p, regu_variable_list_node * regu_list, val_descr * vd, OID * class_oid,
 		OID * obj_oid, QFILE_TUPLE_RECORD * tplrec, int peek)
@@ -5595,6 +5729,15 @@ fetch_val_list (THREAD_ENTRY * thread_p, regu_variable_list_node * regu_list, va
  * fetch_peek_dbval_pos () - fetch_val_list (peek) for an all-TYPE_POSITION regu list: reads columns in pos_no order
  *   return: NO_ERROR or ER_code
  *   vd(in): the execution's value descriptor: a position reads its column with its execution domain
+ */
+/*
+ * [리뷰] fetch_peek_dbval_pos — 전부 TYPE_POSITION 인 regu 리스트를 pos_no 오름차순으로 한 번에 훑어 각 regu 의 vfetch_to 를 채우는 순차
+ * 경로 — fetch_val_list 가 부른다.
+ * develop: 시그니처 (regu_list, tplrec). 컬럼 도메인으로 pos_descr->dom 을 그대로 qfile_slot_read_column_value 에 넘겼고,
+ * dom->type 이 NULL 이면 ER_FAILED.
+ * 이 PR: const VAL_DESCR *vd 인자를 받아 qexec_get_node_domain (vd, pos_descr->dom, pos_descr->plan_item) 이 준 실행
+ * 도메인으로 NULL 검사와 컬럼 읽기를 한다.
+ * 바뀐 것: 시그니처 +1 인자, 도메인 출처 2곳 교체(+4/-2).
  */
 static int
 fetch_peek_dbval_pos (regu_variable_list_node * regu_list, QFILE_TUPLE_RECORD * tplrec, const VAL_DESCR * vd)
@@ -5905,6 +6048,14 @@ error_exit:
  *   thread_p(in) : thread entry
  *   regu_var(in) : root of the regu variable arith tree to search
  *   vd(in)       : value descriptor
+ */
+/*
+ * [리뷰] fetch_peek_leftmost_numeric_regu — ARITH 트리의 leftptr 를 따라 내려가 첫 NUMERIC 타입 노드의 값을 찾아 돌려주는 보조 함수(해시 조인
+ * NUMERIC 정밀도 결정에 쓰인다). 못 찾으면 NULL.
+ * develop: TP_DOMAIN_TYPE (regu_var->domain) 으로 NUMERIC 여부를 판정했다 — 컴파일 도메인만 봤다.
+ * 이 PR: TP_DOMAIN_TYPE (qexec_get_node_domain (vd, regu_var->domain, regu_var->plan_item)) 로 판정한다 — 컴파일 때
+ * variable 이었다가 이 실행에서 NUMERIC 으로 정해진 노드도 잡힌다.
+ * 바뀐 것: 조건식 1줄 교체. 같은 커밋에서 바로 위 fetch_force_not_const_recursive(24줄)가 삭제됐다.
  */
 DB_VALUE *
 fetch_peek_leftmost_numeric_regu (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, VAL_DESCR * vd)

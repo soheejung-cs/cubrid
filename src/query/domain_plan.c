@@ -205,6 +205,14 @@ static void domain_add_define (DOMAIN_LOAD_CONTEXT * ctx, ARITH_TYPE * define);
 static XASL_NODE *domain_outer_scope (const DOMAIN_LOAD_CONTEXT * ctx, const REGU_VARIABLE * regu);
 
 /* The type axis only: the collation of a character result is merged at resolve_domains. */
+/*
+ * [리뷰] domain_type_is_fixed — TP_DOMAIN 이 컴파일 시점에 타입이 정해진 것인지(= DB_TYPE_VARIABLE 이 아닌지) 판정하는 술어. 로드·해소 전 과정에서
+ * '이 항목은 더 볼 필요 없다'의 기준으로 쓰인다.
+ * develop: develop 에 없음 — 이 PR 이 신설(domain_plan.c 파일 자체가 새 파일이고, develop 전체에 domain_* 심볼이 없다).
+ * 이 PR: 도메인 NULL 이거나 VARIABLE 이면 false. domain_plan_validate 의 게이트 조건, domain_resolve_node 의 compiled 판정,
+ * domain_fixed_operand 의 변환기 조회 조건이 모두 이 한 술어를 공유한다.
+ * 바뀐 것: 신설(+5줄).
+ */
 static bool
 domain_type_is_fixed (const TP_DOMAIN * domain)
 {
@@ -213,6 +221,14 @@ domain_type_is_fixed (const TP_DOMAIN * domain)
 
 /* A typed character domain whose collation the compiler left to the values (LEAVE) or enforced over an operand it
  * could not type (ENFORCE): the values give it, so resolve_domains resolves it. */
+/*
+ * [리뷰] domain_character_is_variable — 문자열 도메인인데 collation 이 아직 값에 달려 있는지(TP_DOMAIN_COLL_NORMAL 이 아닌
+ * LEAVE/ENFORCE) 판정한다. 타입 축과 분리된 'collation 축' 판정의 유일한 입구다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 타입은 컴파일러가 정했지만 collation 은 값이 주는 경우를 true 로 돌려, 그런 항목을 DOMAIN_PLAN_LATE_BIND_COLLATION 으로 표시하게 한다.
+ * domain_plan_validate 는 이 표시 없이 collation 이 미확정인 항목을 로드 거부 사유로 쓴다.
+ * 바뀐 것: 신설(+6줄).
+ */
 static bool
 domain_character_is_variable (const TP_DOMAIN * domain)
 {
@@ -221,6 +237,13 @@ domain_character_is_variable (const TP_DOMAIN * domain)
 }
 
 /* The load entry an item lives in: every item is an entry's embedded item until the plan is published. */
+/*
+ * [리뷰] domain_load_entry_of — 공개될 DOMAIN_PLAN_ITEM 포인터에서 그것을 품은 로드 전용 DOMAIN_LOAD_ENTRY 를 offsetof 로 역산한다. 로드
+ * 중에만 유효한 스크래치(producer/link/row_invariant 등)에 접근하는 유일한 통로다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: item == NULL 이면 NULL. 로드가 끝나면 LOAD_ENTRY 는 해제되고 핫 배열에는 ITEM 만 남으므로, 이 역산은 로드 단계 안에서만 유효하다.
+ * 바뀐 것: 신설(+6줄).
+ */
 static DOMAIN_LOAD_ENTRY *
 domain_load_entry_of (const DOMAIN_PLAN_ITEM * item)
 {
@@ -238,6 +261,14 @@ domain_load_entry_of (const DOMAIN_PLAN_ITEM * item)
  * analytic function gets one whether or not its domain is variable: its execution also records the operand type it
  * evaluates with.
  */
+/*
+ * [리뷰] domain_give_node_domain — 이 항목에 실행 도메인 슬롯(domain_execution.node_domains 의 한 칸)이 필요하다고 표시한다.
+ * stx_build_domain_plan 이 나중에 이 표시만 보고 node_domain_index 를 번호 매긴다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: needs_node_domain=true 로 하고 variable 플래그는 OR 로 누적한다(여러 경로에서 같은 항목에 대해 불려도 한 번이라도 variable 이면
+ * variable).
+ * 바뀐 것: 신설(+11줄).
+ */
 static void
 domain_give_node_domain (DOMAIN_PLAN_ITEM * item, bool variable)
 {
@@ -251,6 +282,14 @@ domain_give_node_domain (DOMAIN_PLAN_ITEM * item, bool variable)
 }
 
 /* The resolver context of a late-binding operator node. */
+/*
+ * [리뷰] domain_late_bind_context — 지연 바인딩 노드로 확정된 연산자를 실행 시 해소 규칙 문맥(DOMAIN_CTX_ARITH / COMMON_VALUE /
+ * FUNC_ARG)으로 사상한다. domain_resolve_node 가 노드를 LATE_BIND 로 확정할 때 cold.ctx 를 이 값으로 덮어쓴다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 산술 11종은 ARITH, NVL/COALESCE/NULLIF/LEAST/GREATEST 등 7종은 COMMON_VALUE, 나머지는 FUNC_ARG. 컴파일 시
+ * 문맥(COMPARE·ASSIGN 등)과 달리 '실행이 피연산자들로부터 타입을 합칠 때 쓸 규칙'을 고른다.
+ * 바뀐 것: 신설(+29줄, switch 하나).
+ */
 static DOMAIN_CTX
 domain_late_bind_context (OPERATOR_TYPE opcode)
 {
@@ -283,6 +322,15 @@ domain_late_bind_context (OPERATOR_TYPE opcode)
 
 /* Records the operands a node the compiler left without a type is resolved from (resolution pass). A load entry links
  * three operands in place; a function with more links an array of its own, freed with the load entries. */
+/*
+ * [리뷰] domain_set_links — 지연 바인딩 노드의 피연산자 목록을 LOAD_ENTRY 에 적는다. 피연산자 regu 들에서 plan_item 포인터(link)와 TYPE_DBVAL
+ * 리터럴 포인터(literal)를 뽑고 consumer 도메인을 기록한다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 피연산자가 3개 이하면 inline 배열, 넘으면 db_private_alloc 로 link/literal 두 배열을 한 번 할당한다. 한쪽만 성공하면 둘 다 해제하고
+ * ctx->failed. plan_item 이 NULL 인 피연산자는 건너뛰므로 n_link 가 n_operands 보다 작을 수 있다.
+ * 바뀐 것: 신설(+35줄).
+ * [지적 C3-04]
+ */
 static void
 domain_set_links (DOMAIN_LOAD_CONTEXT * ctx, DOMAIN_LOAD_ENTRY * load_entry, REGU_VARIABLE * const *operands,
 		  int n_operands, const TP_DOMAIN * consumer)
@@ -321,6 +369,14 @@ domain_set_links (DOMAIN_LOAD_CONTEXT * ctx, DOMAIN_LOAD_ENTRY * load_entry, REG
 
 /* Makes a resolved node a late-binding node: resolve_domains resolves it into its own resolved domain table entry once
  * per execution, after every operand (the resolution pass appends it after its producers). */
+/*
+ * [리뷰] domain_mark_late_bind_node — 항목을 '실행 전 게이트가 해소할 노드'로 확정한다 — DOMAIN_PLAN_LATE_BIND 플래그, plan->n_resolved
+ * 에서 받은 resolved_index, fixed.domain=NULL, 그리고 해소 순서 배열(late_bind_order)에 등록.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: late_bind_order 는 16에서 시작해 2배씩 db_private_realloc 한다. 호출 시점이 domain_resolve_record 의 깊이 우선 해소 안이므로 배열에
+ * 들어가는 순서가 곧 '생산자 먼저' 순서가 되고, 실행 전 게이트는 그 순서대로 한 번에 훑는다.
+ * 바뀐 것: 신설(+21줄).
+ */
 static void
 domain_mark_late_bind_node (DOMAIN_LOAD_CONTEXT * ctx, DOMAIN_LOAD_ENTRY * load_entry)
 {
@@ -343,6 +399,15 @@ domain_mark_late_bind_node (DOMAIN_LOAD_CONTEXT * ctx, DOMAIN_LOAD_ENTRY * load_
   ctx->late_bind_order[ctx->n_late_bind_order++] = load_entry;
 }
 
+/*
+ * [리뷰] domain_add_item — GATE 슬롯 하나(DOMAIN_PLAN_ITEM)를 만들어 소유 포인터(*owner)에 달고 로드 연결 리스트 꼬리에 잇는다. 워크 전체에서 '이
+ * regu/arith/aggregate 에 대응하는 항목'을 만드는 유일한 생성기다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: *owner 가 이미 차 있으면 기존 것을 돌려 멱등하다. index 는 plan->n_items 순번, ref/resolved_index 는 -1, operand_class 가
+ * OPERAND_CONST 면 row_invariant 초기값 true. COMPARE/KEY_ELEM/ASSIGN 문맥이면 DOMAIN_PLAN_CONSUMER_CONVERTS 를 켠다.
+ * ctx->tail 을 갱신하므로 호출 직후의 tail 이 방금 만든 항목이다.
+ * 바뀐 것: 신설(+44줄).
+ */
 static DOMAIN_PLAN_ITEM *
 domain_add_item (DOMAIN_LOAD_CONTEXT * ctx, DOMAIN_PLAN_ITEM ** owner, const TP_DOMAIN * domain,
 		 DOMAIN_OPERAND_CLASS operand_class, DOMAIN_CTX context, int opcode)
@@ -394,6 +459,13 @@ domain_add_item (DOMAIN_LOAD_CONTEXT * ctx, DOMAIN_PLAN_ITEM ** owner, const TP_
  *   constant branch's condition reads only these; the cache class is another question - a fetch computes a branch
  *   node every time, so its class stays NON_CACHEABLE.
  */
+/*
+ * [리뷰] domain_regu_is_row_invariant — regu 가 행마다 값이 바뀌지 않는지(상수 분기 판정의 기본 단위) 묻는다. plan_item 을 통해 로드 엔트리의
+ * row_invariant 를 읽는다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: plan_item 이 아직 없으면(아직 안 걸은 regu) false — 즉 보수적으로 '행마다 바뀐다'로 본다.
+ * 바뀐 것: 신설(+5줄).
+ */
 static bool
 domain_regu_is_row_invariant (const REGU_VARIABLE * regu)
 {
@@ -401,6 +473,14 @@ domain_regu_is_row_invariant (const REGU_VARIABLE * regu)
 }
 
 /* Whether no row changes a predicate the walk met: every value each of its terms compares is so. */
+/*
+ * [리뷰] domain_pred_is_row_invariant — 술어 트리 전체가 행과 무관한지 재귀로 판정한다. CASE/IF 의 선택자나 블록의 if_pred 가 상수 분기(constant
+ * branch)를 만들 자격이 있는지의 기준.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: T_PRED 는 양쪽 AND, NOT 은 하나, EVAL_TERM 은 COMP/ALSM/LIKE 세 종류만 피연산자 regu 들로 판정하고 나머지(RLIKE 포함)는 false.
+ * RLIKE 를 뺀 이유가 주석에 있다 — 컴파일된 패턴을 항에 들고 있어 게이트가 평가하지 않는다.
+ * 바뀐 것: 신설(+38줄).
+ */
 static bool
 domain_pred_is_row_invariant (const PRED_EXPR * pred)
 {
@@ -444,6 +524,14 @@ domain_pred_is_row_invariant (const PRED_EXPR * pred)
  * domain_push_constant_branch () - a branch the walk enters whose condition is a constant becomes the innermost
  *   constant branch of what lies below it; the caller restores ctx->constant branch when it leaves the branch
  */
+/*
+ * [리뷰] domain_push_constant_branch — '이 조건이 거짓이면 아래 것들은 실행되지 않는다'는 상수 분기를 ctx 스택에 밀어 넣는다. 이후 만들어지는 항목들은
+ * cold.constant_branch 에 이 번호를 달고, 게이트는 도달 불가능한 분기의 해소 실패를 에러로 올리지 않는다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 8에서 시작해 2배씩 realloc. parent 로 바깥 분기를 가리켜 트리를 이루고, ctx->constant_branch 는 현재 위치의 가장 안쪽 분기를 가리킨다. 실패 시
+ * ctx->failed 만 세우고 조용히 돌아온다.
+ * 바뀐 것: 신설(+27줄).
+ */
 static void
 domain_push_constant_branch (DOMAIN_LOAD_CONTEXT * ctx, DOMAIN_CONSTANT_BRANCH_KIND kind, const void *selector)
 {
@@ -474,6 +562,13 @@ domain_push_constant_branch (DOMAIN_LOAD_CONTEXT * ctx, DOMAIN_CONSTANT_BRANCH_K
 
 /* Whether constant branch outer is inner or one of the constant branches around it (-1, no constant branch, is around
  * every constant branch). */
+/*
+ * [리뷰] domain_constant_branch_encloses — 상수 분기 outer 가 inner 를 감싸는지 parent 사슬을 따라가며 본다. 같은 항을 두 번 만났을 때 두 번째
+ * 자리가 첫 번째의 분기 안인지 확인하는 데 쓴다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: inner 사슬에서 outer 를 찾으면 true, 못 찾으면 `outer < 0`(= outer 가 '분기 없음'이면 무엇이든 감싼다)을 돌려준다.
+ * 바뀐 것: 신설(+12줄).
+ */
 static bool
 domain_constant_branch_encloses (const DOMAIN_LOAD_CONTEXT * ctx, int outer, int inner)
 {
@@ -490,6 +585,13 @@ domain_constant_branch_encloses (const DOMAIN_LOAD_CONTEXT * ctx, int outer, int
 /* A node the walk meets again, first met below constant branch: its constant branch chain holds for this place too when
  * the first place's constant branch is around this one; otherwise the node is also reached another way than its chain
  * says, and the plan keeps no constant branches (every failure is resolve_domains' error). */
+/*
+ * [리뷰] domain_note_met_again — 이미 만든 항목/블록/인덱스를 워크가 다시 만났을 때, 지금 위치의 분기가 처음 만났을 때의 분기 안이 아니면 '분기 정보가 모호하다'고
+ * ctx 에 표시한다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: constant_branches_ambiguous 가 서면 stx_build_domain_plan 이 플랜의 상수 분기 정보를 전부 -1 로 지워 보수적으로 동작한다(4890행대).
+ * 바뀐 것: 신설(+8줄).
+ */
 static void
 domain_note_met_again (DOMAIN_LOAD_CONTEXT * ctx, int constant_branch)
 {
@@ -499,6 +601,14 @@ domain_note_met_again (DOMAIN_LOAD_CONTEXT * ctx, int constant_branch)
     }
 }
 
+/*
+ * [리뷰] domain_bind_item — 워크 중 XASL 안의 보조 소유 포인터(pos_descr.plan_item, 비교쌍의 column 등)에 이미 만든 항목을 연결하고, 그 연결을
+ * bindings 리스트에 기록한다. 공개 단계에서 임시 item 주소를 최종 배열 주소로 고쳐 쓰기 위한 추적이다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: *owner 가 비어 있고 target 이 있을 때만 DOMAIN_LOAD_BINDING 하나를 할당해 ctx->bindings 머리에 붙이고 *owner=target. 할당 실패는
+ * ctx->failed.
+ * 바뀐 것: 신설(+19줄).
+ */
 static void
 domain_bind_item (DOMAIN_LOAD_CONTEXT * ctx, DOMAIN_PLAN_ITEM ** owner, DOMAIN_PLAN_ITEM * target)
 {
@@ -523,6 +633,14 @@ domain_bind_item (DOMAIN_LOAD_CONTEXT * ctx, DOMAIN_PLAN_ITEM ** owner, DOMAIN_P
  * domain_add_compare_pair () - a comparison of two values outside a predicate term: its resolved comparison is
  *   published with the terms' (domain_plan_add_compares) into *owner
  *   regu(in), column(in), literal(in): per side, the regu, the list column item or the literal it compares; one each
+ */
+/*
+ * [리뷰] domain_add_compare_pair — 술어 항 밖의 두 값 비교(FIELD·NULLIF·LEAST/GREATEST·LIMIT 의 0 비교·머지조인 컬럼쌍)를
+ * ctx->compare_pairs 에 적어 둔다. 나중에 domain_plan_add_compares 가 이것들을 DOMAIN_COMPARE_PLAN 으로 공개한다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: *owner 가 이미 차 있으면 멱등 반환. 한 쪽은 regu / 리스트 컬럼 / 어떤 regu 도 들지 않는 리터럴 중 하나이고, column 쪽은 domain_bind_item
+ * 으로 연결해 공개 시 주소가 고쳐진다.
+ * 바뀐 것: 신설(+26줄).
  */
 static void
 domain_add_compare_pair (DOMAIN_LOAD_CONTEXT * ctx, REGU_VARIABLE * const regu[2], DOMAIN_PLAN_ITEM * const column[2],
@@ -553,6 +671,13 @@ domain_add_compare_pair (DOMAIN_LOAD_CONTEXT * ctx, REGU_VARIABLE * const regu[2
 
 /* The two resolved comparison entries of a FIELD, NULLIF, LEAST or GREATEST node, in the plan's arena: the node's
  * item carries them; NULL for any other operator */
+/*
+ * [리뷰] domain_arith_compares — NULLIF/LEAST/GREATEST/FIELD 네 연산자에 대해, 그 노드가 들 비교 계획 슬롯 2칸을 XASL 언팩
+ * 버퍼(stx_alloc_struct)에 미리 잡아 준다. 다른 연산자면 NULL.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: stx_alloc_struct 로 잡으므로 플랜과 수명이 같다(로드 임시 메모리가 아니다). 두 칸 모두 NULL 초기화하고, 할당 실패는 호출자의 failed 플래그로 전달한다.
+ * 바뀐 것: 신설(+23줄).
+ */
 static const DOMAIN_COMPARE_PLAN **
 domain_arith_compares (THREAD_ENTRY * thread_p, OPERATOR_TYPE opcode, bool * failed)
 {
@@ -578,6 +703,13 @@ domain_arith_compares (THREAD_ENTRY * thread_p, OPERATOR_TYPE opcode, bool * fai
 }
 
 /* A comparison of two regus outside a predicate term. */
+/*
+ * [리뷰] domain_add_regu_compare — 두 regu 사이의 비교 하나를 compare pair 로 등록하는 얇은 어댑터. domain_walk_arith 가
+ * FIELD/NULLIF/LEAST/GREATEST 노드에서 부른다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 한쪽이라도 NULL 이면 아무것도 하지 않고, 아니면 column/literal 을 비운 채 domain_add_compare_pair 로 넘긴다.
+ * 바뀐 것: 신설(+13줄).
+ */
 static void
 domain_add_regu_compare (DOMAIN_LOAD_CONTEXT * ctx, REGU_VARIABLE * lhs, REGU_VARIABLE * rhs,
 			 const DOMAIN_COMPARE_PLAN ** owner)
@@ -592,6 +724,13 @@ domain_add_regu_compare (DOMAIN_LOAD_CONTEXT * ctx, REGU_VARIABLE * lhs, REGU_VA
   domain_add_compare_pair (ctx, regu, column, literal, owner);
 }
 
+/*
+ * [리뷰] domain_merge_class — 피연산자들의 캐시 등급(OPERAND_CONST < CORRELATED < ROW < NON_CACHEABLE)을 합쳐 상위 노드 등급을 정한다.
+ * 이 등급이 '게이트가 한 번 계산하고 끝낼 수 있는 값인가'를 가른다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: NON_CACHEABLE 이 하나라도 있으면 NON_CACHEABLE, 다음 ROW, 다음 CORRELATED, 아니면 CONST. rhs 가 NULL 이면 lhs 그대로.
+ * 바뀐 것: 신설(+18줄).
+ */
 static DOMAIN_OPERAND_CLASS
 domain_merge_class (DOMAIN_OPERAND_CLASS lhs, const DOMAIN_PLAN_ITEM * rhs)
 {
@@ -611,6 +750,14 @@ domain_merge_class (DOMAIN_OPERAND_CLASS lhs, const DOMAIN_PLAN_ITEM * rhs)
   return lhs == OPERAND_CORRELATED || other == OPERAND_CORRELATED ? OPERAND_CORRELATED : OPERAND_CONST;
 }
 
+/*
+ * [리뷰] domain_non_cacheable_operator — 값이 매 평가마다 달라질 수 있는 연산자(INCR/DECR, 시퀀스, 분기 노드, 세션 변수, 난수, UUID, SLEEP,
+ * 통계 등 21종)를 열거한다. 이 목록에 들면 항목은 OPERAND_NON_CACHEABLE 로 시작한다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: domain_walk_arith 가 노드의 초기 등급을 정할 때, 그리고 row_invariant 판정에서 쓴다. CASE/DECODE/IF/PREDICATE 는 여기 들어 있지만
+ * domain_branch_operator 가 따로 걸러 row_invariant 는 될 수 있게 한다.
+ * 바뀐 것: 신설(+31줄, switch 하나).
+ */
 static bool
 domain_non_cacheable_operator (OPERATOR_TYPE opcode)
 {
@@ -645,6 +792,13 @@ domain_non_cacheable_operator (OPERATOR_TYPE opcode)
 
 /* The non-cacheable operators a fetch computes every time only because it does not analyze their predicate: over
  * operands no row changes, no row changes them either. */
+/*
+ * [리뷰] domain_branch_operator — CASE/DECODE/IF/PREDICATE 넷을 가려낸다. 이 넷은 non-cacheable 이면서도 '피연산자가 모두 행 불변이면 결과도
+ * 행 불변'이라는 예외를 받는다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: domain_walk_arith 의 row_invariant 계산에서 domain_non_cacheable_operator 의 결과를 되돌리는 예외 조건으로만 쓰인다.
+ * 바뀐 것: 신설(+5줄).
+ */
 static bool
 domain_branch_operator (OPERATOR_TYPE opcode)
 {
@@ -653,6 +807,13 @@ domain_branch_operator (OPERATOR_TYPE opcode)
 
 /* A fetch caches a function over constant operands only for these (the FETCH_ALL_CONST resolution of TYPE_FUNC);
  * every other function computes each time it is fetched, so it is no constant resolve_domains evaluates */
+/*
+ * [리뷰] domain_function_caches — fetch 가 결과를 캐시해도 되는 함수(JSON 계열 22종, REGEXP 5종, INSERT_SUBSTRING, ELT)를 열거한다.
+ * 여기 들면 TYPE_FUNC regu 의 등급이 OPERAND_CONST 로 시작하고 행 불변 후보가 된다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: domain_walk_regu 의 TYPE_FUNC 가지에서 등급 초기값과 row_invariant 초기값 두 군데에 쓰인다. 목록 밖 함수는 OPERAND_ROW 로 시작한다.
+ * 바뀐 것: 신설(+40줄, switch 하나).
+ */
 static bool
 domain_function_caches (FUNC_CODE ftype)
 {
@@ -697,6 +858,14 @@ domain_function_caches (FUNC_CODE ftype)
 /* A BENCHMARK target and a stored procedure's arguments are computed again at every call: fetch marks them not
  * constant through regu_variable_node::map_regu (arithmetic left and right operands, function operands, procedure
  * arguments, value and regu lists), so none of them is a constant resolve_domains evaluates once */
+/*
+ * [리뷰] domain_force_row — regu 서브트리를 훑어 OPERAND_CONST 로 표시돼 있던 노드들을 OPERAND_ROW 로 되돌린다. 게이트가 미리 한 번 계산해 두면 안
+ * 되는 자리(인덱스 키 리밋, 저장 프로시저 인자, BENCHMARK 의 대상)에 쓴다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 노드(INARITH/OUTARITH/FUNC/SP)만 등급을 내리고 그 아래의 bind·리터럴은 상수로 남긴다는 규칙이 주석에 명시돼 있다. 재귀로 arith 의 left/right,
+ * FUNC/SP 의 인자, REGUVAL_LIST·REGU_VAR_LIST 의 원소까지 내려간다.
+ * 바뀐 것: 신설(+57줄).
+ */
 static void
 domain_force_row (REGU_VARIABLE * regu)
 {
@@ -755,6 +924,14 @@ domain_force_row (REGU_VARIABLE * regu)
     }
 }
 
+/*
+ * [리뷰] domain_fixed_operand — 항목의 i 번째 피연산자에 대해 '컴파일 시점에 확정 가능한' 목표 도메인과 변환 함수(fixed.conv[i])를 적는다. 실행은 이 변환기를
+ * 그냥 호출만 한다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: source·target 둘 다 타입이 확정이고 둘 다 collation_flag != TP_DOMAIN_COLL_LEAVE 일 때만 tp_value_find_converter 로
+ * 변환기를 미리 찾는다. 하나라도 미확정이면 operand_domain 만 적고 conv 는 비운다 — 그 경우는 실행 전 게이트의 몫이다.
+ * 바뀐 것: 신설(+16줄).
+ */
 static void
 domain_fixed_operand (DOMAIN_PLAN_ITEM * item, int i, const TP_DOMAIN * source,
 		      const TP_DOMAIN * target, DOMAIN_CTX mode)
@@ -774,6 +951,12 @@ domain_fixed_operand (DOMAIN_PLAN_ITEM * item, int i, const TP_DOMAIN * source,
 
 /* The operators qdata_*_dbval took through an operand coercion by their values' types; the resolver's type rules is its
  * one rule, and the plan carries it. */
+/*
+ * [리뷰] domain_operand_coercion_operator — 피연산자 강제변환(operand coercion) 규칙이 적용되는 산술 연산자 넷(ADD/SUB/MUL/DIV)인지 본다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: domain_walk_arith 와 스트림 로드 쪽(domain_stream_walk_arith) 양쪽이 같은 술어를 공유해, 두 로드 경로가 같은 연산자 집합을 보게 한다.
+ * 바뀐 것: 신설(+5줄).
+ */
 static bool
 domain_operand_coercion_operator (OPERATOR_TYPE opcode)
 {
@@ -785,6 +968,14 @@ domain_operand_coercion_operator (OPERATOR_TYPE opcode)
  *   its operands' compiled domains: fetch converts the operands with them and qdata_*_dbval casts nothing. A node
  *   resolve_domains resolves the type of reads resolve_domains' instead; an operand whose domain is variable plans
  *   no converter here: the operands keep their compiled domains as their targets.
+ */
+/*
+ * [리뷰] domain_plan_operand_coercion — ADD/SUB/MUL/DIV 노드의 두 피연산자 목표 도메인과 변환기를 컴파일 시점에 확정해 항목의 fixed 에 적는다. 실행
+ * 전 게이트가 아니라 로드가 끝내는 자리다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 양쪽 타입이 모두 확정일 때만 domain_resolve_operand_coercion() 으로 규칙을 적용한다. 하나라도 VARIABLE 이면 conv 를 비우고 피연산자 도메인만
+ * 남겨 게이트로 넘긴다.
+ * 바뀐 것: 신설(+26줄).
  */
 static void
 domain_plan_operand_coercion (DOMAIN_PLAN_ITEM * item, OPERATOR_TYPE opcode, const TP_DOMAIN * left,
@@ -813,6 +1004,12 @@ domain_plan_operand_coercion (DOMAIN_PLAN_ITEM * item, OPERATOR_TYPE opcode, con
     }
 }
 
+/*
+ * [리뷰] domain_walk_list — REGU_VARIABLE_LIST 를 순회하며 각 원소에 domain_walk_regu 를 적용한다. 워크 전반에서 가장 많이 쓰이는 반복자.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: ctx->failed 가 서면 즉시 멈춘다. 문맥(DOMAIN_CTX)은 기본 FUNC_ARG 이고 호출자가 LIST_COLUMN·ASSIGN 등으로 바꿔 넘긴다.
+ * 바뀐 것: 신설(+8줄).
+ */
 static void
 domain_walk_list (DOMAIN_LOAD_CONTEXT * ctx, REGU_VARIABLE_LIST list, DOMAIN_CTX context = DOMAIN_CTX_FUNC_ARG)
 {
@@ -824,6 +1021,13 @@ domain_walk_list (DOMAIN_LOAD_CONTEXT * ctx, REGU_VARIABLE_LIST list, DOMAIN_CTX
 
 /* Walks regu lists that read the list file of `source` (or whose columns are `columns`): their TYPE_POSITION regus
  * read that list's columns. */
+/*
+ * [리뷰] domain_walk_position_list — TYPE_POSITION regu 들을 걸을 때, 그들이 읽는 리스트의 출처(source XASL 또는 columns 목록)를 ctx
+ * 에 임시로 걸어 두고 걷는다. 위치가 자기 생산자를 찾을 수 있게 하는 스코프 설정자.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: position_source/position_columns 를 저장-설정-복원하는 전형적 save/restore 쌍. 복원이 무조건 일어나므로 중첩 호출에도 안전하다.
+ * 바뀐 것: 신설(+12줄).
+ */
 static void
 domain_walk_position_list (DOMAIN_LOAD_CONTEXT * ctx, REGU_VARIABLE_LIST list, XASL_NODE * source,
 			   REGU_VARIABLE_LIST columns)
@@ -839,6 +1043,14 @@ domain_walk_position_list (DOMAIN_LOAD_CONTEXT * ctx, REGU_VARIABLE_LIST list, X
 
 /* The item of column `pos` of a column list. A list file does not store hidden columns; a sort list numbers the
  * output list with them (qexec_plan_sort_list_domains). */
+/*
+ * [리뷰] domain_column_item — regu 목록에서 pos 번째 컬럼(선택적으로 hidden 컬럼 제외)을 찾아 그 컬럼의 plan_item 을 돌려준다. 리스트 위치·정렬 키·집합
+ * 연산 컬럼이 자기 생산자를 집는 경로다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 찾은 컬럼을 그 자리에서 domain_walk_regu(LIST_COLUMN 문맥)로 걷되, position_source/columns 를 NULL 로 비우고 걷는다 — 생산자 컬럼은
+ * 읽는 쪽 문맥이 아니라 자기 리스트 문맥에서 걸려야 하기 때문.
+ * 바뀐 것: 신설(+24줄).
+ */
 static DOMAIN_PLAN_ITEM *
 domain_column_item (DOMAIN_LOAD_CONTEXT * ctx, REGU_VARIABLE_LIST columns, int pos, bool skip_hidden)
 {
@@ -865,6 +1077,14 @@ domain_column_item (DOMAIN_LOAD_CONTEXT * ctx, REGU_VARIABLE_LIST columns, int p
 }
 
 /* A synthetic load entry owning an item no XASL node points at: a set-operation or CTE list column. */
+/*
+ * [리뷰] domain_add_synthetic — 대응하는 regu 가 없는 합성 항목(집합 연산/CTE 의 통합 컬럼)을 만든다.
+ * tp_Variable_domain·OPERAND_ROW·LIST_COLUMN 문맥으로 시작한다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: cold.synthetic=true 로 표시하고 self_owner 를 자기 소유 포인터로 삼는다(공개 시 자기 자신에게 최종 item 주소를 쓴다).
+ * domain_plan_validate 는 synthetic 항목의 미해소를 거부 사유에서 제외한다.
+ * 바뀐 것: 신설(+16줄).
+ */
 static DOMAIN_LOAD_ENTRY *
 domain_add_synthetic (DOMAIN_LOAD_CONTEXT * ctx)
 {
@@ -888,6 +1108,14 @@ domain_add_synthetic (DOMAIN_LOAD_CONTEXT * ctx)
  * A block's list holds its output columns. A set operation's list unifies its branches' lists, and a CTE's list its
  * non-recursive part's with the rows its recursive part appends (qfile_unify_types): that column is a node over the
  * branch columns, made once per (list, column).
+ */
+/*
+ * [리뷰] domain_list_column — XASL 블록의 pos 번째 출력 컬럼에 해당하는 항목을 돌려준다. UNION/DIFFERENCE/INTERSECTION/CTE 면 가지들을 통합한
+ * 합성 항목을, 아니면 출력 리스트의 그 컬럼 항목을 준다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: (xasl, pos) 쌍으로 ctx->list_columns 에 메모해 한 번만 만든다. 합성 항목을 **가지를 묻기 전에** 등록하는 것이 핵심 — 재귀 CTE 가 자기 컬럼을 다시
+ * 물어도 무한 재귀 대신 진행 중인 항목을 받는다. 가지를 하나도 못 얻으면 n_link=-1(영구 미해소)로 둔다.
+ * 바뀐 것: 신설(+66줄).
  */
 static DOMAIN_PLAN_ITEM *
 domain_list_column (DOMAIN_LOAD_CONTEXT * ctx, XASL_NODE * xasl, int pos)
@@ -958,6 +1186,13 @@ domain_list_column (DOMAIN_LOAD_CONTEXT * ctx, XASL_NODE * xasl, int pos)
 
 /* The output list whose columns a block's result list file holds: the analytic or GROUP BY output when the block
  * has one (a BUILDLIST has at most one of the two). */
+/*
+ * [리뷰] domain_block_output — XASL 블록이 실제로 내보내는 출력 리스트를 고른다. BUILDLIST 는 분석함수용 a_outptr_list, GROUP BY 용
+ * g_outptr_list, 그 밖에는 xasl->outptr_list.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: a_eval_list·groupby_list 가 있는지로 단계별 출력 리스트를 고르므로, 리스트 컬럼을 찾는 쪽과 ORDER BY 키가 같은 '최종 출력'을 보게 된다.
+ * 바뀐 것: 신설(+17줄).
+ */
 static OUTPTR_LIST *
 domain_block_output (XASL_NODE * xasl)
 {
@@ -979,6 +1214,14 @@ domain_block_output (XASL_NODE * xasl)
 /* Every column of a set operation's or a CTE's list is a node over its branches' columns, read or not: resolve_domains
  * rejects branches it cannot unify before execution (qexec_resolve_late_bind_node), whether a reader asks for the
  * column or the list is the statement's result. */
+/*
+ * [리뷰] domain_walk_set_columns — 집합 연산/CTE 블록의 컬럼 개수만큼 domain_list_column 을 불러 통합 항목을 모두 만들어 둔다. 어느 독자도 묻지 않은
+ * 컬럼까지 포함한다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 컬럼 개수는 가장 왼쪽(CTE 면 non_recursive_part) 가지의 출력 리스트에서 hidden 을 뺀 개수로 센다 — '리스트는 첫 가지의 컬럼을 들고 있다'는 주석의
+ * 규칙.
+ * 바뀐 것: 신설(+20줄).
+ */
 static void
 domain_walk_set_columns (DOMAIN_LOAD_CONTEXT * ctx, XASL_NODE * xasl)
 {
@@ -1001,6 +1244,13 @@ domain_walk_set_columns (DOMAIN_LOAD_CONTEXT * ctx, XASL_NODE * xasl)
 }
 
 /* The producer of a TYPE_POSITION regu being walked: the column of the list it reads. */
+/*
+ * [리뷰] domain_position_producer — 지금 걷는 TYPE_POSITION regu 의 생산자 항목을 돌려준다. ctx 에 걸린 position_columns 가 있으면 그
+ * 목록에서, 없으면 position_source XASL 의 리스트 컬럼에서 찾는다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: domain_walk_regu 의 TYPE_POSITION 가지가 producer 를 채울 때 부른다. 둘 다 없으면 NULL 이 나오고 그 위치는 미해소로 남는다.
+ * 바뀐 것: 신설(+9줄).
+ */
 static DOMAIN_PLAN_ITEM *
 domain_position_producer (DOMAIN_LOAD_CONTEXT * ctx, int pos)
 {
@@ -1011,6 +1261,12 @@ domain_position_producer (DOMAIN_LOAD_CONTEXT * ctx, int pos)
   return domain_list_column (ctx, ctx->position_source, pos);
 }
 
+/*
+ * [리뷰] domain_walk_out — OUTPTR_LIST 하나를 LIST_COLUMN 문맥으로 걷는 어댑터.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: NULL 이면 아무것도 하지 않는다. 출력 컬럼은 반드시 LIST_COLUMN 문맥이어야 하므로 이 한 군데로 모았다.
+ * 바뀐 것: 신설(+8줄).
+ */
 static void
 domain_walk_out (DOMAIN_LOAD_CONTEXT * ctx, OUTPTR_LIST * list)
 {
@@ -1022,6 +1278,16 @@ domain_walk_out (DOMAIN_LOAD_CONTEXT * ctx, OUTPTR_LIST * list)
 
 /* field_bottom: a FIELD node whose left operand is a value, not a nested FIELD (REGU_VARIABLE_FIELD_COMPARE); a node
  * met without its regu plans both of its comparisons */
+/*
+ * [리뷰] domain_walk_arith — ARITH_TYPE 노드 하나를 걸어 GATE 슬롯을 만들고, 그 노드가 (a) 지연 바인딩인지 (b) collation 만 지연인지 (c) 피연산자
+ * 강제변환만 지연인지 세 축으로 분류해 표시한다. 이 PR 의 '컴파일이 슬롯을 표시한다' 단계의 중심.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 이미 걸은 노드면 재방문 표시만 하고 스코프가 달라진 temporary_operand 를 해제한다. 아니면 CASE/IF 의 선택자, COALESCE/NVL 계열의 첫 피연산자가 행
+ * 불변이면 나머지 팔에 상수 분기를 씌우고 걷는다. 그다음 FIELD/NULLIF/LEAST/GREATEST 의 비교쌍 등록, row_invariant 계산, domain_add_item,
+ * late_bound/collation_variable/coercion_variable 세 플래그와 링크 설정, 정적으로 확정 가능한 피연산자
+ * 변환기(domain_fixed_operand·domain_plan_operand_coercion), 마지막으로 스코프당 1회 변환 후보(temporary_operand) 기록까지 한다.
+ * 바뀐 것: 신설(+189줄). 이 파일에서 두 번째로 큰 함수.
+ */
 static void
 domain_walk_arith (DOMAIN_LOAD_CONTEXT * ctx, ARITH_TYPE * arith, bool field_bottom = true)
 {
@@ -1212,6 +1478,12 @@ domain_walk_arith (DOMAIN_LOAD_CONTEXT * ctx, ARITH_TYPE * arith, bool field_bot
     }
 }
 
+/*
+ * [리뷰] domain_value_in_list — VAL_LIST 안에 특정 DB_VALUE 포인터가 들어 있는지 포인터 동일성으로 찾는다. 값 포인터가 어느 블록 소유인지 가리는 바닥 함수.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 리스트 선형 탐색. 값 비교가 아니라 주소 비교라는 점이 핵심 — 같은 내용의 값이라도 다른 칸이면 다른 소유다.
+ * 바뀐 것: 신설(+12줄).
+ */
 static bool
 domain_value_in_list (VAL_LIST * list, DB_VALUE * value)
 {
@@ -1225,6 +1497,14 @@ domain_value_in_list (VAL_LIST * list, DB_VALUE * value)
   return false;
 }
 
+/*
+ * [리뷰] domain_local_value — 어떤 DB_VALUE 칸이 주어진 XASL 블록의 소유인지(= 그 블록의 스캔이 매 행 쓰는 칸인지) 판정한다. 값 포인터 regu 가
+ * OPERAND_ROW 인지 OPERAND_CORRELATED 인지를 가른다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: val_list·merge_val_list, BUILDVALUE/BUILDLIST 의 집계 누적기, BUILDLIST 의 분석함수 value/out_value,
+ * g_val_list·a_val_list 까지 블록이 쓰는 칸을 모두 본다.
+ * 바뀐 것: 신설(+37줄).
+ */
 static bool
 domain_local_value (XASL_NODE * block, DB_VALUE * value)
 {
@@ -1271,6 +1551,13 @@ domain_local_value (XASL_NODE * block, DB_VALUE * value)
  * A value of a block walked after this one (an inner scan's row the outer block's output reads) changes at every row
  * this block evaluates, and a subquery's result is computed on demand: neither is fixed for a scope.
  */
+/*
+ * [리뷰] domain_outer_scope — 상관 참조 regu 가 '바깥 블록의 스캔이 고정하는 값'인지 보고, 그렇다면 그 값이 고정돼 있는 동안인 현재 블록을 돌려준다. 스코프당 1회
+ * 변환(temporary)의 스코프를 정하는 자리.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: TYPE_CONSTANT 이고 자기 xasl 이 없고 현재 블록 소유가 아닐 때만 조상 스택을 바깥쪽으로 훑어 소유 블록을 찾는다. 찾으면 ctx->block, 아니면 NULL.
+ * 바뀐 것: 신설(+18줄).
+ */
 static XASL_NODE *
 domain_outer_scope (const DOMAIN_LOAD_CONTEXT * ctx, const REGU_VARIABLE * regu)
 {
@@ -1294,6 +1581,15 @@ domain_outer_scope (const DOMAIN_LOAD_CONTEXT * ctx, const REGU_VARIABLE * regu)
  * domain_link_string_function () - a function the compiler typed as a string whose collation its values give: a node
  *   resolve_domains resolves from its string operands (out of domain_walk_regu)
  *   return: false when the walk stops (no memory)
+ */
+/*
+ * [리뷰] domain_link_string_function — 컴파일러가 문자열로 타입은 정했지만 collation 은 값이 주는 함수(F_ELT 포함)에 대해, 게이트가 collation 을
+ * 합칠 문자열 피연산자들을 링크로 건다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: ELT 는 모든 피연산자를 순서대로 걸고 인덱스는 값으로 읽을 수 있을 때(bind·리터럴)만 링크에 넣으며 컴파일러가 씌운 BIGINT 캐스트를 elt_index_cast 에
+ * 보관한다. 그 외 함수는 collation 을 가진 피연산자만 고른다. 8개까지는 스택 배열, 넘으면 db_private_alloc 하고 반환 전 해제. plan_item 없는 피연산자가
+ * 하나라도 있으면 n_link=-1.
+ * 바뀐 것: 신설(+70줄).
  */
 static bool
 domain_link_string_function (DOMAIN_LOAD_CONTEXT * ctx, REGU_VARIABLE * regu, DOMAIN_PLAN_ITEM * item,
@@ -1366,6 +1662,16 @@ domain_link_string_function (DOMAIN_LOAD_CONTEXT * ctx, REGU_VARIABLE * regu, DO
   return true;
 }
 
+/*
+ * [리뷰] domain_walk_regu — REGU_VARIABLE 하나를 걸어 그 자리의 GATE 슬롯을 만들고, 그 슬롯이 리프인지·생산자를 읽는 소비자인지·지연 바인딩
+ * 노드인지(DOMAIN_LOAD_KIND)를 정한다. 워크의 실질적 중심.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: regu 종류별로 등급(OPERAND_*)과 row_invariant 를 정한 뒤 domain_add_item 으로 슬롯을 만든다. 그다음 variable 여부로 실행 도메인 슬롯과
+ * REGU_VARIABLE_VARIABLE_DOMAIN/FAST_PEEK 플래그를 켜고, variable POS 는 LATE_BIND·resolved_index 를, collation 만 지연인
+ * POS 는 LATE_BIND_COLLATION 을, 출력 리스트의 bind 는 LIST_BIND 를 단다. 마지막으로 TYPE_CONSTANT/TYPE_POSITION/REGUVAL_LIST 는
+ * CONSUMER, arith 래퍼는 ARITH_REGU 로 kind 를 정하고, 아닌 경우에만 정적 피연산자 변환기를 건다.
+ * 바뀐 것: 신설(+218줄). 이 파일에서 domain_walk_xasl 다음으로 큰 함수.
+ */
 static void
 domain_walk_regu (DOMAIN_LOAD_CONTEXT * ctx, REGU_VARIABLE * regu, DOMAIN_CTX context)
 {
@@ -1587,6 +1893,14 @@ domain_walk_regu (DOMAIN_LOAD_CONTEXT * ctx, REGU_VARIABLE * regu, DOMAIN_CTX co
 
 /* A comparison term of two values: the load resolves it or gives it a late-bind comparison when the plan is published.
  * The set comparisons (subset and superset, tp_set_compare) and a list side (eval_set_list_cmp) are not these. */
+/*
+ * [리뷰] domain_add_compare_term — 술어의 비교 항(COMP_EVAL_TERM)을 워크 순서대로 ctx 에 모은다. 항과 함께 그 자리의 상수 분기·키 범위 여부·양쪽의 외부
+ * 스코프를 같이 적는다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 지원하는 8개 관계 연산자(EQ..NULLSAFE_EQ)만, 그리고 양쪽이 TYPE_LIST_ID 가 아닌 항만 모은다. 4개 평행 배열(terms / constant_branches
+ * / scopes(2배) / ranges)을 같은 max 로 함께 키운다.
+ * 바뀐 것: 신설(+63줄). arch.json 이 alloc-free=+4 로 표시했으나 네 배열 모두 ctx 가 소유하고 domain_load_context_free 가 해제하는 구조다.
+ */
 static void
 domain_add_compare_term (DOMAIN_LOAD_CONTEXT * ctx, COMP_EVAL_TERM * term)
 {
@@ -1652,6 +1966,14 @@ domain_add_compare_term (DOMAIN_LOAD_CONTEXT * ctx, COMP_EVAL_TERM * term)
 }
 
 /* An ALL/SOME term: its comparisons are published with the plan; a list's column is found now. */
+/*
+ * [리뷰] domain_add_element_term — ALL/SOME 항(ALSM_EVAL_TERM)을 ctx->element_terms 에 모은다. 비교 대상이 서브쿼리 리스트면 그 리스트의
+ * 0번 컬럼 항목을 같이 묶어 둔다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 리스트 머리에 밀어 넣으므로 나중 것이 앞에 온다(구조체 주석의 'last first'). elemset 이 TYPE_LIST_ID 면 domain_list_column(xasl,
+ * 0) 을 domain_bind_item 으로 연결해 공개 시 주소가 갱신되게 한다.
+ * 바뀐 것: 신설(+26줄).
+ */
 static void
 domain_add_element_term (DOMAIN_LOAD_CONTEXT * ctx, ALSM_EVAL_TERM * term)
 {
@@ -1679,6 +2001,15 @@ domain_add_element_term (DOMAIN_LOAD_CONTEXT * ctx, ALSM_EVAL_TERM * term)
     }
 }
 
+/*
+ * [리뷰] domain_walk_pred — PRED_EXPR 트리를 걸어 각 항의 피연산자 regu 를 COMPARE 문맥으로 걷고, 비교 항·ALL/SOME 항을 수집한다. AND/OR 의
+ * 왼쪽이 행 불변이면 오른쪽에 상수 분기를 씌운다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: T_PRED 는 오른쪽으로 루프를 돌아(꼬리 재귀 제거) 깊은 AND 사슬에서도 스택을 쓰지 않는다. eval_pred 의 단축 평가 규칙(AND 는 거짓 아닐 때만, OR 은 참
+ * 아닐 때만 나머지를 본다)을 그대로 분기 종류로 옮겼다. 함수 끝에서 constant_branch 를 진입값으로 복원한다.
+ * 바뀐 것: 신설(+58줄).
+ * [지적 A3-03]
+ */
 static void
 domain_walk_pred (DOMAIN_LOAD_CONTEXT * ctx, PRED_EXPR * pred)
 {
@@ -1740,6 +2071,14 @@ domain_walk_pred (DOMAIN_LOAD_CONTEXT * ctx, PRED_EXPR * pred)
 
 /* A sort key reads column pos_no of the list it sorts: the producer's item is the key's item. An aggregate's
  * ORDER BY sorts the aggregate's own list, whose columns are its operands. */
+/*
+ * [리뷰] domain_walk_sort — SORT_LIST 의 각 정렬 키가 읽는 컬럼 항목을 찾아 pos_descr.plan_item 에 연결한다. 못 찾으면 그 키 자리에 독립 항목을 새로
+ * 만든다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: columns 가 주어지면 그 목록에서(hidden 포함, skip_hidden=false), 아니면 source XASL 의 리스트 컬럼에서 찾는다 — 출력 리스트가 없는 집합 연산
+ * 블록은 자기 리스트 파일을 정렬하기 때문.
+ * 바뀐 것: 신설(+19줄).
+ */
 static void
 domain_walk_sort (DOMAIN_LOAD_CONTEXT * ctx, SORT_LIST * list, REGU_VARIABLE_LIST columns, XASL_NODE * source = NULL)
 {
@@ -1760,6 +2099,15 @@ domain_walk_sort (DOMAIN_LOAD_CONTEXT * ctx, SORT_LIST * list, REGU_VARIABLE_LIS
     }
 }
 
+/*
+ * [리뷰] domain_walk_agg — 집계 함수 목록을 걸어 각 집계에 GATE 슬롯을 만들고, 누적기·피연산자 타입·보간 리스트 도메인이라는 세 가지 실행 상태가 필요한지 표시한다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: COUNT(*)·GROUPBY_NUM 은 피연산자가 없는 것으로 보고 그 가짜 regu 를 걷지 않는다. kind 는 FIXED_AGG 이고 링크는 인자 하나. opr_dbtype 이
+ * VARIABLE 이 아니고 인자 도메인도 확정이면 argument 에 컴파일 도메인을 남긴다. SUM/AVG(non-DISTINCT)는 더하는 값을 temporary_operand[1] 후보로
+ * 적는다. MEDIAN/PERCENTILE 은 정렬 키를 집계 항목에 묶고, CUME_DIST/PERCENT_RANK 는 REGU_VAR_LIST 로 싸인 ORDER BY 값들을 컬럼으로 삼아
+ * domain_walk_sort 로 넘긴다.
+ * 바뀐 것: 신설(+75줄).
+ */
 static void
 domain_walk_agg (DOMAIN_LOAD_CONTEXT * ctx, AGGREGATE_TYPE * agg)
 {
@@ -1836,6 +2184,13 @@ domain_walk_agg (DOMAIN_LOAD_CONTEXT * ctx, AGGREGATE_TYPE * agg)
     }
 }
 
+/*
+ * [리뷰] domain_walk_analytic — 분석함수 평가 목록을 걸어 각 분석함수에 GATE 슬롯을 만들고 출력 두 칸(value, out_value)과 피연산자 타입 슬롯을 표시한다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 집계와 같은 FIXED_AGG 모양이되 피연산자가 a_val_list 의 값 포인터라 생산자를 통해 해소된다는 점이 주석에 명시돼 있다. eval 단위마다 정렬 리스트를
+ * a_outptr_list_ex 의 컬럼으로 걷는다.
+ * 바뀐 것: 신설(+42줄).
+ */
 static void
 domain_walk_analytic (DOMAIN_LOAD_CONTEXT * ctx, ANALYTIC_EVAL_TYPE * eval, OUTPTR_LIST * output)
 {
@@ -1880,6 +2235,12 @@ domain_walk_analytic (DOMAIN_LOAD_CONTEXT * ctx, ANALYTIC_EVAL_TYPE * eval, OUTP
 }
 
 /* An index scan the walk meets: its key plan is published once its elements' items are. */
+/*
+ * [리뷰] domain_add_index — 인덱스 스캔(INDX_INFO)을 워크 순서대로 모으고 그 자리의 상수 분기를 같이 적는다. 같은 스캔을 다시 만나면 분기 모호성만 표시한다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: indexes / index_constant_branches 두 평행 배열을 4에서 시작해 2배씩 키운다. 중복 검사는 선형 탐색(인덱스 스캔 수가 적다는 전제).
+ * 바뀐 것: 신설(+34줄).
+ */
 static void
 domain_add_index (DOMAIN_LOAD_CONTEXT * ctx, INDX_INFO * index)
 {
@@ -1916,6 +2277,13 @@ domain_add_index (DOMAIN_LOAD_CONTEXT * ctx, INDX_INFO * index)
 }
 
 /* Records a session variable assignment: resolve_domains types the variable from the values the statement assigns. */
+/*
+ * [리뷰] domain_add_define — 세션 변수 대입(T_DEFINE_VARIABLE 노드)을 ctx->defines 에 모은다. 나중에
+ * domain_plan_add_session_variables 가 '이 변수를 읽는 자리'와 짝지어 준다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: domain_walk_arith 가 T_DEFINE_VARIABLE 을 만나면 부른다. 4에서 시작해 2배씩 realloc.
+ * 바뀐 것: 신설(+17줄).
+ */
 static void
 domain_add_define (DOMAIN_LOAD_CONTEXT * ctx, ARITH_TYPE * define)
 {
@@ -1934,6 +2302,15 @@ domain_add_define (DOMAIN_LOAD_CONTEXT * ctx, ARITH_TYPE * define)
   ctx->defines[ctx->n_defines++] = define;
 }
 
+/*
+ * [리뷰] domain_walk_specs — ACCESS_SPEC 사슬을 걸어 인덱스 키 범위·키 리밋·세 술어(where_key/pred/range)와 대상 종류별 regu 목록을 모두 건다.
+ * 스캔이 읽는 모든 값이 여기서 슬롯을 받는다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: where_range 를 걷는 동안만 ctx->in_key_range 를 세워, 그 안의 비교 항이 'B-tree 탐색에서 만나는 항'으로 표시되게 한다. 키 리밋은 걷고 나서
+ * domain_force_row 로 상수 등급을 내린다 — 스캔이 열릴 때 자기가 계산하고 오버플로를 리밋으로 바꾸므로 게이트의 에러가 아니어야 하기 때문. TARGET_LIST 는 생산자
+ * XASL 을 먼저 걷고 네 개의 위치 목록을 그 출처로 걷는다.
+ * 바뀐 것: 신설(+78줄).
+ */
 static void
 domain_walk_specs (DOMAIN_LOAD_CONTEXT * ctx, ACCESS_SPEC_TYPE * spec)
 {
@@ -2013,6 +2390,13 @@ domain_walk_specs (DOMAIN_LOAD_CONTEXT * ctx, ACCESS_SPEC_TYPE * spec)
     }
 }
 
+/*
+ * [리뷰] domain_walk_assignments — UPDATE/ODKU 의 대입식들을 ASSIGN 문맥으로 걷는다. ASSIGN 문맥이어야 대상 컬럼으로의 캐스트가
+ * CONSUMER_CONVERTS 로 표시된다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: count 만큼 배열을 돌며 regu_var 를 걷는 단순 반복자.
+ * 바뀐 것: 신설(+8줄).
+ */
 static void
 domain_walk_assignments (DOMAIN_LOAD_CONTEXT * ctx, UPDATE_ASSIGNMENT * assignments, int count)
 {
@@ -2029,6 +2413,15 @@ domain_walk_assignments (DOMAIN_LOAD_CONTEXT * ctx, UPDATE_ASSIGNMENT * assignme
  * NUMERIC, the first fixed-precision NUMERIC of the rest list gives its precision and scale, so integers scale the way
  * the fixed numeric column's hash keys do. Only compiled domains resolve this: the load sets it once, not each
  * execution.
+ */
+/*
+ * [리뷰] domain_fix_connect_by_probe — CONNECT BY 블록의 프로브 regu 가 기본 정밀도 NUMERIC 으로 디코드된 경우, 같은 리스트의 rest 목록에서 실제
+ * 정밀도를 찾아 프로브 도메인을 그것으로 고친다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: tp_domain_copy 로 복사해 precision/scale 만 바꾸고 tp_domain_cache 로 캐시 도메인을 얻어 regu->domain 에 쓴다. 즉 로드가 디코드된
+ * 스트림 자체를 한 번 고치는 것이고, 주석대로 '이 클론의 모든 실행이 그것을 읽는다'. domain_walk_xasl 이 블록당 한 번만 부르므로(이미 domain_plan 이 달린 블록은
+ * 조기 반환) 중복 수정은 없다.
+ * 바뀐 것: 신설(+39줄).
  */
 static void
 domain_fix_connect_by_probe (DOMAIN_LOAD_CONTEXT * ctx, XASL_NODE * xasl)
@@ -2078,6 +2471,14 @@ domain_fix_connect_by_probe (DOMAIN_LOAD_CONTEXT * ctx, XASL_NODE * xasl)
  * (regu->vfetch_to); BUILDVALUE's operand is the expression itself. fetch_peek_arith evaluates a flagged expression in
  * one register pass; the shape check reads the compiled domains, which an execution's regus hold again before its scan
  * (qexec_clear_regu_var). Analytic functions read their operands from list columns: nothing to mark there.
+ */
+/*
+ * [리뷰] domain_mark_aggregate_operands — SUM/AVG(non-DISTINCT)의 피연산자가 fetch 가 집계식 모양으로 알아보는 산술식이면 그 regu 에
+ * REGU_VARIABLE_AGG_OPERAND 플래그를 단다. 실행이 그 자리에서 값을 한 번만 변환하도록 하는 표시.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: BUILDVALUE 는 집계의 피연산자 regu 를 직접 보고, BUILDLIST 는 출력 리스트의 regu 중 vfetch_to 가 집계의 값 포인터와 같은 것을 찾아 거기에 단다.
+ * 재귀 깊이 예산은 PRM_ID_MAX_RECURSION_SQL_DEPTH 를 쓴다.
+ * 바뀐 것: 신설(+42줄).
  */
 static void
 domain_mark_aggregate_operands (XASL_NODE * xasl)
@@ -2134,6 +2535,14 @@ static const DB_VALUE domain_Int_zero = []
 
 /* A merge join compares each pair of merge columns, the outer list's with the inner list's (qexec_cmp_tpl_vals_merge):
  * one resolved comparison per pair. */
+/*
+ * [리뷰] domain_add_merge_compares — 머지 조인 블록의 컬럼 쌍마다 비교 계획 슬롯을 만들고 양쪽 리스트의 해당 컬럼 항목을 비교쌍으로 등록한다.
+ * merge->merge_compares 배열의 주인.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: ls_column_cnt 개를 domain_plan_alloc(플랜 수명)으로 한 번에 잡고 NULL 초기화한 뒤, 각 칸을 domain_add_compare_pair 의 owner
+ * 로 넘긴다. 양쪽 다 regu 없이 컬럼만 있는 쌍이다.
+ * 바뀐 것: 신설(+30줄).
+ */
 static void
 domain_add_merge_compares (DOMAIN_LOAD_CONTEXT * ctx, XASL_NODE * xasl)
 {
@@ -2165,6 +2574,15 @@ domain_add_merge_compares (DOMAIN_LOAD_CONTEXT * ctx, XASL_NODE * xasl)
     }
 }
 
+/*
+ * [리뷰] domain_walk_xasl — XASL 트리 한 블록을 정해진 순서로 걷는 최상위 워크. 블록·조상 스택·상수 분기 문맥을 관리하며 모든 하위
+ * 워크(specs·pred·agg·analytic·sort·out·regu)를 부른다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: xasl->domain_plan 이 이미 차 있으면 재방문 표시만 하고 돌아온다(공유 XASL 1회 방문 보장). 블록 목록·조상 스택을 8부터 2배씩 키우고, if_pred 가 행
+ * 불변이면 그 아래(fptr·내부 스캔·행 번호·출력)를 상수 분기 안으로 넣는다. 최상위 블록의 LIMIT 은 if_pred 분기 밖에서 걷고 행 수 > INT 0 비교쌍을 등록한다. 순서가
+ * '생산자 먼저'로 짜여 있다 — 스캔 출력 → GROUP BY → 분석함수 → 최종 출력 → ORDER BY.
+ * 바뀐 것: 신설(+277줄). 이 파일에서 가장 큰 함수.
+ */
 static void
 domain_walk_xasl (DOMAIN_LOAD_CONTEXT * ctx, XASL_NODE * xasl)
 {
@@ -2449,12 +2867,24 @@ domain_walk_xasl (DOMAIN_LOAD_CONTEXT * ctx, XASL_NODE * xasl)
  * late-binding nodes come out in an order resolve_domains can resolve them in, whatever order the walk met them.
  */
 
+/*
+ * [리뷰] domain_owner_load_entry — 로드 엔트리의 alias(값 포인터가 생산자 항목을 공유하기로 한 경우의 대표)를 따라가 '답을 가진 쪽'을 돌려준다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 한 단계만 따라간다 — alias 가 또 alias 를 가지지 않는다는 것이 암묵 전제다.
+ * 바뀐 것: 신설(+5줄).
+ */
 static DOMAIN_LOAD_ENTRY *
 domain_owner_load_entry (DOMAIN_LOAD_ENTRY * load_entry)
 {
   return load_entry != NULL && load_entry->alias != NULL ? load_entry->alias : load_entry;
 }
 
+/*
+ * [리뷰] domain_is_value_pointer — 로드 엔트리가 TYPE_CONSTANT regu(값 포인터, 즉 생산자가 써 둔 칸을 읽는 자리)인지 본다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: domain_link_producer 가 '컴파일 도메인을 믿어도 되는가'를 가를 때 쓴다 — 값 포인터는 독자의 컴파일 도메인이 아니라 생산자의 도메인을 따라야 하기 때문.
+ * 바뀐 것: 신설(+5줄).
+ */
 static bool
 domain_is_value_pointer (const DOMAIN_LOAD_ENTRY * load_entry)
 {
@@ -2465,6 +2895,13 @@ domain_is_value_pointer (const DOMAIN_LOAD_ENTRY * load_entry)
  * the function domain resolve_domains resolves follows the argument (a CHAR bind makes it CHAR), the accumulator does
  * not. An output column reading it is retyped with the function domain before its first fetch (qexec_end_one_iteration,
  * the GROUP BY setup), so the list carries that domain; any other reader sees the accumulator's own value. */
+/*
+ * [리뷰] domain_reads_group_concat_value — 독자가 GROUP_CONCAT 누적기의 값을 (출력 컬럼이 아닌 자리에서) 읽는 경우인지 판정한다. 게이트의
+ * GROUP_CONCAT collation 규칙을 적용할 조건.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 생산자가 FIXED_AGG·AGG 문맥·opcode PT_GROUP_CONCAT 이고 독자 문맥이 LIST_COLUMN 이 아닐 때 true.
+ * 바뀐 것: 신설(+6줄).
+ */
 static bool
 domain_reads_group_concat_value (const DOMAIN_LOAD_ENTRY * reader, const DOMAIN_LOAD_ENTRY * producer)
 {
@@ -2477,6 +2914,15 @@ static void domain_resolve_record (DOMAIN_LOAD_CONTEXT * ctx, DOMAIN_LOAD_ENTRY 
 /* The item a node's operand is resolved from: through value pointers, list positions and wrappers that share a resolved
  * domain table entry to the bind or node owning it, so resolve_domains sees a bind's value (a value-dependent argument
  * type). */
+/*
+ * [리뷰] domain_link_source — 생산자를 따라가는 사슬(follows_producer)을 끝까지 좇아 '실제로 답을 내는' 항목을 돌려준다. 지연 바인딩 노드가 링크로 걸 대상을
+ * 한 점으로 정규화한다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 매 단계 alias 를 먼저 푼 뒤 follows_producer·producer 가 있으면 생산자로 넘어간다. 루프 변수 이름이 `constant_branch` 지만 실제로는
+ * 256회 홉 상한일 뿐이고, 상한에 걸리면 정규화되지 않은 item 을 그대로 돌려준다.
+ * 바뀐 것: 신설(+14줄).
+ * [지적 C3-03]
+ */
 static DOMAIN_PLAN_ITEM *
 domain_link_source (DOMAIN_PLAN_ITEM * item)
 {
@@ -2495,6 +2941,15 @@ domain_link_source (DOMAIN_PLAN_ITEM * item)
 /* A derived consumer reads its producer: the producer's resolved domain table entry (ALIAS) or its domain. A value
  * pointer takes the producer's domain even when it was compiled with another one (the reader's), because the value is
  * the producer's; a compiled list position or VALUES column keeps its domain, which is what its list holds. */
+/*
+ * [리뷰] domain_link_producer — CONSUMER 엔트리(값 포인터·리스트 위치·VALUES 컬럼)를 생산자에 묶어 해소한다. 생산자가 게이트 해소 대상이면 ALIAS 로
+ * resolved_index 를 공유하고, 아니면 생산자의 도메인을 그대로 가져온다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 값 포인터가 아니고 타입·collation 이 모두 확정이면 그대로 known. 단 TYPE_POSITION 은 예외로, 생산자 사슬의 뿌리가 같은 타입(또는 둘 다 문자형)의
+ * 리터럴/bind 를 들고 있으면 그 생산자를 따라간다. 재귀 CTE 가 자기 컬럼을 읽는 경우(생산자 state==1)는 비재귀 가지 컬럼으로 바꿔 잡는다. GROUP_CONCAT 누적기를 읽는
+ * 값 포인터는 collation 축 지연 바인딩 노드로 승격한다.
+ * 바뀐 것: 신설(+79줄).
+ */
 static void
 domain_link_producer (DOMAIN_LOAD_CONTEXT * ctx, DOMAIN_LOAD_ENTRY * load_entry)
 {
@@ -2578,6 +3033,16 @@ domain_link_producer (DOMAIN_LOAD_CONTEXT * ctx, DOMAIN_LOAD_ENTRY * load_entry)
 /* A node over known operands becomes a late-binding node; a compiled aggregate or analytic gets its accumulator
  * domain derived once from its operand's. A set-operation column over compiled branches of one type is that
  * type. */
+/*
+ * [리뷰] domain_resolve_node — NODE / FIXED_AGG 엔트리의 피연산자를 모두 해소한 뒤, 그 노드를 (a) 로드가 끝낼 수 있는지 (b) 실행 전 게이트로 넘길지
+ * 판정한다. 로드 단계 해소 패스의 핵심 분기.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 링크마다 domain_link_source 로 정규화 → 재귀 해소 → 다시 정규화(사슬이 움직였을 수 있으므로) 한다. MEDIAN/PERCENTILE 은 인자가 값 인자인지로
+ * VALUE_ARGUMENT 를 표시. 전부 known 이고 FIXED_AGG 이며 variable POS 가 없으면 domain_resolve() 를 **로드 시점에 한 번** 돌려 누적기
+ * 규칙(ACCUMULATOR)을 확정한다. 집합 연산 컬럼은 가지 타입이 모두 같으면 그 타입으로 끝낸다. 그 외는 domain_mark_late_bind_node 로 게이트에 넘기고
+ * cold.ctx 를 실행용 문맥으로 바꾼다.
+ * 바뀐 것: 신설(+88줄).
+ */
 static void
 domain_resolve_node (DOMAIN_LOAD_CONTEXT * ctx, DOMAIN_LOAD_ENTRY * load_entry)
 {
@@ -2667,6 +3132,15 @@ domain_resolve_node (DOMAIN_LOAD_CONTEXT * ctx, DOMAIN_LOAD_ENTRY * load_entry)
   load_entry->known = !ctx->failed;
 }
 
+/*
+ * [리뷰] domain_resolve_record — 엔트리 하나를 해소하는 진입점 — kind 별로 domain_link_producer / domain_resolve_node 로 보낸다.
+ * state(0/1/2)로 중복과 순환을 막는다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: state!=0 이면 즉시 반환하므로 진행 중(state==1)인 것을 다시 만나면 '아직 모름'으로 남는다 — 재귀 CTE 의 자기 참조가 여기서 멈춘다. ARITH_REGU 는
+ * 노드의 fixed 를 통째로 복사하고 노드가 LATE_BIND 면 ALIAS 로 resolved_index 를 공유한다. LEAF 는 resolved_index·리터럴·확정 도메인 중 하나면
+ * known.
+ * 바뀐 것: 신설(+42줄).
+ */
 static void
 domain_resolve_record (DOMAIN_LOAD_CONTEXT * ctx, DOMAIN_LOAD_ENTRY * load_entry)
 {
@@ -2712,6 +3186,14 @@ domain_resolve_record (DOMAIN_LOAD_CONTEXT * ctx, DOMAIN_LOAD_ENTRY * load_entry
 
 /* The unresolved-domain check (load): both axes are strict: an item resolve_domains does not resolve has a fixed
  * type, and a fixed string whose collation the values give is a variable POS recording its bound value's domain. */
+/*
+ * [리뷰] domain_plan_validate — 로드의 마지막 관문 — 공개된 모든 항목이 타입과 collation 둘 다 확정됐거나 게이트가 책임지기로 표시돼 있는지 본다. false 면
+ * stx_build_domain_plan 이 ER_QPROC_DOMAIN_UNRESOLVED 로 로드를 거부한다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: LATE_BIND·ALIAS 플래그가 있거나 synthetic 인 항목은 건너뛴다. 나머지는 (1) 타입이 VARIABLE 이면 거부, (2) collation 이 미확정인데
+ * LATE_BIND_COLLATION 표시가 없으면 거부. 타입 축과 collation 축을 각각 한 조건으로 고정한 것이 이 PR 의 '게이트 둘' 중 로드 측 관문이다.
+ * 바뀐 것: 신설(+22줄). 파일에서 몇 안 되는 비-static 함수.
+ */
 bool
 domain_plan_validate (const DOMAIN_PLAN * plan)
 {
@@ -2735,6 +3217,13 @@ domain_plan_validate (const DOMAIN_PLAN * plan)
   return true;
 }
 
+/*
+ * [리뷰] domain_plan_alloc — 플랜 수명 배열(count × size)을 XASL 언팩 버퍼에서 잡는다. 오버플로를 막는 곱셈 검사가 붙은 stx_alloc_struct 래퍼.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: count==0 이면 NULL 을 정상 반환하므로 호출자는 NULL 을 실패로만 보면 안 된다(대부분 n>0 을 먼저 검사한다). count<0 이거나 size*count 가
+ * INT_MAX 를 넘으면 NULL.
+ * 바뀐 것: 신설(+13줄).
+ */
 static void *
 domain_plan_alloc (THREAD_ENTRY * thread_p, int count, size_t size)
 {
@@ -2749,6 +3238,14 @@ domain_plan_alloc (THREAD_ENTRY * thread_p, int count, size_t size)
   return stx_alloc_struct (thread_p, (int) (count * size));
 }
 
+/*
+ * [리뷰] domain_compare_refs — plan->const_refs(값 참조 번호를 가진 항목들)를 ref 오름차순으로 정렬하기 위한 qsort 비교자. 실행의 bind 단계가 참조를
+ * 순서대로 훑을 수 있게 한다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: ref 가 같으면 항목 주소로 동점을 가른다. const_refs 원소는 모두 연속 배열 plan->items 안을 가리키므로 주소 순서 = 항목 인덱스 순서로
+ * 결정적이다(domain_assign_references 가 같은 (위치, 도메인, 변환정책) 에 같은 ref 를 재사용하므로 동점은 실제로 생긴다).
+ * 바뀐 것: 신설(+11줄).
+ */
 static int
 domain_compare_refs (const void *lhs, const void *rhs)
 {
@@ -2763,6 +3260,13 @@ domain_compare_refs (const void *lhs, const void *rhs)
 
 /* The constant expression a load entry's regu computes, if resolve_domains evaluates it once: a constant arithmetic
  * node (its value is the node's item's) or a constant function that caches. */
+/*
+ * [리뷰] domain_constant_of — 로드 엔트리가 '상수 식'(행과 무관해 게이트가 첫 행 전에 한 번 계산할 수 있는 산술·함수 노드)인지 보고 그 항목을 돌려준다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: INARITH/OUTARITH 는 arithptr 의 항목을, TYPE_FUNC 는 regu 자신의 항목을 보고, operand_class 가 OPERAND_CONST 일 때만
+ * 돌려준다. 그 외는 NULL.
+ * 바뀐 것: 신설(+19줄).
+ */
 static DOMAIN_PLAN_ITEM *
 domain_constant_of (const DOMAIN_LOAD_ENTRY * load_entry)
 {
@@ -2789,6 +3293,14 @@ domain_constant_of (const DOMAIN_LOAD_ENTRY * load_entry)
  *   resolutions - with the consumer's execution domain and variable domain flags; after the constant references, which
  *   the producer's item takes
  */
+/*
+ * [리뷰] domain_plan_add_item_copies — 생산자 항목을 공유(alias)하되 자기 실행 도메인이 필요해 별도 인덱스를 받은 엔트리에, 생산자 항목 내용을 복사하고 자기
+ * variable 플래그·node_domain_index 만 되살린다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: alias 가 있고 인덱스가 다른 엔트리만 대상. VARIABLE/VARIABLE_POSITION 플래그를 지우고 자기 r->variable 로 다시 세우며 cold 도 자기 것으로
+ * 덮어쓴다 — '소비자의 노드는 자기 실행 도메인을 따로 갖는다'는 stx_build_domain_plan 주석의 구현부.
+ * 바뀐 것: 신설(+17줄).
+ */
 static void
 domain_plan_add_item_copies (DOMAIN_LOAD_CONTEXT * ctx, DOMAIN_PLAN * plan)
 {
@@ -2811,6 +3323,14 @@ domain_plan_add_item_copies (DOMAIN_LOAD_CONTEXT * ctx, DOMAIN_PLAN * plan)
  * domain_plan_add_constants () - every constant expression gets a value of its own in resolve_domains' array, which
  *   resolve_domains fills once before the main block: this replaces fetch's FETCH_ALL_CONST marking. Nested constants
  *   come first, in the order the walk appended them.
+ */
+/*
+ * [리뷰] domain_plan_add_constants — 상수 식들에 값 참조 번호(ref)를 매기고 plan->constant_expressions 배열(항목 + 그 값을 계산할 regu)을
+ * 만든다. 실행 전 게이트의 '상수 식 단계'가 읽을 목록이다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 두 번 훑는다 — 먼저 ref 를 매겨 개수를 확정하고, 배열을 잡아 0 으로 민 뒤 다시 훑어 (item, regu) 를 채운다. 같은 항목이 여러 엔트리에서 나와도 처음 것만
+ * 들어간다(`.item == NULL` 검사). 개수가 0이면 배열 없이 true.
+ * 바뀐 것: 신설(+36줄).
  */
 static bool
 domain_plan_add_constants (THREAD_ENTRY * thread_p, DOMAIN_LOAD_CONTEXT * ctx, DOMAIN_PLAN * plan)
@@ -2851,6 +3371,14 @@ domain_plan_add_constants (THREAD_ENTRY * thread_p, DOMAIN_LOAD_CONTEXT * ctx, D
 
 /* Whether resolve_domains resolves an entry only in the constant expression step (qexec_evaluate_constant_expression):
  * the entry of a node that waits for constant expressions. */
+/*
+ * [리뷰] domain_resolved_after_constant_expressions — 어떤 resolved_index 의 해소가 상수 식 계산 뒤에야 가능한지 묻는다. 비교가 '상수 단계
+ * 이후'로 미뤄져야 하는지 판정하는 기본 술어.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: resolved_index → 그 값을 내는 지연 바인딩 노드(resolved_late_bind_node)로 가서 그 노드의 after_constants 를 읽는다. 생산자가
+ * 없으면(-1) false.
+ * 바뀐 것: 신설(+6줄).
+ */
 static bool
 domain_resolved_after_constant_expressions (const DOMAIN_PLAN * plan, int resolved_index)
 {
@@ -2864,6 +3392,15 @@ domain_resolved_after_constant_expressions (const DOMAIN_PLAN * plan, int resolv
  *   constant expression's value is known only in the constant expression step (qexec_evaluate_constant_expression) - a
  *   NULL without a type drops out of the fold, which its compiled domain does not tell. A node above such a node reads
  *   its resolution, so it waits too (producers come first).
+ */
+/*
+ * [리뷰] domain_plan_add_late_bind_waits — 각 지연 바인딩 노드의 after_constants 를 결정한다 — 피연산자 중 상수 식 참조를 쓰거나, 상수 단계 뒤에
+ * 풀리는 다른 노드를 읽으면 이 노드도 상수 단계를 기다려야 한다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: g 를 0부터 올라가며 계산하는데, 전파 조건이 `domain_resolved_after_constant_expressions`(= 다른 노드의 after_constants
+ * 읽기)이므로 **late_bind_nodes 가 생산자 먼저 순서**여야 맞는다. 그 순서는 domain_mark_late_bind_node 의 호출 시점(깊이 우선 해소)으로만 보장된다.
+ * COMMON_VALUE 문맥 노드만 피연산자의 ref 가 상수 영역인지로 직접 걸린다.
+ * 바뀐 것: 신설(+17줄).
  */
 static void
 domain_plan_add_late_bind_waits (DOMAIN_PLAN * plan, int constant_base)
@@ -2884,6 +3421,12 @@ domain_plan_add_late_bind_waits (DOMAIN_PLAN * plan, int constant_base)
 }
 
 /* A session variable's name as a read or an assignment carries it: the CHAR literal the parser writes for @name. */
+/*
+ * [리뷰] domain_session_variable_name — DB_VALUE 가 세션 변수 이름으로 쓸 수 있는 값(NULL 아닌 CHAR)인지 보고 그대로 돌려주거나 NULL 을 준다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 읽기(T_EVALUATE_VARIABLE)와 대입(T_DEFINE_VARIABLE) 양쪽의 이름 추출이 이 한 술어를 공유한다.
+ * 바뀐 것: 신설(+5줄).
+ */
 static const DB_VALUE *
 domain_session_variable_name (const DB_VALUE * value)
 {
@@ -2891,6 +3434,12 @@ domain_session_variable_name (const DB_VALUE * value)
 }
 
 /* The name late-binding node g reads, when it is a session variable read. */
+/*
+ * [리뷰] domain_session_read_name — g 번째 지연 바인딩 노드가 세션 변수 읽기라면 그 변수 이름 값을 돌려준다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 노드의 cold.opcode 가 T_EVALUATE_VARIABLE 일 때만 link[0] 자리의 리터럴을 이름으로 본다. opcode 가 다르면 NULL.
+ * 바뀐 것: 신설(+6줄).
+ */
 static const DB_VALUE *
 domain_session_read_name (const DOMAIN_PLAN * plan, int g)
 {
@@ -2899,6 +3448,13 @@ domain_session_read_name (const DOMAIN_PLAN * plan, int g)
 }
 
 /* The variable a name refers to among the first n, compared as the session compares names; -1 none. */
+/*
+ * [리뷰] domain_find_session_variable — 수집한 세션 변수 배열에서 이름이 같은 항목의 인덱스를 찾는다. 비교는 intl_identifier_casecmp(식별자 규칙,
+ * 대소문자 무시).
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: name 이 NULL 이면 루프가 돌지 않아 -1. 선형 탐색이고, 한 질의의 세션 변수 수가 적다는 전제다.
+ * 바뀐 것: 신설(+12줄).
+ */
 static int
 domain_find_session_variable (const DOMAIN_SESSION_VARIABLE * variables, int n, const DB_VALUE * name)
 {
@@ -2913,6 +3469,13 @@ domain_find_session_variable (const DOMAIN_SESSION_VARIABLE * variables, int n, 
 }
 
 /* The variable an assignment writes, among the first n; -1 when the statement does not read it. */
+/*
+ * [리뷰] domain_session_define_variable — T_DEFINE_VARIABLE 노드가 수집된 변수 중 어느 것에 대입하는지 인덱스를 돌려준다. 읽기가 하나도 없는 변수에
+ * 대한 대입은 -1.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 왼쪽이 TYPE_DBVAL(이름 리터럴)이고 오른쪽에 plan_item 이 있을 때만 유효로 본다. 그 외는 -1 로 떨어뜨려 세션 변수 묶음에서 제외한다.
+ * 바뀐 것: 신설(+10줄).
+ */
 static int
 domain_session_define_variable (const DOMAIN_SESSION_VARIABLE * variables, int n, const ARITH_TYPE * define)
 {
@@ -2928,6 +3491,14 @@ domain_session_define_variable (const DOMAIN_SESSION_VARIABLE * variables, int n
  * domain_plan_add_session_variables () - the session variables the statement reads, each with its reads and the values
  *   its assignments store: resolve_domains gives each of them one type per execution. A variable the
  *   statement only assigns is none of them: nothing here reads it.
+ */
+/*
+ * [리뷰] domain_plan_add_session_variables — 세션 변수별로 '이 변수를 읽는 지연 바인딩 노드들'과 '이 변수에 대입하는 항목들'을 한 배열에 모아
+ * plan->session_variables 로 공개한다. 게이트의 세션 변수 단계가 읽을 표다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 읽기가 하나도 없으면 바로 true(표를 만들지 않는다). 세 번 훑는 전형적 counting layout — 먼저 변수별 읽기/대입 수를 세고, reads·assigns 슬라이스
+ * 시작점을 잡고 카운터를 0으로 되돌린 뒤 실제 인덱스를 채운다. variables 배열은 n_reads 개로 잡지만 실제 변수 수(n_variables)는 그 이하다.
+ * 바뀐 것: 신설(+82줄).
  */
 static bool
 domain_plan_add_session_variables (THREAD_ENTRY * thread_p, DOMAIN_LOAD_CONTEXT * ctx, DOMAIN_PLAN * plan)
@@ -3015,6 +3586,14 @@ domain_plan_add_session_variables (THREAD_ENTRY * thread_p, DOMAIN_LOAD_CONTEXT 
 /* Whether a load entry reads an aggregate that finalizes to DOUBLE whatever its function domain says: AVG, STDDEV* and
  * VAR* (qdata_finalize_aggregate_list), whose function domain over a late-bound argument is the argument's. Through
  * value pointers and list positions to the producer. */
+/*
+ * [리뷰] domain_reads_double_aggregate — 어떤 항목이 (alias·생산자 사슬을 따라가) 결국 DOUBLE 을 내는 집계(AVG·STDDEV·VARIANCE 계열)를
+ * 읽는지 판정한다. 그런 쪽은 집계의 해소 도메인과 무관하게 DOUBLE 로 비교해야 한다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: alias 면 대표로 옮기고, FIXED_AGG 를 만나면 AGG 문맥인지와 opcode 7종으로 판정하고 끝낸다. CONSUMER 가 아니거나 생산자가 없으면 false. 여기서도
+ * 루프 변수 이름이 `constant_branch` 지만 실제로는 256회 홉 상한이고, 상한에 걸리면 false(보수적).
+ * 바뀐 것: 신설(+38줄).
+ */
 static bool
 domain_reads_double_aggregate (const DOMAIN_LOAD_ENTRY * load_entry)
 {
@@ -3067,6 +3646,16 @@ enum DOMAIN_COMPARE_SIDE
  * with a resolved index is resolve_domains', a reader of an aggregate that finalizes to DOUBLE a DOUBLE, anything else
  * its plan domain.
  * load_entries(in): the load entry of each published item, by index */
+/*
+ * [리뷰] domain_compare_side — 비교 한쪽(regu)을 보고 그 쪽이 KNOWN(로드가 비교 키를 확정) / LATE_BIND(게이트가 확정) / VARIABLE(아무도 확정 못
+ * 함) 중 무엇인지 판정하면서 DOMAIN_COMPARE_PLAN 의 그 쪽 칸을 채운다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 순서대로 — COLLATE 수식(REGU_VARIABLE_APPLY_COLLATION) 기록 → DOUBLE 집계 독자면 tp_Double_domain 으로 KNOWN →
+ * TYPE_POS_VALUE 면 LATE_BIND(bind 여부 기록) → TYPE_DBVAL 이면 리터럴 값에서 키를 뽑아 KNOWN → 상수 식이면
+ * LATE_BIND(after_constants) → resolved_index 가 있으면 LATE_BIND(세션 의존·상수 대기 전파) → 그 외는 도메인이 값을 고정하면 KNOWN, 아니면
+ * VARIABLE.
+ * 바뀐 것: 신설(+75줄).
+ */
 static DOMAIN_COMPARE_SIDE
 domain_compare_side (const DOMAIN_PLAN * plan, DOMAIN_LOAD_ENTRY * const *load_entries, int constant_base,
 		     REGU_VARIABLE * regu, DOMAIN_COMPARE_PLAN * comparison, int side, DOMAIN_COMPARE_KEY * key,
@@ -3144,6 +3733,13 @@ domain_compare_side (const DOMAIN_PLAN * plan, DOMAIN_LOAD_ENTRY * const *load_e
 }
 
 /* A side resolve_domains converts once when its comparison converts it: a literal, a bind or a constant expression. */
+/*
+ * [리뷰] domain_compare_constant_side — 비교의 한쪽이 상수(리터럴 또는 상수 항목)인지 본다. 그런 쪽의 변환은 행마다가 아니라 게이트가 한 번만 하면 된다는 판단의
+ * 근거.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: literal[side] 나 constant[side] 중 하나라도 있으면 true.
+ * 바뀐 것: 신설(+5줄).
+ */
 static bool
 domain_compare_constant_side (const DOMAIN_COMPARE_PLAN * comparison, int side)
 {
@@ -3155,6 +3751,15 @@ domain_compare_constant_side (const DOMAIN_COMPARE_PLAN * comparison, int side)
  *   no constant side needs converting, otherwise a late-bind comparison resolve_domains resolves once per execution
  *   (and converts its constant sides into values of their own). A side whose values the plan leaves variable keeps
  *   tp_value_compare_with_error on the values (comparison method VALUES).
+ */
+/*
+ * [리뷰] domain_plan_add_comparison — 양쪽 판정(lhs/rhs)을 합쳐 비교의 해소 방식(fixed.method)을 정한다 — 행마다 값으로 비교할지, 로드가 변환까지
+ * 확정할지, 게이트가 한 번 확정할지.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 한쪽이라도 VARIABLE 이면 DOMAIN_COMPARE_VALUES(행마다). 둘 다 KNOWN 이면 domain_resolve_comparison 으로 로드가 확정하되, 상수
+ * 쪽에 변환이 필요하면 그 변환을 한 번만 하려고 다시 late_bind 로 돌린다. 그 외는 late_bind. late_bind 로 가면 compare_index 를 받고 상수 쪽마다 값 참조
+ * 번호(plan->n_refs++)를 받아 변환 결과를 둘 자리를 확보한다. 세션 의존이면 LATE_BIND_SESSION.
+ * 바뀐 것: 신설(+48줄).
  */
 static bool
 domain_plan_add_comparison (DOMAIN_PLAN * plan, DOMAIN_COMPARE_PLAN * comparison, DOMAIN_COMPARE_SIDE lhs,
@@ -3207,6 +3812,14 @@ domain_plan_add_comparison (DOMAIN_PLAN * plan, DOMAIN_COMPARE_PLAN * comparison
 
 /* A list column side of an ALL/SOME term: its resolved domain table entry, a DOUBLE for a reader of AVG, STDDEV* or
  * VAR*, or its plan domain; VARIABLE when the plan leaves its values' type or collation variable. */
+/*
+ * [리뷰] domain_compare_column_side — regu 가 아니라 리스트 컬럼 항목으로 주어진 비교 한쪽을 판정한다(서브쿼리 리스트와 비교하는 ALL/SOME, 머지 조인
+ * 컬럼쌍).
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: domain_compare_side 와 같은 순서를 컬럼 항목만으로 돌린다 — column==NULL 이면 VARIABLE, DOUBLE 집계면 KNOWN, resolved_index
+ * 가 있으면 LATE_BIND, 도메인이 값을 고정하면 KNOWN, 아니면 VARIABLE. regu 가 없으므로 COLLATE 수식 처리는 없다.
+ * 바뀐 것: 신설(+37줄).
+ */
 static DOMAIN_COMPARE_SIDE
 domain_compare_column_side (const DOMAIN_PLAN * plan, DOMAIN_LOAD_ENTRY * const *load_entries,
 			    const DOMAIN_PLAN_ITEM * column, DOMAIN_COMPARE_PLAN * comparison, int side,
@@ -3247,6 +3860,13 @@ domain_compare_column_side (const DOMAIN_PLAN * plan, DOMAIN_LOAD_ENTRY * const 
 
 /* One side of a comparison outside a term: a regu as a term's side, a list column as an ALL/SOME term's list
  * side, a literal no regu holds by its value's key. */
+/*
+ * [리뷰] domain_compare_pair_side — compare pair 의 한쪽이 regu / 리터럴 / 컬럼 중 무엇으로 주어졌는지에 따라 적절한 판정 함수로 보내는 디스패처.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: regu 가 있으면 domain_compare_side, 리터럴이면 여기서 직접 키를 뽑아 KNOWN, 아니면 domain_compare_column_side. 리터럴 경로는 NULL
+ * 이면 tp_Null_domain 을 쓴다.
+ * 바뀐 것: 신설(+22줄).
+ */
 static DOMAIN_COMPARE_SIDE
 domain_compare_pair_side (const DOMAIN_PLAN * plan, DOMAIN_LOAD_ENTRY * const *load_entries, int constant_base,
 			  const DOMAIN_LOAD_COMPARE_PAIR * pair, DOMAIN_COMPARE_PLAN * comparison, int side,
@@ -3278,6 +3898,15 @@ domain_compare_pair_side (const DOMAIN_PLAN * plan, DOMAIN_LOAD_ENTRY * const *l
  * resolve_domains' when resolve_domains resolves the item. Against a constant (a literal, a bind, a constant
  * expression): resolve_domains resolves and converts each element once, by position. A right side resolve_domains types
  * is resolve_domains' too.
+ */
+/*
+ * [리뷰] domain_plan_add_elements — ALL/SOME 항 하나의 해소 계획(DOMAIN_ELEMENT_COMPARE_PLAN)을 만든다. 원소 비교를 쌍 비교로 할지, 행마다
+ * 할지, 게이트가 원소들을 위치별로 풀지(kind)를 정한다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 왼쪽은 항상 domain_compare_side. 오른쪽은 서브쿼리 리스트면 컬럼 판정, 아니면 regu 판정 후 — 상수/bind/상수식이면 LATE_BIND, variable
+ * POS 면 LATE_BIND, 확정된 집합 타입이면 왼쪽도 KNOWN 일 때만 ROW — 로 kind 를 정한다. 한쪽이라도 VARIABLE 이면 무조건 PAIR 로 되돌린다. 마지막에
+ * term->domain_compare 에 연결한다.
+ * 바뀐 것: 신설(+74줄).
  */
 static bool
 domain_plan_add_elements (THREAD_ENTRY * thread_p, DOMAIN_PLAN * plan, DOMAIN_LOAD_ENTRY * const *load_entries,
@@ -3362,6 +3991,14 @@ domain_plan_add_elements (THREAD_ENTRY * thread_p, DOMAIN_PLAN * plan, DOMAIN_LO
  * scan_reset_scan_block: an inner scan for each outer row), and so does the block's execution (a correlated subquery,
  * qexec_execute_mainblock). Only a scan procedure's block is one; a list another block's scope marked already is not.
  */
+/*
+ * [리뷰] domain_block_scope — XASL 블록에 '스코프 번호'를 부여한다. 스코프란 그 블록의 스캔이 한 행을 잡고 있는 동안 — 바깥 상관 값이 고정돼 있어 변환을 한 번만
+ * 하면 되는 구간이다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: BUILDLIST/BUILDVALUE/SCAN 이고 val_list 가 있을 때만 번호를 준다. val_list 와 merge_val_list 의 기존 번호가 어긋나면 -1(스코프
+ * 없음). 아직 0이면 plan->n_scopes 에서 새 번호를 받아 두 리스트에 같이 써 넣는다 — 번호 저장소가 플랜이 아니라 VAL_LIST 라는 점이 특징이다.
+ * 바뀐 것: 신설(+27줄).
+ */
 static int
 domain_block_scope (DOMAIN_PLAN * plan, XASL_NODE * block)
 {
@@ -3395,6 +4032,14 @@ domain_block_scope (DOMAIN_PLAN * plan, XASL_NODE * block)
  *   correlated value's its block's
  *   return: 1 + its domain_execution.temporaries index; 0 when there is none (the block's scans do not start a scope;
  *	     no memory: ctx->failed)
+ */
+/*
+ * [리뷰] domain_add_temporary — '스코프당 한 번만 변환해 두는 값' 하나를 플랜에 등록하고 1부터 시작하는 핸들을 돌려준다(0 은 '없음').
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: block 이 NULL 이면 실행 전체 스코프(DOMAIN_SCOPE_EXECUTION), 아니면 domain_block_scope 로 번호를 얻고 -1 이면 등록하지 않고 0 을
+ * 돌려준다. temporary_scopes/temporary_blocks 두 평행 배열을 8부터 2배씩 키운다. 반환값이 `++plan->n_temporaries` 이므로 호출자가 받는 값은
+ * 1-based 인덱스다.
+ * 바뀐 것: 신설(+32줄).
  */
 static int
 domain_add_temporary (DOMAIN_LOAD_CONTEXT * ctx, DOMAIN_PLAN * plan, XASL_NODE * block)
@@ -3431,6 +4076,13 @@ domain_add_temporary (DOMAIN_LOAD_CONTEXT * ctx, DOMAIN_PLAN * plan, XASL_NODE *
 
 /* Whether a node's operand coercion may convert operand i at the row: resolve_domains resolves the operand coercion (a
  * late-binding node, a compiled one over an operand it did not type), or the load's converts it. */
+/*
+ * [리뷰] domain_arith_may_convert — 산술 항목의 i 번째 피연산자가 실제로 변환을 겪을 수 있는지 본다. 변환이 없으면 스코프당 1회 변환 슬롯을 잡을 필요가 없다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: (타입 축 지연 바인딩이면서 collation 전용이 아님) 또는 (강제변환 지연) 또는 (이미 정적 변환기가 걸려 있음) 셋 중 하나면 true. collation 전용 지연은 값
+ * 변환이 아니므로 제외된다.
+ * 바뀐 것: 신설(+6줄).
+ */
 static bool
 domain_arith_may_convert (const DOMAIN_PLAN_ITEM * item, int i)
 {
@@ -3440,6 +4092,13 @@ domain_arith_may_convert (const DOMAIN_PLAN_ITEM * item, int i)
 
 /* Whether an operand is a constant the execution fixes: a literal, a bind, or a constant expression resolve_domains
  * evaluates (as domain_compare_side knows one). */
+/*
+ * [리뷰] domain_constant_operand — 피연산자 regu 가 실행 전체 스코프에서 한 번만 변환해도 되는 상수인지(리터럴·bind·상수 식) 판정한다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: TYPE_DBVAL 이거나 항목이 달린 TYPE_POS_VALUE 면 바로 true. arith/func 는 그 항목의 ref 가 상수 식 영역(>= constant_base)인지로
+ * 본다.
+ * 바뀐 것: 신설(+18줄).
+ */
 static bool
 domain_constant_operand (const REGU_VARIABLE * regu, int constant_base)
 {
@@ -3461,6 +4120,13 @@ domain_constant_operand (const REGU_VARIABLE * regu, int constant_base)
 
 /* Whether a resolved comparison may convert a side at the row: resolve_domains resolves it, or the load's resolution
  * converts it. */
+/*
+ * [리뷰] domain_load_entry_may_convert — 비교의 한쪽이 변환을 겪을 수 있는지 본다 — 스코프당 1회 변환 슬롯을 비교에 붙일지 결정하는 조건.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 해소 방식이 LATE_BIND 또는 LATE_BIND_SESSION 이면(아직 모르므로) true, CONVERT 면 그 쪽 변환기가 실제로 있을 때만 true. VALUES 방식은
+ * false.
+ * 바뀐 것: 신설(+7줄).
+ */
 static bool
 domain_load_entry_may_convert (const DOMAIN_COMPARE_PLAN * comparison, int side)
 {
@@ -3475,6 +4141,15 @@ domain_load_entry_may_convert (const DOMAIN_COMPARE_PLAN * comparison, int side)
  *
  * a term's side that is a correlated value an outer block's scan fixes is converted once per scope,
  * where every place the walk met the term is in that scope.
+ */
+/*
+ * [리뷰] domain_plan_add_compares — 워크가 모은 비교 항·ALL/SOME 항·비교쌍을 전부 DOMAIN_COMPARE_PLAN 으로 공개하고, 게이트가 풀어야 할 것들을
+ * plan->compares / plan->element_comparisons 두 배열로 묶는다. 실행 전 게이트의 비교 단계가 읽을 목록.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 먼저 index→LOAD_ENTRY 역색인(load_entries)을 만든다(alias 인 항목은 대표를 넣는다). 비교 항은 이미 계획이 있으면(두 번 만남) 분기 포함 관계만
+ * 검사하고 스코프가 달라진 temporaries 를 0 으로 되돌린다. 새 항은 양쪽 판정 → domain_plan_add_comparison → 연산자 함수 고정 → 스코프당 1회 변환 슬롯
+ * 부여. ALL/SOME·비교쌍도 같은 절차를 돈다. 세 임시 배열은 db_private_alloc 로 잡고 끝에서 모두 해제한다.
+ * 바뀐 것: 신설(+171줄).
  */
 static bool
 domain_plan_add_compares (THREAD_ENTRY * thread_p, DOMAIN_LOAD_CONTEXT * ctx, DOMAIN_PLAN * plan, int constant_base)
@@ -3654,6 +4329,14 @@ domain_plan_add_compares (THREAD_ENTRY * thread_p, DOMAIN_LOAD_CONTEXT * ctx, DO
  *   the execution converts each once per scope where the node's operand coercion converts it. Then the scope of every
  *   such value, the comparison sides' (domain_plan_add_compares) included.
  */
+/*
+ * [리뷰] domain_plan_add_temporaries — 산술 노드와 집계가 적어 둔 temporary_operand 후보를 실제 '스코프당 1회 변환' 슬롯으로 확정하고,
+ * plan->temporary_scope 배열을 공개한다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: alias 엔트리와 후보가 없는 엔트리는 건너뛴다. 집계(AGG 문맥)는 변환 여부를 실행 시 값 도메인으로 정하므로 domain_arith_may_convert 검사를 면제한다.
+ * 외부 스코프가 잡혀 있으면 그 블록 스코프로, 아니면 상수 피연산자일 때 실행 전체 스코프로 등록한다. 끝에서 ctx 의 스코프 배열을 플랜 메모리로 복사한다.
+ * 바뀐 것: 신설(+41줄).
+ */
 static bool
 domain_plan_add_temporaries (THREAD_ENTRY * thread_p, DOMAIN_LOAD_CONTEXT * ctx, DOMAIN_PLAN * plan, int constant_base)
 {
@@ -3703,6 +4386,15 @@ domain_plan_add_temporaries (THREAD_ENTRY * thread_p, DOMAIN_LOAD_CONTEXT * ctx,
  *   just before evaluating it); n_constant_expressions when it reads a late-binding node over a constant expression
  *   that reads a row - after the last constant
  */
+/*
+ * [리뷰] domain_comparison_resolvable_at — 상수 단계를 기다리는 비교 하나가 '몇 번째 상수 식까지 계산되면' 풀 수 있는지 그 지점을 돌려준다. 게이트가 상수를 하나
+ * 계산할 때마다 그 지점에 걸린 비교만 풀 수 있게 하는 계수 정렬의 키.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 양쪽을 보며 — 상수 쪽이면 그 상수 식 번호+1, 상수 단계 뒤에 풀리는 피연산자면 그 생산 노드가 상수 식이면 그 번호, 아니면 n_constant_expressions(= 전부
+ * 끝난 뒤) — 중 최대값을 취한다. 범위 검사는 assert 뿐이지만 호출자(domain_plan_add_constant_comparisons)가 `at[s] <
+ * n_constant_expressions` 로 다시 거르므로 범위 밖 값은 '상수 뒤가 아님' 쪽으로 떨어진다.
+ * 바뀐 것: 신설(+27줄).
+ */
 static int
 domain_comparison_resolvable_at (const DOMAIN_PLAN * plan, const DOMAIN_COMPARE_PLAN * comparison, int constant_base)
 {
@@ -3736,6 +4428,17 @@ domain_comparison_resolvable_at (const DOMAIN_PLAN * plan, const DOMAIN_COMPARE_
  *   ALL/SOME terms to resolve the constant expression step (qexec_evaluate_constant_expression) resolves just before it
  *   evaluates that constant: the constant expression step resolves a comparison as soon as its constants have their
  *   values, and this list lets it do so without going over every comparison before every constant
+ */
+/*
+ * [리뷰] domain_plan_add_constant_comparisons — 로드 단계의 마지막 조립 단계 — stx_build_domain_plan 이 상수식·비교를 모두 모은 뒤 불러,
+ * 「어느 상수식이 평가되면 어느 비교를 결정할 수 있나」를 CSR 두 배열(plan->constant_comparisons_first / constant_comparisons)로 plan 에 달고
+ * 성공 여부를 bool 로 돌려준다. 실행 전 게이트의 상수식 단계가 이 인덱스를 보고 그 자리에서 비교를 확정한다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에는 비교 결정을 미리 모아 두는 구조 자체가 없고, 비교 도메인은 행마다 eval_value_rel_cmp →
+ * tp_value_compare_with_error 가 정했다(src/query/query_evaluator.c:153).
+ * 이 PR: 비교(plan->compares)와 원소 비교(element_comparisons)를 한 줄로 이어 각각이 기다리는 상수 인덱스 at[s] 를 구하고, 상수별 계수정렬로 CSR 을
+ * 만든다. 세션 변수를 읽는 비교는 at[s]=n_constant_expressions 로 빼서 상수 단계가 아니라 세션 변수 단계로 넘긴다.
+ * 바뀐 것: 신설 +69줄. 스크래치 at 은 db_private_alloc/db_private_free 짝(3748/3806)이고, CSR 두 배열은
+ * domain_plan_alloc(=stx_alloc_struct, XASL 언팩 아레나)이라 플랜 수명을 따른다.
  */
 static bool
 domain_plan_add_constant_comparisons (THREAD_ENTRY * thread_p, DOMAIN_PLAN * plan, int constant_base)
@@ -3814,6 +4517,14 @@ domain_plan_add_constant_comparisons (THREAD_ENTRY * thread_p, DOMAIN_PLAN * pla
  *   (resolve_domains' error before any row), a literal under a COLLATE modifier (the fetch gives its value the
  *   modifier's collation)
  */
+/*
+ * [리뷰] domain_key_literal — domain_plan_key_element 가 인덱스 키 칼럼 하나를 볼 때 호출 — 그 regu 가 「컴파일 시점에 값이 박힌, 인덱스에 쓸 수
+ * 있는 리터럴」인지 판정해 값의 도메인을 돌려주고, 아니면 NULL 을 돌려준다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: TYPE_DBVAL 이 아니거나 REGU_VARIABLE_APPLY_COLLATION 이 붙었거나 NULL 이거나 인덱스 타입이 아니면 NULL. 통과하면
+ * domain_value_domain() 의 도메인을 domain_fixes_values() 로 한 번 더 걸러 돌려준다.
+ * 바뀐 것: 신설 +11줄.
+ */
 static const TP_DOMAIN *
 domain_key_literal (const REGU_VARIABLE * regu)
 {
@@ -3828,6 +4539,14 @@ domain_key_literal (const REGU_VARIABLE * regu)
 
 /* Whether key2's constant element reads key1's value at its column: two binds of one reference - resolve_domains'
  * vals[ref] - without a COLLATE modifier, against the same column. */
+/*
+ * [리뷰] domain_key_same_bind — domain_plan_key_element 가 range 의 key2 원소를 볼 때 호출 — 짝(key1)의 같은 자리 원소가 같은 bind
+ * 위치를 읽는지 판정해, 같으면 게이트의 결정 슬롯(resolved_element)을 공유시킨다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 짝이 DOMAIN_KEY_CONSTANT 이고 아직 공유되지 않았고 같은 인덱스 칼럼이며, 양쪽 regu 가 모두 TYPE_POS_VALUE 로 같은
+ * plan_item->ref(>=0)를 읽고 둘 다 APPLY_COLLATION 이 아닐 때만 true.
+ * 바뀐 것: 신설 +14줄. pair->shared 를 막아 공유가 연쇄되지 않게 한다.
+ */
 static bool
 domain_key_same_bind (const domain_plan_key_elem * pair, const domain_plan_key_elem * elem)
 {
@@ -3858,6 +4577,16 @@ domain_key_same_bind (const domain_plan_key_elem * pair, const domain_plan_key_e
  * pair(in): key1's element at this column when this is key2's, else NULL. A key2 constant over the same bind (an IN
  * list's range, key1 = key2 = ?) takes key1's resolution: the same value against the same column in the same index is
  * one resolution, which resolve_domains makes once.
+ */
+/*
+ * [리뷰] domain_plan_key_element — 인덱스 키 한 칼럼의 결정 규칙을 로드 시점에 확정한다 — domain_plan_key_bound 가 원소마다 호출하고, elem 에
+ * rule(INDEX/KEEP/CONSTANT/LATE_BIND)·keep_elem·strict_conv·resolved_element 를 채워 성공 여부를 돌려준다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 은 키를 만들 때마다 scan_dbvals_to_midxkey 가 칼럼별로
+ * tp_domain_match_ignore_order 를 돌려 setdomain 재구성 여부를 정하고 btree_coerce_key 로
+ * 변환했다(src/query/scan_manager.c:2042, 2274).
+ * 이 PR: ISS 의 skip 값은 인덱스에서 읽으므로 INDEX 로 두고 끝낸다. OPERAND_CONST 면 리터럴 도메인으로 규칙을 정하고, 규칙이 CONSTANT 면 짝과 bind 를
+ * 공유하거나 새 resolved_element 를 받는다. 비상수는 컴파일 도메인이 값을 고정하지 못하면 LATE_BIND 로 돌려 게이트가 결정하게 한다.
+ * 바뀐 것: 신설 +51줄. 한 칼럼의 결정이 네 갈래(INDEX/KEEP/CONSTANT/LATE_BIND)로 분기한다.
  */
 static bool
 domain_plan_key_element (domain_plan_index * index, bool midxkey, REGU_VARIABLE * regu, const TP_DOMAIN * column,
@@ -3913,6 +4642,14 @@ domain_plan_key_element (domain_plan_index * index, bool midxkey, REGU_VARIABLE 
 
 /* One bound of a key range: the columns of a multi-column key's F_MIDXKEY, or the single-column key itself.
  * pair(in): key1's bound when this is key2's (domain_plan_key_element), else NULL */
+/*
+ * [리뷰] domain_plan_key_bound — KEY_RANGE 한쪽 경계(단일 regu 또는 MIDXKEY 의 F_MIDXKEY 피연산자 목록) 전체를 돌며 domain_plan_key
+ * 를 채운다 — domain_plan_add_indexes 가 range 당 두 번(+ISS fetch range 한 번) 호출한다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: midxkey 면 피연산자 수만큼, 아니면 1개를 domain_plan_key_element 에 넘긴다. 전부 상수이고 행이 정하는 원소가 없으면 bound->constant=true
+ * 로 두어 게이트가 도메인을 한 번만 쓰게 하고, 섞이면 mixed_key_cache 슬롯을 하나 배정해 스캔이 캐시를 쓰게 한다.
+ * 바뀐 것: 신설 +59줄. elems 는 아레나 할당이고 n>0 일 때만 NULL 을 실패로 본다.
+ */
 static bool
 domain_plan_key_bound (THREAD_ENTRY * thread_p, domain_plan_index * index, REGU_VARIABLE * bound_regu, bool skip_first,
 		       const domain_plan_key * pair, domain_plan_key * bound)
@@ -3976,6 +4713,14 @@ domain_plan_key_bound (THREAD_ENTRY * thread_p, domain_plan_index * index, REGU_
 /* Whether a key column takes values of a key other than its own under a load-fixed element: the scan compares them
  * by the type pair comparison table. resolve_domains resolves it for an index whose elements wait for it
  * (qexec_resolve_index_keys). */
+/*
+ * [리뷰] domain_key_other_keys — 결정 원소가 하나도 없는 인덱스(resolved_keys_index 를 받지 않는 인덱스)에 대해, keep 도메인이 인덱스 칼럼 도메인과
+ * 다른 원소가 하나라도 있는지 로드 때 한 번 계산해 index->other_keys 에 캐시한다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 모든 경계(2*n_ranges+1 개)의 모든 원소를 훑어, CONSTANT·LATE_BIND 가 아닌 원소 중 domain_key_differs(keep_elem,
+ * index_elem) 가 참인 것이 있으면 true.
+ * 바뀐 것: 신설 +18줄. 루프 상한 2*n_ranges+1 이 domain_plan_add_indexes 의 bounds 할당 개수와 같다.
+ */
 static bool
 domain_key_other_keys (const domain_plan_index * index)
 {
@@ -3998,6 +4743,15 @@ domain_key_other_keys (const domain_plan_index * index)
 /*
  * domain_plan_add_indexes () - every index scan's key plan: its bounds' elements and their
  *   rules, from INDX_INFO.key_type; the scan finds it through INDX_INFO.key_plan
+ */
+/*
+ * [리뷰] domain_plan_add_indexes — 로드가 XASL 에서 모은 INDX_INFO 전부에 domain_plan_index 를 붙이고 indx_info->key_plan 으로
+ * 건다 — stx_build_domain_plan 이 비교·상수 단계를 끝낸 뒤 부른다. 이후 스캔은 key_plan 만 읽는다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에는 indx_info->key_plan 필드가 없고, 키 도메인 판단이 매 키 생성 때 scan_manager.c
+ * 안에서 일어났다.
+ * 이 PR: 인덱스마다 bounds 배열(2*n_ranges+1)을 아레나에 잡고 range 별 key1/key2 와 ISS fetch range 를 domain_plan_key_bound 로
+ * 채운다. 결정 원소가 있으면 plan->n_resolved_index_keys 슬롯을 받고, 없으면 other_keys 를 한 번 계산한다.
+ * 바뀐 것: 신설 +61줄. key_type==NULL 인 인덱스는 key_plan 을 NULL 로 남겨 실행 시 미해결 도메인 검사에서 걸리게 한다(코드 주석 4021).
  */
 static bool
 domain_plan_add_indexes (THREAD_ENTRY * thread_p, DOMAIN_LOAD_CONTEXT * ctx, DOMAIN_PLAN * plan)
@@ -4081,6 +4835,14 @@ static void domain_stream_walk_pred (DOMAIN_STREAM_CONTEXT * ctx, PRED_EXPR * pr
 
 /* A literal side's key, its value's (and the codeset and collation a COLLATE modifier gives it); false for any other
  * side, whose values are the catalog's. */
+/*
+ * [리뷰] domain_stream_literal_key — 스트림 보강 경로(domain_plan_stream_compares)에서 비교 한쪽 피연산자를 보고, 리터럴이면
+ * DOMAIN_COMPARE_PLAN 의 그 side 를 채우고 비교 키(DOMAIN_COMPARE_KEY)를 만들어 true, 아니면 false 를 돌려준다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: TYPE_DBVAL 이 아니면 operand/domain/value 만 채우고 false. 리터럴이면 APPLY_COLLATION 이 붙고 콜레이션을 갖는 타입일 때만
+ * collate[side] 를 세우고, NULL 이면 tp_Null_domain 으로 키를 만든다.
+ * 바뀐 것: 신설 +19줄. false 를 돌려줄 때 collate/literal 은 건드리지 않아 memset 0 상태로 남는다.
+ */
 static bool
 domain_stream_literal_key (const REGU_VARIABLE * regu, DOMAIN_COMPARE_PLAN * comparison, int side,
 			   DOMAIN_COMPARE_KEY * key)
@@ -4102,6 +4864,13 @@ domain_stream_literal_key (const REGU_VARIABLE * regu, DOMAIN_COMPARE_PLAN * com
 }
 
 /* A stream comparison over a side the catalog gives its values: the key pair table by the values' keys. */
+/*
+ * [리뷰] domain_stream_by_keys — 비교를 「로드 때 결정하지 못했다」로 표시하는 한 줄 초기화 — 한쪽이라도 리터럴이 아니면
+ * domain_stream_compare·domain_stream_elements 가 불러 method=DOMAIN_COMPARE_KEYS 로 두고, 실행 경로가 키로 비교하게 한다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: DOMAIN_COMPARE 를 값 초기화한 뒤 method·compare_index(-1)·value[0..1]·codeset_side(-1)를 센티넬로 세운다.
+ * 바뀐 것: 신설 +10줄.
+ */
 static void
 domain_stream_by_keys (DOMAIN_COMPARE * fixed)
 {
@@ -4114,6 +4883,14 @@ domain_stream_by_keys (DOMAIN_COMPARE * fixed)
 }
 
 /* A comparison of two stream regus, resolved now. */
+/*
+ * [리뷰] domain_stream_compare — 비교식 하나에 대한 DOMAIN_COMPARE_PLAN 을 XASL 언팩 아레나에 만들어 돌려준다 —
+ * domain_stream_walk_pred·domain_stream_walk_arith 가 호출하고, 결과는 comp->domain_compare / compares[] 에 매달린다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서 두 값의 비교 도메인은 행마다 tp_value_compare_with_error 안에서 정해졌다.
+ * 이 PR: 양쪽이 모두 리터럴이면 domain_resolve_comparison 으로 로드 시점에 비교 방식을 확정하고, 하나라도 아니면 domain_stream_by_keys 로 키 비교로
+ * 떨어뜨린다. 할당 실패는 ctx->failed 로 올린다.
+ * 바뀐 것: 신설 +26줄. 실패를 반환값이 아니라 ctx->failed 로 전파하는 계약이다.
+ */
 static DOMAIN_COMPARE_PLAN *
 domain_stream_compare (DOMAIN_STREAM_CONTEXT * ctx, const REGU_VARIABLE * lhs, const REGU_VARIABLE * rhs)
 {
@@ -4143,6 +4920,15 @@ domain_stream_compare (DOMAIN_STREAM_CONTEXT * ctx, const REGU_VARIABLE * lhs, c
 
 /* An ALL/SOME term of a stream: a literal item against the elements of its collection by the item's row of the type
  * pair comparison table, any other item by the two values' keys. */
+/*
+ * [리뷰] domain_stream_elements — ALL/SOME(ALSM) 항의 원소 쪽을 보고 DOMAIN_ELEMENT_COMPARE_PLAN 을 만들어
+ * alsm->domain_compare 에 달 것을 돌려준다 — 원소가 리터럴이면 ROW, 아니면 PAIR 로 분류한다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: domain_stream_literal_key 가 실패하면 kind=DOMAIN_ELEMENTS_PAIR + 키 비교. 성공하면 kind=DOMAIN_ELEMENTS_ROW 이고
+ * row 에 domain_compare_key_row() 결과를 넣는다.
+ * 바뀐 것: 신설 +25줄.
+ * [지적 C4-05]
+ */
 static const DOMAIN_ELEMENT_COMPARE_PLAN *
 domain_stream_elements (DOMAIN_STREAM_CONTEXT * ctx, const REGU_VARIABLE * elem)
 {
@@ -4170,6 +4956,14 @@ domain_stream_elements (DOMAIN_STREAM_CONTEXT * ctx, const REGU_VARIABLE * elem)
 }
 
 /* A stream has no plan items: a node that needs one gets a bare item */
+/*
+ * [리뷰] domain_stream_item — ARITH_TYPE 하나에 DOMAIN_PLAN_ITEM 을 만들어 arith->plan_item 에 건다 — 스트림 보강 경로에서 플랜 항목이
+ * 없는 산술 노드에 자리를 만들어 주는 최소 생성자다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 의 ARITH_TYPE 에는 plan_item 필드가 없다.
+ * 이 PR: stx_alloc_struct 로 잡아 0 으로 밀고 resolved_index=-1, ref=-1, operand_class=OPERAND_ROW,
+ * fixed.domain=arith->domain 으로 둔다. 즉 「행이 정하는 노드」 기본값이다.
+ * 바뀐 것: 신설 +17줄.
+ */
 static DOMAIN_PLAN_ITEM *
 domain_stream_item (DOMAIN_STREAM_CONTEXT * ctx, ARITH_TYPE * arith)
 {
@@ -4190,6 +4984,14 @@ domain_stream_item (DOMAIN_STREAM_CONTEXT * ctx, ARITH_TYPE * arith)
 
 /* A FIELD, NULLIF, LEAST or GREATEST node's resolved comparisons, carried by its bare item; NULL for
  * any other operator */
+/*
+ * [리뷰] domain_stream_arith_compares — 산술 노드의 비교 슬롯 배열(compares[])을 돌려준다 — 이미 plan_item 이 있으면 그 배열을, 없으면 opcode
+ * 가 요구하는 개수만큼 새로 잡고 plan_item 을 만들어 매단다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: domain_arith_compares 가 NULL 이면(그 opcode 는 비교를 쓰지 않거나 할당 실패) NULL. 할당 실패는 그 함수와 domain_stream_item 이
+ * ctx->failed 로 올린다.
+ * 바뀐 것: 신설 +20줄. 반환 NULL 이 「비교 없음」과 「실패」 둘 다를 뜻하고, 구분은 ctx->failed 로만 된다.
+ */
 static const DOMAIN_COMPARE_PLAN **
 domain_stream_arith_compares (DOMAIN_STREAM_CONTEXT * ctx, ARITH_TYPE * arith)
 {
@@ -4211,6 +5013,14 @@ domain_stream_arith_compares (DOMAIN_STREAM_CONTEXT * ctx, ARITH_TYPE * arith)
   return compares;
 }
 
+/*
+ * [리뷰] domain_stream_walk_arith — ARITH_TYPE 한 노드의 자식(left/right/third/pred)을 먼저 내려간 뒤, 그 노드에 피연산자
+ * 강제변환(operand coercion)과 비교 플랜을 다는 스트림 보강 워커.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: domain_operand_coercion_operator 인 연산자는 domain_plan_operand_coercion 으로 좌우 스트림 도메인에서 강제변환을 로드 때 정한다.
+ * T_FIELD 는 third 와 left/right 의 두 비교를, 그 밖은 left/right 한 비교를 채운다.
+ * 바뀐 것: 신설 +40줄. ctx->failed 이면 즉시 반환하는 단락 조건이 모든 워커에 공통이다.
+ */
 static void
 domain_stream_walk_arith (DOMAIN_STREAM_CONTEXT * ctx, ARITH_TYPE * arith, bool field_bottom)
 {
@@ -4252,6 +5062,14 @@ domain_stream_walk_arith (DOMAIN_STREAM_CONTEXT * ctx, ARITH_TYPE * arith, bool 
     }
 }
 
+/*
+ * [리뷰] domain_stream_walk_regu — REGU_VARIABLE 한 노드의 종류를 보고 자식으로 내려가는 디스패처 — 산술이면 walk_arith, 함수/regu 목록이면
+ * 피연산자 목록을 재귀한다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: TYPE_INARITH/OUTARITH 는 REGU_VARIABLE_FIELD_COMPARE 플래그를 field_bottom 으로 넘겨 T_FIELD 의 첫 비교를 달지 말지 알린다.
+ * 그 밖의 타입은 아무것도 하지 않는다.
+ * 바뀐 것: 신설 +29줄.
+ */
 static void
 domain_stream_walk_regu (DOMAIN_STREAM_CONTEXT * ctx, REGU_VARIABLE * regu)
 {
@@ -4282,6 +5100,15 @@ domain_stream_walk_regu (DOMAIN_STREAM_CONTEXT * ctx, REGU_VARIABLE * regu)
     }
 }
 
+/*
+ * [리뷰] domain_stream_walk_pred — PRED_EXPR 트리를 돌며 비교항(T_COMP)·ALSM 항에 비교 플랜을 달고 LIKE/RLIKE 항의 regu 를 내려간다 —
+ * 스트림 보강의 술어 쪽 진입점.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 COMP_EVAL_TERM 에 domain_compare 필드가 없고 비교 도메인이 행마다
+ * 결정됐다(query_evaluator.c:153 eval_value_rel_cmp).
+ * 이 PR: T_PRED 는 lhs 를 재귀하고 rhs 로 꼬리이동, T_NOT_TERM 은 꼬리이동한다. 값 비교 연산자(R_EQ 등 7종)이고 양쪽이 LIST_ID 가 아닐 때만
+ * comp->domain_compare 를 만들고, 만들었으면 domain_compare_set_operator_functions 로 연산자 함수를 미리 박는다.
+ * 바뀐 것: 신설 +66줄. 값 비교 판정 조건을 domain_add_compare_term 과 똑같이 손으로 한 번 더 적은 자리다(주석 4309) — 두 곳이 같이 바뀌어야 하는 암묵 계약.
+ */
 static void
 domain_stream_walk_pred (DOMAIN_STREAM_CONTEXT * ctx, PRED_EXPR * pred)
 {
@@ -4349,6 +5176,13 @@ domain_stream_walk_pred (DOMAIN_STREAM_CONTEXT * ctx, PRED_EXPR * pred)
     }
 }
 
+/*
+ * [리뷰] domain_plan_stream_compares — 스트림에서 개별 술어/regu 만 따로 복원하는 경로의 공개 진입점 — stream_to_xasl.c:373·443 이 불러 그
+ * 조각에도 비교 플랜을 달아 주고, 실패는 ER_OUT_OF_VIRTUAL_MEMORY 로 돌려준다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: DOMAIN_STREAM_CONTEXT 를 스택에 만들어 pred 와 regu 를 차례로 걷고 ctx.failed 를 에러 코드로 번역한다.
+ * 바뀐 것: 신설 +8줄. 전체 XASL 경로(stx_build_domain_plan)와 조각 경로가 같은 워커를 공유하는 두 번째 입구다.
+ */
 int
 domain_plan_stream_compares (THREAD_ENTRY * thread_p, PRED_EXPR * pred, REGU_VARIABLE * regu)
 {
@@ -4371,6 +5205,13 @@ struct DOMAIN_LOAD_OUTPUT
   int order;
 };
 
+/*
+ * [리뷰] domain_compare_outputs — qsort 비교자 — domain_match_value_pointers 가 로드 엔트리의 출력 DB_VALUE 포인터 목록을 값 주소
+ * 오름차순(동률이면 원래 순서)으로 정렬할 때 쓴다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 포인터를 uintptr_t 로 비교하고, 같으면 order 로 안정 정렬을 흉내낸다.
+ * 바뀐 것: 신설 +12줄.
+ */
 static int
 domain_compare_outputs (const void *lhs, const void *rhs)
 {
@@ -4385,6 +5226,13 @@ domain_compare_outputs (const void *lhs, const void *rhs)
 }
 
 /* The first of a value's outputs among the sorted outputs; n when no load entry writes it. */
+/*
+ * [리뷰] domain_first_output — 정렬된 출력 목록에서 주어진 DB_VALUE 포인터의 하한(lower bound)을 이진 탐색으로 찾는다 —
+ * domain_match_value_pointers 가 값 포인터마다 전체 엔트리 스캔 대신 이것을 쓴다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 표준 lower_bound 루프. n==0 이면 0 을 돌려주므로 outputs==NULL 과도 안전하게 맞물린다.
+ * 바뀐 것: 신설 +18줄. 로드 1회 비용을 O(E^2) 에서 O(E log E) 로 낮추는 자리.
+ */
 static int
 domain_first_output (const DOMAIN_LOAD_OUTPUT * outputs, int n, const DB_VALUE * value)
 {
@@ -4416,6 +5264,14 @@ struct DOMAIN_LOAD_REF
 
 /* The load context's lists and load entries, once the plan is published; on a failure the owners the walk bound are
  * left without an item (one function of stx_build_domain_plan's steps). */
+/*
+ * [리뷰] domain_load_context_free — 로드 중에만 쓰는 스크래치(DOMAIN_LOAD_CONTEXT)의 db_private 블록과 연결 리스트를 전부 되돌려준다 —
+ * stx_build_domain_plan 이 플랜 조립을 끝낸 직후 한 번 부른다. 플랜 본체는 아레나라 여기서 풀지 않는다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 14개 배열과 element_terms/list_columns/bindings/compare_pairs/head 다섯 리스트를 해제한다. ctx->failed 이면
+ * bindings·compare_pairs 의 *owner 를 NULL 로 되돌려, 실패한 로드가 반쯤 연결된 포인터를 XASL 에 남기지 않게 한다.
+ * 바뀐 것: 신설 +104줄. bindings 를 compare_pairs 보다 먼저 푸는 순서가 의도된 것이고 주석 4500 에 적혀 있다.
+ */
 static void
 domain_load_context_free (THREAD_ENTRY * thread_p, DOMAIN_LOAD_CONTEXT * ctx)
 {
@@ -4522,6 +5378,14 @@ domain_load_context_free (THREAD_ENTRY * thread_p, DOMAIN_LOAD_CONTEXT * ctx)
 }
 
 /* The value pointers' aliases and producers, found through the load entries' sorted outputs */
+/*
+ * [리뷰] domain_match_value_pointers — 로드 엔트리들 가운데 「같은 DB_VALUE 를 가리키는 소비자와 생산자」를 이어 준다 — stx_build_domain_plan
+ * 이 XASL 걷기 직후 불러 r->alias(같은 항목 재사용)와 r->producer(값을 쓰는 노드)를 채운다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 출력 포인터 목록을 만들어 qsort 한 뒤, TYPE_CONSTANT regu 마다 이진 탐색으로 같은 값을 쓰는 엔트리를 찾는다. alias 는 컴파일
+ * 도메인·operand_class·flags 가 모두 같고 GROUP_CONCAT 값을 읽는 경우가 아닐 때만 맺는다.
+ * 바뀐 것: 신설 +84줄. db_private_alloc/free 짝(4538/4606)이고 ctx->failed 이면 두 매칭 루프가 모두 건너뛴다.
+ */
 static void
 domain_match_value_pointers (THREAD_ENTRY * thread_p, DOMAIN_LOAD_CONTEXT * ctx)
 {
@@ -4608,6 +5472,15 @@ domain_match_value_pointers (THREAD_ENTRY * thread_p, DOMAIN_LOAD_CONTEXT * ctx)
 }
 
 /* Each bind's reference and the constant count (one of stx_build_domain_plan's steps) */
+/*
+ * [리뷰] domain_assign_references — bind 위치(val_pos)마다 참조 번호(item->ref)를 정한다 — 같은 위치라도 (도메인, 소비자 변환 여부)가 다르면 별도
+ * 참조를 하나 더 만들어, 실행 전 게이트가 한 위치를 서로 다른 도메인으로 두 번 쓰는 일이 없게 한다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 위치별 단일 연결 리스트(ref_first/refs)로 이미 만든 (도메인, consumer_converts) 조합을 찾고, 없으면 첫 사용은 val_pos 를 그대로, 그 뒤는
+ * plan->n_refs++ 를 쓴다. OPERAND_CONST 엔트리 수를 세어 plan->n_const_refs 로 올린다.
+ * 바뀐 것: 신설 +67줄. ref_first 길이가 plan->dbval_cnt 라, 호출자가 먼저 dbval_cnt 를 최대 val_pos+1 로 늘려 둔 것(4760~4767)에 의존한다 —
+ * 그 확장 루프가 이 호출보다 앞에 있어야 한다는 계약이 코드 순서로만 보장된다.
+ */
 static void
 domain_assign_references (THREAD_ENTRY * thread_p, DOMAIN_LOAD_CONTEXT * ctx, DOMAIN_PLAN * plan)
 {
@@ -4676,6 +5549,17 @@ domain_assign_references (THREAD_ENTRY * thread_p, DOMAIN_LOAD_CONTEXT * ctx, DO
     }
 }
 
+/*
+ * [리뷰] stx_build_domain_plan — 로드 게이트의 본체 — stream_to_xasl.c:269 가 XASL 언팩 직후 루트마다 한 번 부르고, XASL 전체를 걸어
+ * DOMAIN_PLAN 을 아레나에 완성해 root->domain_plan 에 단다. 실행 전 게이트(qexec_resolve_domains)는 이 플랜만 읽는다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 의 stx_map_stream_to_xasl 은 언팩만 하고 도메인에 관한 사전 계산을 하지 않았다.
+ * 이 PR: domain_walk_xasl → 값 포인터 매칭 → (CTE 칼럼 먼저) 해결 기록 → 항목 번호 매기기 → 실행 도메인 번호를 3그룹(보간 리스트 / 피연산자 타입 / 나머지)
+ * 순으로 매기기 → dbval_cnt 확장 → 참조 배정 → 늦은 바인딩 링크 작성 → 상수·비교·인덱스·임시값 단계 → 상수 분기 확정 → 스크래치 해제 → const_refs 정렬 →
+ * domain_plan_validate. 검증 실패는 ER_QPROC_DOMAIN_UNRESOLVED 로 로드를 거절한다.
+ * 바뀐 것: 신설 +273줄. 실패는 전부 ctx.failed 한 플래그로 모여 ER_OUT_OF_VIRTUAL_MEMORY 하나로 번역되고, 실패 시 모든 *r->owner 가 NULL 로
+ * 되돌아간다.
+ * [지적 C3-01]
+ */
 int
 stx_build_domain_plan (THREAD_ENTRY * thread_p, XASL_NODE * root, XASL_UNPACK_INFO * unpack_info)
 {

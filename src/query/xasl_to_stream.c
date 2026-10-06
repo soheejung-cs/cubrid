@@ -4756,6 +4756,15 @@ xts_process_access_spec_type (char *ptr, const ACCESS_SPEC_TYPE * access_spec)
   return ptr;
 }
 
+/*
+ * [리뷰] xts_process_indx_info — 클라이언트 컴파일에서 INDX_INFO 를 XASL 스트림으로 직렬화한다 — xts_save_indx_info 가 부르고 채운 버퍼 끝
+ * 포인터를 돌려준다. 서버 쪽 짝은 stx_build_indx_info.
+ * develop: develop 은 func_idx_col_id 까지 쓰고 바로 커버링 리스트 오프셋으로 넘어갔다. 인덱스 키 도메인은 스트림에 실리지 않았다 — 서버가 루트 헤더에서만 알았다.
+ * 이 PR: func_idx_col_id 다음에 or_pack_domain (ptr, indx_info->key_type, 0, 0) 으로 B-tree 키 도메인을 싣는다. 주석대로 OBJECT
+ * 키를 OID 로 바꾸지 않고 그대로 싣는 것이 조건이다 — 서버가 루트 헤더의 키 타입과 맞춰 보기 때문.
+ * 바뀐 것: +4줄(주석 포함)의 스트림 포맷 추가. '컴파일이 게이트 슬롯을 표시한다'는 이 PR 의 첫 단계에 해당한다. key_type 은
+ * xasl_generation.c:12358~12363 에서 NULL 이 아님을 보장받는다.
+ */
 static char *
 xts_process_indx_info (char *ptr, const INDX_INFO * indx_info)
 {
@@ -7021,6 +7030,13 @@ xts_sizeof_access_spec_type (const ACCESS_SPEC_TYPE * access_spec)
  * xts_sizeof_indx_info () -
  *   return:
  *   ptr(in)    :
+ */
+/*
+ * [리뷰] xts_sizeof_indx_info — INDX_INFO 의 직렬화 크기를 미리 계산해 버퍼를 잡게 해 준다 — xts_save_indx_info 가 pack 전에 부른다.
+ * develop: 고정 필드 합계만 돌려줬다(키 도메인 항목 없음).
+ * 이 PR: 반환 직전에 or_packed_domain_size (indx_info->key_type, 0) 을 더한다 — pack 쪽 or_pack_domain(.., 0, 0) 의
+ * include_classoid 인자와 맞는 짝이다.
+ * 바뀐 것: +2줄. size·pack·unpack 세 함수가 한 묶음으로 움직여야 하는 전형적인 3파일(여기선 3함수) 계약이고, 이번 변경은 셋이 맞춰져 있다.
  */
 static int
 xts_sizeof_indx_info (const INDX_INFO * indx_info)

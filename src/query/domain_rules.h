@@ -216,6 +216,14 @@ bool domain_fixes_values (const TP_DOMAIN * domain);
 /* Whether a domain leaves the type or the collation of its values to the execution: VARIABLE, or a collation flag
  * other than NORMAL (LEAVE, ENFORCE), whatever the type. A NULL domain does not: TP_DOMAIN_TYPE and
  * TP_DOMAIN_COLLATION_FLAG read it as NULL and NORMAL. */
+/*
+ * [리뷰] domain_is_variable — 도메인이 타입이나 콜레이션을 실행 시점에 남겨 두는지를 묻는 헤더 인라인 술어로, fetch_read_plan_domain 과
+ * qexec_setup_* 등 핫패스 호출부가 GATE 슬롯 여부를 한 번에 판정한다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 호출부마다 TP_DOMAIN_TYPE==VARIABLE 검사와 콜레이션 플래그 검사를 따로 썼다.
+ * 이 PR: TP_DOMAIN_TYPE(domain)==DB_TYPE_VARIABLE 이거나 TP_DOMAIN_COLLATION_FLAG(domain)!=NORMAL 이면 true. NULL
+ * 도메인은 매크로가 NULL/NORMAL 로 읽어 false 가 된다.
+ * 바뀐 것: 신규 헤더 인라인(+5줄). 인라인으로 둔 이유는 행 경로 호출부라는 점(헤더 주석에 NULL 처리 근거 명시).
+ */
 inline bool
 domain_is_variable (const TP_DOMAIN * domain)
 {
@@ -302,6 +310,15 @@ void domain_compare_key_of_value (const DB_VALUE * value, DOMAIN_COMPARE_KEY * k
 
 /* Whether two values differ in type, or in collation as strings: a comparison of them resolves a coercion or a
  * collation merge from them. A NULL compares with any value as it is. */
+/*
+ * [리뷰] domain_value_domains_differ — 두 값이 타입이나 콜레이션에서 달라 비교가 강제변환·콜레이션 병합을 해석해야 하는지를 묻는 헤더 인라인으로,
+ * scan_key_compare 와 eval_value_rel_cmp·eval_compare_values_resolved 가 행에서 빠른 경로를 고를 때 쓴다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 그런 선판정 없이 바로 tp_value_compare_with_error 로 들어갔다.
+ * 이 PR: 어느 한쪽이 NULL 이면 false, 타입이 다르면 true, 같은 문자형이면 db_get_string_collation 비교 결과를 돌려준다.
+ * 바뀐 것: 신규 헤더 인라인(+14줄). ENUM 은 문자형이 아니라 TP_IS_CHAR_TYPE 에 걸리지 않으므로 콜레이션 차이가 여기서는 보이지 않는다 — 호출부가 그 경우를 따로
+ * 다루는지에 계약이 걸려 있다.
+ * [지적 C5-04]
+ */
 inline bool
 domain_value_domains_differ (const DB_VALUE * value1, const DB_VALUE * value2)
 {

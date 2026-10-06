@@ -53,6 +53,14 @@
 #include "memory_wrapper.hpp"
 
 /* Releases one execution's resolutions for an ALL/SOME term: resolve_domains' values and arrays are the owner's. */
+/*
+ * [리뷰] qexec_clear_elements — ALL/SOME 원소 결정표 하나(DOMAIN_ELEMENTS)를 해제한다 — 실행 상태
+ * 정리(qexec_clear_resolved_domains)와 PX 워커 복사 실패 경로가 부른다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 값이 있으면 원소마다 pr_clear_value 한 뒤 값·결정 인덱스·결정을 묶은 한 블록을 한 번에 해제하고, 값이 없고 compares 만 있으면 그것을 해제한다. 마지막에
+ * 구조체를 0 으로 민다.
+ * 바뀐 것: 신설 +18줄. 「값·인덱스·결정이 한 블록」이라는 qexec_copy_elements 의 레이아웃 계약과 짝이다.
+ */
 static void
 qexec_clear_elements (THREAD_ENTRY * thread_p, DOMAIN_ELEMENTS * elements)
 {
@@ -73,6 +81,13 @@ qexec_clear_elements (THREAD_ENTRY * thread_p, DOMAIN_ELEMENTS * elements)
 }
 
 /* The bytes of a constant's element resolutions: n values, n resolution indices, then n_compare_indexes resolutions. */
+/*
+ * [리뷰] qexec_positions_bytes — DOMAIN_ELEMENTS 한 묶음(DB_VALUE n개 + int n개 + DOMAIN_COMPARE n_compares개)을 한 블록에
+ * 담을 때의 총 바이트와 두 오프셋을 계산한다 — qexec_copy_elements 가 유일한 호출자.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: DB_VALUE 가 int 정렬의 배수임을 static_assert 로 못박고, 결정 배열은 alignof(DOMAIN_COMPARE) 로 올림한 오프셋에 둔다.
+ * 바뀐 것: 신설 +10줄. 정렬 가정을 런타임이 아니라 컴파일 때 검사한다.
+ */
 static size_t
 qexec_positions_bytes (int n, int n_compares, size_t * element_compare_offset, size_t * compares_offset)
 {
@@ -86,6 +101,14 @@ qexec_positions_bytes (int n, int n_compares, size_t * element_compare_offset, s
 
 /* A PX copy of one execution's resolutions for an ALL/SOME term, on the worker's heap: its own values; the
  * resolutions carry no pointers into themselves, and a row is the shared type pair comparison table's. */
+/*
+ * [리뷰] qexec_copy_elements — 리더의 원소 결정표 하나를 워커용으로 깊은 복사한다 — qexec_copy_resolved_domains 가 n_elements 만큼 부른다.
+ * 값은 pr_clone_value 로 복제하고 결정은 그대로 memcpy 한다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 값이 있으면 한 블록을 잡아 세 구역으로 쪼개 DB_VALUE 를 먼저 NULL 로 만든 뒤 복제하고, 값 없이 결정만 있으면 결정 배열만 복사한다.
+ * 바뀐 것: 신설 +45줄. 팩의 gate-imbalance +2 는 오탐이다 — 소유권이 dest 로 넘어가고, 중간 실패 시 호출자가 qexec_clear_resolved_domains 로
+ * 정리한다(domain_resolve.c:340).
+ */
 static int
 qexec_copy_elements (THREAD_ENTRY * thread_p, const DOMAIN_ELEMENTS * src, DOMAIN_ELEMENTS * dest)
 {
@@ -138,6 +161,14 @@ static int qexec_copy_index_keys (THREAD_ENTRY * thread_p, const RESOLVED_INDEX_
 /* Allocate the values, the resolved domain table's arrays and the node state's arrays (domain_execution) as one
  * owner-local block, whose address is resolved_domain.vals. Every value starts as NULL so the common error exit can
  * clear a partial fill. */
+/*
+ * [리뷰] qexec_alloc_resolved_domains — 한 실행이 쓸 결정표 전체(값·해결 도메인·비교 결정·원소 결정·키 결정·노드 실행 도메인·보간 리스트 도메인·피연산자 타입·값
+ * 상태 플래그)를 db_private 한 블록으로 잡고 XASL_STATE 에 꽂는다 — 실행 전 게이트의 1단계.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에는 RESOLVED_DOMAIN_TABLE 도 DOMAIN_EXECUTION_STATE 도 없다.
+ * 이 PR: 13개 static_assert 로 구역 간 정렬을 컴파일 때 보장한 뒤 한 번 db_private_alloc 하고 구역마다 포인터를 끊어 memset 한다. 값은 NULL, 피연산자
+ * 타입은 0xff(=-1), 값 상태는 DOMAIN_VALUE_PENDING 으로 초기화한다.
+ * 바뀐 것: 신설 +108줄. 할당이 한 번뿐이라 해제도 resolved.vals 하나로 끝난다 — 팩의 +1 은 호출자 해제 위임이라 오탐.
+ */
 static int
 qexec_alloc_resolved_domains (THREAD_ENTRY * thread_p, int n_vals, int n_resolved, int n_compares, int n_elements,
 			      int n_indexes, int n_node_domains, int n_operand_types, int n_interpolation_list_domains,
@@ -250,6 +281,14 @@ qexec_alloc_resolved_domains (THREAD_ENTRY * thread_p, int n_vals, int n_resolve
 /* The values an execution converts once per scope and the scopes' generations: none converted yet; the execution's
  * scope is entered from the start, a block's when its scan starts. temporary_scope: the plan's scope of each value,
  * which the value keeps for its reads. */
+/*
+ * [리뷰] qexec_alloc_execution_temporaries — 실행 중 변환값 캐시(DOMAIN_EXECUTION_TEMPORARY 배열)와 스코프 세대 카운터를 잡는다 —
+ * qexec_init_resolved_domains 와 qexec_copy_resolved_domains 가 부르고, 행 경로의 qexec_execution_temporary 가 이것을 읽는다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 두 블록을 잡고 하나라도 실패하면 둘 다 free_and_init 하고 ER_OUT_OF_VIRTUAL_MEMORY. 성공하면 임시마다
+ * generation=0·converted=NULL·scope 를 넣고, 실행 스코프(DOMAIN_SCOPE_EXECUTION)의 세대만 1 로 올려 「아직 아무것도 변환되지 않았다」를 표현한다.
+ * 바뀐 것: 신설 +47줄. 디버그 빌드에서만 conv/target 을 보관해 뒤의 assert 가 같은 변환인지 확인한다.
+ */
 static int
 qexec_alloc_execution_temporaries (THREAD_ENTRY * thread_p, int n_temporaries, const int *temporary_scope, int n_scopes,
 				   DOMAIN_EXECUTION_STATE & execution)
@@ -307,6 +346,16 @@ qexec_alloc_execution_temporaries (THREAD_ENTRY * thread_p, int n_temporaries, c
  *   from(in): the leader's execution state, its domains resolved
  *   to(out): the copy whose table this fills
  *   own_load(in): as qexec_deep_copy_xasl_state's
+ */
+/*
+ * [리뷰] qexec_copy_resolved_domains — 리더 실행의 결정표를 PX 워커용 XASL_STATE 로 통째 복사한다 — query_executor.c:3598 의
+ * qexec_deep_copy_xasl_state 가 부른다. 워커는 다시 결정하지 않고 이 복사본을 읽기만 한다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 같은 크기로 재할당한 뒤 원소·키 결정은 깊은 복사, 값은 pr_clone_value, 해결 도메인·비교 결정·값 상태는 memcpy 한다. 워커가 자기 로드를 쓰는
+ * 경우(own_load)는 노드 실행 도메인을 복사하지 않아 워커 노드가 컴파일 도메인에서 시작하게 한다. 끝에 copied_from_leader=true 로 표시해 소유권
+ * 검사(qexec_owns_resolved_index)가 포인터 범위 대신 이 표시를 보게 한다.
+ * 바뀐 것: 신설 +88줄. 중간 실패는 모두 qexec_clear_resolved_domains 로 되돌린다.
+ * [지적 X3-05]
  */
 int
 qexec_copy_resolved_domains (THREAD_ENTRY * thread_p, const XASL_STATE * from, XASL_STATE * to, bool own_load)
@@ -397,6 +446,16 @@ qexec_copy_resolved_domains (THREAD_ENTRY * thread_p, const XASL_STATE * from, X
   return NO_ERROR;
 }
 
+/*
+ * [리뷰] qexec_init_resolved_domains — 실행 전 게이트가 결정표를 만들기 직전에 부르는 크기 결정자 — 플랜의 개수들과 vd.dbval_cnt 를 보고
+ * qexec_alloc_resolved_domains·qexec_alloc_execution_temporaries 에 넘길 치수를 뽑는다(qexec_resolve_domains_internal,
+ * domain_resolve.c:2632).
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: plan 이 NULL 이면 값 배열만 dbval_cnt 만큼 잡고 끝낸다. 플랜이 있으면 n_vals 를 max(dbval_cnt, plan->n_refs) 로 잡아 2차 참조가 기존
+ * 위치와 겹치지 않게 하고, 나머지 치수는 플랜에서 그대로 읽는다.
+ * 바뀐 것: 신설 +29줄. resolved.in 을 vd.dbval_ptr 로 고정하고 owner 를 현재 thread_p 로 적어, 뒤의 모든 읽기가 이 소유자 검사를 통과하게 한다.
+ * [지적 X3-04]
+ */
 static int
 qexec_init_resolved_domains (THREAD_ENTRY * thread_p, const DOMAIN_PLAN * plan, XASL_STATE * xasl_state)
 {
@@ -467,6 +526,14 @@ static int qexec_defer_constant_error (THREAD_ENTRY * thread_p, DOMAIN_DEFERRED_
  * number nor a date (a string, a BIT, a LOB, a collection) is typed as its first value would be, by the cascade to
  * DOUBLE, DATETIME and TIME, the aggregate's and the analytic's alike (no row types it; a value that takes none is the
  * resolve_domains' error). */
+/*
+ * [리뷰] qexec_argument_type_depends_on_value — 게이트가 어떤 인자의 타입을 「컴파일 도메인」이 아니라 「값」에서 가져와야 하는지 판정한다 —
+ * qexec_resolve_operand 가 피연산자마다 부른다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 MEDIAN/PERCENTILE 의 인자 타입을 첫 행의 값으로 정했다.
+ * 이 PR: 집계·분석 문맥에서는 MEDIAN/PERCENTILE_CONT/PERCENTILE_DISC 의 0번 인자가 숫자도 날짜/시간도 아닐 때만 참. 함수 인자 문맥에서는 ADDTIME 의
+ * 0번 문자열 인자와 STR_TO_DATE 의 1번 포맷 인자만 참.
+ * 바뀐 것: 신설 +11줄. 「값에서 타입을 가져오는 자리」의 목록이 이 한 함수에 모였다.
+ */
 static bool
 qexec_argument_type_depends_on_value (DOMAIN_CTX context, int opcode, int arg_index, DB_TYPE type)
 {
@@ -492,6 +559,18 @@ qexec_argument_type_depends_on_value (DOMAIN_CTX context, int opcode, int arg_in
  * a constant expression resolve_domains evaluated in the constant expression step gives its value's type
  * there, so a NULL without a type drops out of the fold; the node waits for that value, which every constant has once
  * the constant expression step evaluated it.
+ */
+/*
+ * [리뷰] qexec_resolve_operand — 늦은 바인딩 노드의 피연산자 하나를 실행 전 게이트에서 해석해 DOMAIN_OPERAND(도메인·값 타입·가변 위치 여부)를 채운다 —
+ * qexec_resolve_late_bind_node_over 가 피연산자마다 부르고, false 면 「아직 결정할 수 없다」는 뜻이라 미해결 도메인 에러로 간다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 이런 타입 판단이 행마다 fetch_peek_arith 안에서 일어났다.
+ * 이 PR: 값(bind 또는 리터럴)이 있으면 그 값의 도메인, 없고 생산자가 해결돼 있으면 생산자의 해결 도메인, 둘 다 아니면 컴파일 도메인을 쓴다. 상수식 피연산자는 상수 단계의 값
+ * 상태(EVALUATED/FAILED/그 외)를 보고 각각 값 사용·NULL 대입·false 를 고른다. 산술 문맥의 NULL 은 tp_Null_domain 으로 낮추고, 값에서 타입을 가져와야
+ * 하는 인자는 domain_classify_value 로, 세션 변수 뒤의 인자는 session_get_variable 로 실행 시작 시점 값의 타입을 쓴다.
+ * 바뀐 것: 신설 +92줄(팩이 적은 496~3925 범위는 파일 단위 구간이고 함수 본체는 496~587). 이 PR 의 「행은 읽기만」을 성립시키는 핵심 — 값 의존 타입 결정이 전부 여기로
+ * 올라왔다.
+ * [지적 A3-02]
+ * [지적 X0-01]
  */
 static bool
 qexec_resolve_operand (THREAD_ENTRY * thread_p, const DOMAIN_PLAN * plan, const RESOLVED_DOMAIN_TABLE & resolved,

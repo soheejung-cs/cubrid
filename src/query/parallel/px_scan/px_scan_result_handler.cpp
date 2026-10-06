@@ -62,6 +62,14 @@ namespace parallel_scan
   /* A worker's list opens with the plan's domains (qdata_get_valptr_type_list): no column waits for a first tuple to
    * type it - PX keeps session variable reads off (px_scan_checker) and resolve_domains resolves every other column.
    * A variable column here fails the unresolved-domain check (execution). */
+  /*
+   * [리뷰] list_columns_unresolved — MERGEABLE_LIST 워커가 자기 출력 리스트 파일을 열기 직전 부르는 파일 정적 점검 — type_list 의 컬럼 도메인 중
+   * NULL 이거나 VARIABLE 인 것이 하나라도 있으면 domain_unresolved_error 로 ER_QPROC_DOMAIN_UNRESOLVED 를 세우고 true 를 돌려준다.
+   * develop: develop 에 없음 — 이 PR 이 신설. 같은 자리에 있던 update_domains_on_type_list_by_val_list 는 워커의 첫 VAL_LIST 값으로
+   * 리스트 도메인을 뒤늦게 채우고 qfile_set_layout 으로 레이아웃을 다시 계산하던 함수였고, 이 PR 이 삭제했다.
+   * 이 PR: 행이 도메인을 확정하는 대신, 리스트를 열기 전에 플랜이 모든 컬럼을 해결했는지 한 번 확인하고 미해결이면 실패시킨다. 해결은 전혀 하지 않는다.
+   * 바뀐 것: 함수 통째 교체(+13/-27 상당). 반환 의미도 int 오류코드에서 bool 판정으로 바뀌었다.
+   */
   static bool list_columns_unresolved (const qfile_tuple_value_type_list &type_list)
   {
     for (int i = 0; i < type_list.type_cnt; i++)
@@ -216,6 +224,19 @@ namespace parallel_scan
   }
 
   template <RESULT_TYPE result_type>
+  /*
+   * [리뷰] result_handler<result_type>::write_initialize — 워커 스레드가 스캔을 시작하기 전 한 번 부르는 준비 함수. MERGEABLE_LIST 면 출력
+   * 타입 리스트를 만들어 워커 전용 리스트 파일을 열고 튜플 버퍼·instnum 한계·해시 집계 컨텍스트·topn 을 세팅한다. 실패는 반환값이 아니라 에러 메시지 이관과 interrupt 코드로
+   * 알린다.
+   * develop: qdata_get_valptr_type_list (thread_p, outptr_list, &type_list) 가 준 도메인을 그대로 믿고 리스트를 열었다.
+   * g_hash_eligible 이면 tl.g_agg_domains_resolved = FALSE 로 두어 집계 누산기 도메인 확정을 첫 행(write)으로 미뤘다.
+   * 이 PR: 타입 리스트를 vd 와 함께 받아(게이트가 확정한 도메인) list_columns_unresolved 로 미해결 컬럼을 거른 뒤에만 리스트를 연다. 해시 집계면 클론의 누산기 도메인을
+   * NULL 로 비우고 qexec_setup_parallel_aggregates 로 첫 행 전에 세팅한 뒤 qexec_setup_hash_aggregate_lists 와
+   * qdata_link_shared_accumulators 까지 여기서 끝낸다.
+   * 바뀐 것: qdata_get_valptr_type_list 시그니처에 vd 추가 + 사전 점검 블록 신설(+8), 해시 집계 준비가 '첫 행으로 미룸' 한 줄에서 '스캔 전 확정' 블록으로
+   * 교체(+19/-1).
+   * [지적 C7-01]
+   */
   void result_handler<result_type>::write_initialize (THREAD_ENTRY *thread_p, OUTPTR_LIST *outptr_list,
       XASL_NODE *curr_xasl, VAL_DESCR *vd)
   {
@@ -884,6 +905,17 @@ namespace parallel_scan
   }
 
   template <RESULT_TYPE result_type>
+  /*
+   * [리뷰] result_handler<result_type>::write — 워커가 행마다 부르는 쓰기 경로. MERGEABLE_LIST 면 outptr 값으로 튜플 디스크립터를 만들어 자기
+   * 리스트에 쓰고(해시 GROUP BY 면 해시 테이블에 누적), XASL_SNAPSHOT 이면 VAL_LIST 를 자기 list_id 로 복사한다. 성공 여부를 bool 로 돌려준다.
+   * develop: 해시 집계 첫 행에서 qexec_resolve_domains_for_aggregation_for_parallel_heap_scan_g_agg 로 도메인을 해결하고, 워커 XASL
+   * 복사본에는 전해지지 않는 집계 피연산자 표시를 qexec_mark_aggregate_operand_expressions 로 다시 달고, 해결 여부와 무관하게
+   * qdata_link_shared_accumulators 를 불렀다. XASL_SNAPSHOT 에서는 list_id_p->is_domain_resolved 가 false 면 그 행의
+   * VAL_LIST 로 리스트 도메인을 덮어쓰고 공유 m_type_list 배열에 release-store 로 공표했다.
+   * 이 PR: 집계는 세팅이 못 정하고 첫 값에 맡긴 것만 qexec_parallel_aggregate_first_values 로 받고, 실제로 다 정해졌을 때만 공유 누산기를 링크한다. 피연산자
+   * 표시는 로드(domain_mark_aggregate_operands)의 몫이 되어 호출이 사라졌다. XASL_SNAPSHOT 의 행 기반 도메인 덮어쓰기와 공표 블록은 통째 삭제됐다.
+   * 바뀐 것: 집계 해결 호출 교체 + 조건부 링크(+8/-8), 스냅샷 경로의 행 기반 도메인 해결 블록 삭제(-10), 주석 1줄 수정.
+   */
   bool result_handler<result_type>::write (THREAD_ENTRY *thread_p, write_dest_type *src)
   {
     if constexpr (result_type == RESULT_TYPE::MERGEABLE_LIST)
@@ -1452,6 +1484,15 @@ namespace parallel_scan
   }
 
   template <FUNC_CODE F>
+  /*
+   * [리뷰] result_handler<RESULT_TYPE::BUILDVALUE_OPT>::initialize_node — BUILDVALUE_OPT 워커가 write_initialize 안에서
+   * 집계 노드마다 한 번 불러, 함수 종류별로 누산기 카운터를 초기화하고 DISTINCT·MEDIAN/PERCENTILE 처럼 값을 모아야 하는 함수에는 단일 컬럼 중간 리스트 파일을 열어 준다.
+   * bool 반환.
+   * develop: 중간 리스트의 컬럼 도메인을 세 자리 모두 피연산자 regu 의 컴파일 도메인 agg_node->operands->value.domain 으로 직접 잡았다.
+   * 이 PR: DISTINCT 와 보간 함수 두 자리는 qdata_aggregate_list_domain (tl_vd, agg_node) 가 세팅이 고른 리스트 도메인을 주고, 나머지 한 자리는
+   * qexec_get_node_domain (tl_vd, …->value.domain, …->value.plan_item) 으로 이번 실행에서 그 노드가 가진 도메인을 쓴다.
+   * 바뀐 것: 리스트 도메인 출처 3곳 교체(+4/-3). 분기·에러 처리 구조는 그대로.
+   */
   bool result_handler<RESULT_TYPE::BUILDVALUE_OPT>::initialize_node (THREAD_ENTRY *thread_p, AGGREGATE_TYPE *agg_node)
   {
     /* execution-only field, not part of the stream, so initialize it here */
@@ -1565,6 +1606,16 @@ namespace parallel_scan
       }
   }
 
+  /*
+   * [리뷰] result_handler<RESULT_TYPE::BUILDVALUE_OPT>::write_initialize — BUILDVALUE_OPT 워커가 스캔 전 한 번 불러
+   * thread_local 포인터(outptr_list·agg_list·vd·xasl)와 튜플 버퍼를 잡고, 집계 노드마다 initialize_node 를 돌려 중간 리스트를 연다. 실패는
+   * interrupt 로 알린다.
+   * develop: agg_domains_resolved 를 0 으로 놓고 바로 initialize_node 루프로 갔다 — 누산기 도메인은 첫 행에서 정해졌고, 풀에서 꺼낸 클론은 지난 실행의
+   * 누산기 도메인을 그대로 들고 있을 수 있었다.
+   * 이 PR: 루프 전에 클론의 모든 누산기 도메인(value_dom·value2_dom)을 NULL 로 비우고(CBRD-27484), qexec_setup_parallel_aggregates 로
+   * 리더에서 복사한 플랜 해결에서 채우고, 다 채워졌으면 qdata_link_shared_accumulators 까지 한다. 세팅이 실패하면 에러를 옮기고 interrupt 를 세운 뒤 반환한다.
+   * 바뀐 것: 블록 신설(+21). 순서가 중요하다 — 이 블록이 initialize_node 루프보다 앞에 있어야 중간 리스트가 세팅 결과의 도메인으로 열린다.
+   */
   void result_handler<RESULT_TYPE::BUILDVALUE_OPT>::write_initialize (THREAD_ENTRY *thread_p, OUTPTR_LIST *outptr_list,
       write_dest_type *agg_p, VAL_DESCR *vd, xasl_node *xasl_p)
   {
@@ -1684,6 +1735,18 @@ namespace parallel_scan
   }
 
   template <FUNC_CODE F>
+  /*
+   * [리뷰] result_handler<RESULT_TYPE::BUILDVALUE_OPT>::accumulate_node — BUILDVALUE_OPT 워커가 행마다 집계 함수
+   * 종류(FUNC_CODE F)별로 부르는 누적 본체 — DB_VALUE 하나를 워커 자신의 누산기에 더하고 성공 여부를 bool 로 돌려준다.
+   * develop: 함수 분기마다 'per-row domain fallback' 이 있었다 — acc_dom->value_dom 이 NULL 이거나 tp_Null_domain 이면 그 행에서
+   * agg_node->domain, tp_domain_resolve_default(값의 타입), SUM/AVG 의 NUMERIC·FLOAT 별 규칙, STDDEV 의 tp_Double_domain,
+   * BIT 집계의 tp_Bigint_domain 중 하나를 골라 채워 넣었다. SUM/AVG 는 qdata_add_dbval 로 더했고 GROUP_CONCAT·보간 함수 호출에는 vd 가 없었다.
+   * 이 PR: MEDIAN·PERCENTILE_CONT/DISC 와 ORDER BY 있는 GROUP_CONCAT(값을 리스트에 모으는 쪽)만 빼고, 함수 본체에 들어가기 전에
+   * acc_dom->value_dom 이 비어 있으면 domain_unresolved_error 로 실패한다. 행이 도메인을 고르는 자리는 전부 없어졌다. SUM/AVG 는 세팅이 정한
+   * acc_dom->operand_coercion 과 스코프당 한 번만 변환되는 임시값(qexec_execution_temporary)으로 qdata_coerce_arith_operands 를
+   * 쓴다. GROUP_CONCAT 과 보간 갱신은 tl_vd 를 받는다.
+   * 바뀐 것: 함수별 fallback 8개 삭제(약 -95줄), 선두 단일 점검 신설(+12), SUM/AVG 덧셈 경로 교체(+12/-1), 호출 3건에 vd 추가.
+   */
   bool result_handler<RESULT_TYPE::BUILDVALUE_OPT>::accumulate_node (THREAD_ENTRY *thread_p, AGGREGATE_TYPE *agg_node,
       DB_VALUE *db_value_p)
   {
@@ -2071,6 +2134,15 @@ namespace parallel_scan
     return true;
   }
 
+  /*
+   * [리뷰] result_handler<RESULT_TYPE::BUILDVALUE_OPT>::write — BUILDVALUE_OPT 워커가 행마다 부르는 진입점 — 아직 못 정한 집계 도메인이
+   * 있으면 마저 정하고, outptr 값을 꺼내 함수별 accumulate_node 로 넘긴다.
+   * develop: 첫 행에서 qexec_resolve_domains_for_aggregation_for_parallel_heap_scan_buildvalue_proc 로 누산기 도메인을 해결했고,
+   * 해결되면 공유 누산기를 링크했다.
+   * 이 PR: 같은 자리에서 qexec_parallel_aggregate_first_values 를 부른다 — 스캔 전 세팅이 정하지 못하고 첫 값에 맡긴 것(문자열 MEDIAN/PERCENTILE
+   * 등)만 남는다. 링크 조건과 그 뒤 흐름은 그대로.
+   * 바뀐 것: 호출 1건 교체(+2/-1)와 주석 정리(+2/-3). 분기 구조 불변.
+   */
   bool result_handler<RESULT_TYPE::BUILDVALUE_OPT>::write (THREAD_ENTRY *thread_p)
   {
     if (!tl_xasl_p->proc.buildvalue.agg_domains_resolved)
@@ -2269,6 +2341,15 @@ namespace parallel_scan
     return true;
   }
   template <FUNC_CODE F>
+  /*
+   * [리뷰] result_handler<RESULT_TYPE::BUILDVALUE_OPT>::finalize_node — 워커가 끝날 때 함수 종류별로 자기 누산기(cur_agg_p)를 리더의
+   * 누산기(orig_agg_p)에 합치는 병합 본체. 반환값 없이 에러는 interrupt 로 알린다.
+   * develop: GROUP_CONCAT 병합은 qdata_group_concat_value (thread_p, orig_agg_p, …) 였고, 일반 병합은
+   * qdata_aggregate_accumulator_to_accumulator 에 컴파일 도메인 orig_agg_p->domain 을 그대로 넘겼다.
+   * 이 PR: 두 호출 모두 워커의 tl_vd 를 거친다 — 병합 도메인은 qexec_get_node_domain (tl_vd, orig_agg_p->domain,
+   * orig_agg_p->plan_item), 즉 이번 실행에서 그 플랜 노드가 가진 도메인이다.
+   * 바뀐 것: 호출 2건에 vd 경유 추가(+4/-2)와 근거 주석 2줄.
+   */
   void result_handler<RESULT_TYPE::BUILDVALUE_OPT>::finalize_node (THREAD_ENTRY *thread_p, AGGREGATE_TYPE *orig_agg_p,
       AGGREGATE_TYPE *cur_agg_p)
   {
@@ -2551,6 +2632,16 @@ namespace parallel_scan
       }
   }
 
+  /*
+   * [리뷰] result_handler<RESULT_TYPE::BUILDVALUE_OPT>::write_finalize — BUILDVALUE_OPT 워커의 마지막 단계.
+   * writer_results_mutex 를 잡고 리더의 집계 리스트(m_orig_agg_list)와 자기 클론의 리스트를 노드 단위로 짝지어 finalize_node 로 병합하고,
+   * interrupt 상태면 자기 쪽 값만 정리한다.
+   * develop: 병합 직전에, 리더 노드의 opr_dbtype 이 아직 DB_TYPE_VARIABLE 이고 워커 노드는 아니면 워커가 행에서 해결한 domain·opr_dbtype 을 리더
+   * 노드로 되돌려 복사했다(호스트 변수 도메인이 워커 클론에서만 해결되던 전제).
+   * 이 PR: 되돌림을 삭제하고, 그런 상태가 애초에 없다는 assert 로 바꿨다 — qexec_node_operand_type 으로 본 (리더=VARIABLE, 워커=확정) 조합이면 디버그
+   * 빌드가 멈춘다. 리더가 스캔 전에 이미 집계를 세팅했고 워커는 그 해결을 복사해 갔다는 게 근거다.
+   * 바뀐 것: 복구 분기 삭제 → 단언으로 교체(+5/-7).
+   */
   void result_handler<RESULT_TYPE::BUILDVALUE_OPT>::write_finalize (THREAD_ENTRY *thread_p)
   {
     {

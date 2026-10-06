@@ -4695,6 +4695,13 @@ tp_atonumeric (const DB_VALUE * src, DB_VALUE * temp)
  *    Accepts strings that are not null terminated. Don't call this unless
  *    src is a string db_value.
  */
+/*
+ * [리뷰] tp_atof — 문자열 `DB_VALUE` 를 `double` 로 읽고, 넘침·미소비 문자를 `DB_DATA_STATUS` 로 알려 준다. 문자열→수치 변환기들이 공통으로 쓴다.
+ * develop: develop 에서는 같은 본문의 **`static`** 함수였고(object_domain.c:4851), 호출자는 같은 파일 안의 거대한 캐스트 switch 뿐이었다.
+ * 이 PR: 본문은 한 글자도 바뀌지 않았고 `static` 만 떨어져 `object_domain_convert.h:117` 에 선언됐다. 이제 object_domain_convert.cpp 로
+ * 옮겨간 변환기들이 부른다.
+ * 바뀐 것: 링키지만 변경(static → extern) +헤더 선언 1줄. develop 과 본문 diff 0줄.
+ */
 int
 tp_atof (const DB_VALUE * src, double *num_value, DB_DATA_STATUS * data_stat)
 {
@@ -4800,6 +4807,12 @@ tp_atof (const DB_VALUE * src, double *num_value, DB_DATA_STATUS * data_stat)
  *    src is a string db_value.
  *    If string contains decimal part, performs rounding.
  *
+ */
+/*
+ * [리뷰] tp_atobi — 문자열 `DB_VALUE` 를 `DB_BIGINT` 로 읽는다 — 16진·지수 표기와 소수부 반올림까지 처리한다.
+ * develop: develop 에서는 같은 본문의 **`static`** 함수였고(object_domain.c:4957), 호출자는 같은 파일 안의 거대한 캐스트 switch 뿐이었다.
+ * 이 PR: 본문 무변경, `static` 제거 + `object_domain_convert.h:118` 선언.
+ * 바뀐 것: 링키지만 변경 +헤더 선언 1줄. 본문 diff 0줄.
  */
 int
 tp_atobi (const DB_VALUE * src, DB_BIGINT * num_value, DB_DATA_STATUS * data_stat)
@@ -5020,6 +5033,12 @@ tp_itoa (int value, char *string, int radix)
  *    string(in/out): dest buffer or NULL
  *    radix(in): int value between 2 and 36
  */
+/*
+ * [리뷰] tp_ltoa — `DB_BIGINT` 를 주어진 진법 문자열로 바꿔 돌려준다(버퍼를 주지 않으면 malloc).
+ * develop: develop 에서는 같은 본문의 **`static`** 함수였고(object_domain.c:5176), 호출자는 같은 파일 안의 거대한 캐스트 switch 뿐이었다.
+ * 이 PR: 본문 무변경, `static` 제거 + `object_domain_convert.h:119` 선언. 수→문자열 변환기가 convert.cpp 로 옮겨가 이 이름을 부른다.
+ * 바뀐 것: 링키지만 변경 +헤더 선언 1줄. 본문 diff 0줄. (하네스의 `tp_ltoa alloc-free = +1` 경고는 버퍼 소유권을 반환값으로 넘기는 빌더라 오탐이다.)
+ */
 char *
 tp_ltoa (DB_BIGINT value, char *string, int radix)
 {
@@ -5100,6 +5119,15 @@ tp_ltoa (DB_BIGINT value, char *string, int radix)
  *  decpt(in):		decimal point position in the digits sequence
  *			(similar to the exponent)
  *  sign(in):		sign of the floating-point number
+ */
+/*
+ * [리뷰] format_floating_point — `dtoa` 가 만든 자릿수 열과 소수점 위치를 받아 C 표준 printf 규칙대로 최종 문자열을 조립한다. FLOAT/DOUBLE → 문자열
+ * 변환의 포맷 단계.
+ * develop: develop 에서는 같은 본문의 **`static`** 함수였고(object_domain.c:5257), 호출자는 같은 파일 안의 거대한 캐스트 switch 뿐이었다. 같은
+ * 파일의 `tp_ftoa`·`tp_dtoa` 가 유일한 호출자였다.
+ * 이 PR: 본문 무변경, `static` 제거 + `object_domain_convert.h:120` 선언. **파일 안 호출자 두 개(`tp_ftoa`·`tp_dtoa`)는
+ * object_domain_convert.cpp 의 `tp_ftoa_buffer`·`tp_dtoa_buffer` 로 옮겨가 삭제됐다** — 이제 이 파일 안에는 호출자가 없다.
+ * 바뀐 것: 링키지만 변경 +헤더 선언 1줄. 본문 diff 0줄이지만 호출자 2개가 이 파일에서 사라졌다(−146줄 구간).
  */
 void
 format_floating_point (char *new_string, char *rve, int ndigits, int decpt, int sign)
@@ -5282,6 +5310,12 @@ tp_enumeration_to_varchar (const DB_VALUE * src, DB_VALUE * result)
  *    string(out): output buffer
  *    max_size(in): size of output buffer
  */
+/*
+ * [리뷰] bfmt_print — `DB_VALUE` 비트열을 2진 또는 16진 문자열로 찍는다. 버퍼가 모자라면 −1.
+ * develop: develop 에서는 같은 본문의 **`static`** 함수였고(object_domain.c:5560), 호출자는 같은 파일 안의 거대한 캐스트 switch 뿐이었다.
+ * 이 PR: 본문 무변경, `static` 제거 + `object_domain_convert.h:121` 선언.
+ * 바뀐 것: 링키지만 변경 +헤더 선언 1줄. 본문 diff 0줄.
+ */
 int
 bfmt_print (int bfmt, const DB_VALUE * the_db_bit, char *string, int max_size)
 {
@@ -5414,6 +5448,19 @@ tp_value_coerce (const DB_VALUE * src, DB_VALUE * dest, const TP_DOMAIN * desire
  * dest (out) : destination value
  * desired_domain (in) : destination domain
  */
+/*
+ * [리뷰] tp_value_coerce_strict — 정밀도 손실 없이 값을 목표 도메인으로 바꾼다 — 비교·인덱스 키 생성처럼 '되면 되고 안 되면 ER_FAILED' 인 자리가 쓴다.
+ * 수치·날짜시각 도메인만 허용한다.
+ * develop: object_domain.c:5743~6978, **약 1,236줄의 (desired_type × original_type) 2중 switch**. 가지마다
+ * `OR_CHECK_*_OVERFLOW`·`modf`·`numeric_db_value_coerce_from_num_strict` 를 손으로 적었고, 날짜시각 가지는 발행형
+ * `db_timestamp_encode_ses`·`db_timestamp_decode_w_tz_id` 를 불러 전역 에러를 남겼다.
+ * 이 PR: 78줄로 줄었다. NULL·도메인 검사·src==dest 처리·`db_value_domain_init` 까지는 그대로 하고, 실제 변환은 `tp_value_find_converter
+ * (original_type, desired_domain, DOMAIN_CONVERT_COMPARE)` 가 고른 함수 포인터 하나에 맡긴다. ENUM·JSON 원본은 명시적으로 거부한다. 스택의
+ * `conversion_error` 를 변환기에 넘기지만 **publish 하지 않는다**.
+ * 바뀐 것: −1,158줄. 2중 switch 전체가 '모드별 변환기 조회' 한 줄로 교체됐다. 게이트가 쓰는 `DOMAIN_CONVERT_COMPARE` 모드와 같은 표를 보므로, 비교용 강제
+ * 변환 규칙이 게이트와 한 벌이 된다.
+ * [지적 A3-05]
+ */
 int
 tp_value_coerce_strict (const DB_VALUE * src, DB_VALUE * dest, const TP_DOMAIN * desired_domain)
 {
@@ -5503,6 +5550,18 @@ tp_value_coerce_strict (const DB_VALUE * src, DB_VALUE * dest, const TP_DOMAIN *
  *    do_domain_select(in): flag for select appropriate domain from
  *                          'desired_domain'
  *    preserve_domain(in): flag to preserve dest's domain
+ */
+/*
+ * [리뷰] tp_value_cast_internal — 모든 캐스트·암묵 강제변환이 모이는 자리. 도메인 선택, JSON/MIDXKEY 언래핑, ENFORCE/LEAVE 콜레이션 처리,
+ * src==dest 별칭 처리, 잘림 정책까지 하고 변환기를 한 번 돌린다. 변환이 남긴 에러를 **실제로 발행하는 유일한 캐스트 지점**이다.
+ * develop: object_domain.c:6992~10068, **약 3,077줄**. 위 전처리 뒤에 (desired_type × original_type) 2중 switch 로 모든
+ * 타입쌍 변환을 직접 수행했고, 가지마다 `tp_atof`·`numeric_*`·`db_*_to_string` 호출과 `er_set` 이 흩어져 있었다. 파라미터는 6개였다.
+ * 이 PR: 443줄. 전처리 분기는 거의 그대로 두고, 변환 본체는 `tp_value_find_converter (original_type, desired_domain, mode)` 가 돌려준
+ * 함수 포인터 호출 한 줄이 됐다. 7번째 파라미터 `const tp_cast_converter *found` 가 생겨, **실행 전 게이트가 이미 찾아 둔 변환기가 있으면 조회를
+ * 건너뛴다**(`found->src_type == original_type && found->domain == desired_domain` 일 때만, 디버그에서는 조회 결과와 같은지
+ * assert). 마지막에 `conversion_error.publish ()` 를 한 번 부른다.
+ * 바뀐 것: −2,634줄. 시그니처 +1 인자(기본값 NULL), 2중 switch 삭제, CLOB/LOB 중첩 캐스트의 레거시 관측 동작은 주석과 함께 `lob_nested` 분기로 명시했다.
+ * 문자열→NUMERIC 만 `tp_atonumeric` 선파싱 뒤 변환기를 타는 특례로 남겼다.
  */
 static TP_DOMAIN_STATUS
 tp_value_cast_internal (const DB_VALUE * src, DB_VALUE * dest, const TP_DOMAIN * desired_domain,
@@ -5982,6 +6041,16 @@ tp_value_cast_force (const DB_VALUE * src, DB_VALUE * dest, const TP_DOMAIN * de
  *   return: as tp_value_cast
  *   converter(in): tp_value_find_converter (src_type, desired_domain, DOMAIN_CONVERT_ASSIGN); NULL: none found
  */
+/*
+ * [리뷰] tp_value_cast_with_converter — 실행 전 게이트가 고른 변환기를 캐스트에 그대로 꽂아 주는 진입점. `src/query/fetch.c:933`(CAST 연산자
+ * 평가)이 행마다 부르며, 값 타입·목표 도메인이 게이트가 본 것과 같으면 `tp_value_cast_internal` 의 변환기 조회가 생략된다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 의 fetch.c 는 `tp_value_cast`/`tp_value_cast_force` 를 불렀고, 캐스트마다
+ * 타입쌍 switch 를 다시 탔다.
+ * 이 PR: `{src_type, desired_domain, converter}` 를 스택 구조체로 묶어 `tp_value_cast_internal` 의 `found` 인자로 넘긴다.
+ * `force` 에 따라 `TP_FORCE_COERCION`/`TP_EXPLICIT_COERCION` 을 고르고, `converter == NULL` 이면 `found` 도 NULL 로 넘겨 기존
+ * 조회 경로를 탄다.
+ * 바뀐 것: 신설 8줄 + `object_domain.h:469` 선언. 게이트(컴파일/로드 시 결정) → 행(조회 없이 실행)이라는 이 PR 의 축이 함수 하나로 드러나는 자리다.
+ */
 TP_DOMAIN_STATUS
 tp_value_cast_with_converter (const DB_VALUE * src, DB_VALUE * dest, const TP_DOMAIN * desired_domain, bool force,
 			      DB_TYPE src_type, TP_VALUE_CONVERTER converter)
@@ -6147,6 +6216,17 @@ tp_more_general_type (const DB_TYPE type1, const DB_TYPE type2)
  *    type2(in): type of the second value
  * Note:
  *    Pure rule shared by tp_value_compare_with_error and the server domain resolver.
+ */
+/*
+ * [리뷰] tp_value_compare_common_domain — 두 값의 타입만 보고 비교 전 어느 쪽을 무엇으로 coerce 할지 방향 하나를 돌려준다. 행마다 도는
+ * tp_value_compare_with_error 와 실행 전에 도는 domain_rules.c(domain_search_key_compare·키 쌍 표)가 같은 이 함수를 불러 같은 결론을
+ * 얻는다.
+ * develop: develop 에 없음 — 이 PR 이 신설. 같은 규칙이 tp_value_compare_with_error 안(object_domain.c:10523~)의 if/else 사슬로
+ * 인라인돼 있어 호출자가 '어느 쪽이 coerce 되나'를 미리 물을 수 없었다.
+ * 이 PR: ARE_COMPARABLE → NONE, char↔숫자 → TO_DOUBLE, char↔날짜 → FIRST/SECOND_TO_DATE, 나머지는 tp_more_general_type
+ * 부호로 SECOND_TO_FIRST/FIRST_TO_SECOND. 값은 보지 않고 타입만 본다.
+ * 바뀐 것: 순수 분류 함수 신설(+26줄). 반환형 TP_COMPARE_COERCION 과 상수 6개가 object_domain_convert.h 에 새로 생겼다. 분기 순서·조건은
+ * develop 사슬과 같다.
  */
 TP_COMPARE_COERCION
 tp_value_compare_common_domain (const DB_TYPE type1, const DB_TYPE type2)
@@ -6345,6 +6425,17 @@ tp_value_compare (const DB_VALUE * value1, const DB_VALUE * value2, int allow_co
  *    If "can_compare" is not null, in the event of incomparable values an
  *    error will be logged and the boolean that is pointed by "can_compare"
  *    will be set to false.
+ */
+/*
+ * [리뷰] tp_value_compare_with_error — 두 DB_VALUE 를 비교해 DB_LT/EQ/GT/UNK 를 돌려주는 엔진 공용 비교기.
+ * btree_compare_key_with·mr_cmpval_*·tp_value_compare 와 이 PR 이 새로 넣은 domain_rules.c:domain_search_key_compare
+ * 가 부른다.
+ * develop: 타입이 다르면 `do_coercion && !ARE_COMPARABLE(...)` 안에서
+ * TP_IS_CHAR_TYPE/TP_IS_NUMERIC_TYPE/tp_more_general_type 을 그 자리에서 다시 평가해 coerce 방향을
+ * 정했다(object_domain.c:10519~).
+ * 이 PR: tp_value_compare_common_domain 으로 방향을 한 번 구해 coercion_kind 에 담고, NONE 이 아닐 때만 kind 별 분기로 실제 coerce 를
+ * 한다. coerce 본문(DOUBLE 승격·날짜 변환·일반 타입 맞춤·ENUM collation 유지)은 develop 과 같다.
+ * 바뀐 것: 조건 평가를 분류 함수로 뽑고 if/else 조건을 enum 비교로 바꿨다. 지역 변수 coercion_kind 추가. 규칙이 같아 비교 결과는 바뀌지 않는다.
  */
 DB_VALUE_COMPARE_RESULT
 tp_value_compare_with_error (const DB_VALUE * value1, const DB_VALUE * value2, int do_coercion, int total_order,
@@ -7497,6 +7588,18 @@ tp_infer_common_domain (TP_DOMAIN * arg1, TP_DOMAIN * arg2)
  *   return:
  *
  *  Note :
+ */
+/*
+ * [리뷰] tp_domain_status_er_set — TP_DOMAIN_STATUS(캐스트 실패 사유)를 사용자용 에러 코드로 바꿔 er_set 하고 코드를 돌려준다. 캐스트를 부르는 28곳이
+ * 쓴다 — 셀 함수들이 에러를 직접 내지 않게 된 지금, 사용자 에러가 나가는 지점은 여기 하나다.
+ * develop: develop object_domain.c:11569 에 같은 이름·거의 같은 본문. DOMAIN_ERROR 면 er_errid() 를 읽어 JSON 에러는 그대로 돌려주고,
+ * OVERFLOW/INCOMPATIBLE 로 승격한 뒤 er_set 했다. assert 는 `assert (status != DOMAIN_ERROR);` 하나였다.
+ * 이 PR: 같은 승격·er_set 에 `assert (status != DOMAIN_TRUNCATED);` 가 하나 늘었다. 이 PR 이 새로 넣은
+ * DOMAIN_TRUNCATED(object_domain.h:192)는 tp_value_cast_internal 이 coercion_mode·PRM_ID_ALLOW_TRUNCATED_STRING
+ * 으로 이미 소화하므로 여기 오면 안 된다는 계약이다.
+ * 바뀐 것: 본문 로직 동일, assert 한 줄 추가(+1). 주변 캐스트 switch 가 object_domain_convert.cpp 로 빠지면서 전처리 가드(#if !defined
+ * (SERVER_MODE))가 움직인 것이 나머지 변경이다.
+ * [지적 X2-01]
  */
 int
 tp_domain_status_er_set (TP_DOMAIN_STATUS status, const char *file_name, const int line_no, const DB_VALUE * src,

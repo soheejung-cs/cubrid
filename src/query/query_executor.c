@@ -1117,6 +1117,18 @@ exit_on_error:
  *
  * Note: Processing to be accomplished when a candidate row has been qualified.
  */
+/*
+ * [리뷰] qexec_end_one_iteration — 스캔 루프(qexec_intprt_fnc/qexec_execute_scan)가 조건을 통과한 행마다 부르는 지점으로, 그 행을
+ * BUILDLIST 의 결과 리스트파일·topn 힙에 쓰거나 BUILDVALUE 의 누산기에 넣고 NO_ERROR/에러를 돌려준다.
+ * develop: 행마다 qexec_resolve_domains_for_aggregation() 을 불러 집계 도메인이 미해결이면 그 행의 값에서 도메인을 추론했고, BUILDVALUE 쪽은 매
+ * 행 끝에 outptr_list 를 순회하며 DB_VALUE 포인터가 같은 집계 노드를 찾아 out_list_val->value.domain 을 덮어썼다.
+ * 이 PR: 같은 자리를 qexec_aggregate_first_values() 가 맡는다 — 첫 값에서 아직 받아야 할 것만 받고, 해결이 끝나면 곧바로
+ * qdata_link_shared_accumulators() 로 누산기 공유를 연결한다. outptr_list 순회 덮어쓰기는 사라지고 '출력 컬럼 도메인은 첫 행 전에
+ * qexec_type_accumulator_outputs 가 이미 정했다'는 주석만 남는다.
+ * 바뀐 것: 함수 교체(resolve_domains_for_aggregation→aggregate_first_values) + 공유 누산기 연결 호출 2곳 추가 + BUILDVALUE 의 행별
+ * 도메인 덮어쓰기 루프 약 -26줄 삭제. qdata_copy_valptr_list_to_tuple 에 &xasl->list_id->type_list 인자 추가(행이 쓸 레이아웃을 호출자가
+ * 넘김).
+ */
 static int
 qexec_end_one_iteration (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
 			 QFILE_TUPLE_RECORD * tplrec)
@@ -1450,6 +1462,14 @@ qexec_clear_arith_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, ARITH_TYPE 
 }
 
 /* A function's cached evaluation state: a regular expression's compiled pattern. */
+/*
+ * [리뷰] qexec_clear_function_tmp_obj — FUNCTION_TYPE 노드가 실행 중 만든 임시 객체(현재는 컴파일된 정규식)를 지우는 소유자로,
+ * qexec_clear_regu_var 와 domain_resolve.c 의 두 정리 경로가 공유해서 부른다. 반환 없음.
+ * develop: develop 에 없음 — 이 PR 이 신설. 같은 코드가 qexec_clear_regu_var 의 TYPE_FUNC 분기 안에 인라인으로 있었다.
+ * 이 PR: 같은 내용을 독립 함수로 떼어내고 query_executor.h 에 extern 으로 내보냈다. 도메인 계획 경로(domain_resolve.c:1799, 2392)가 regu 전체
+ * 정리 없이 함수 노드 하나만 비울 수 있게 됐다.
+ * 바뀐 것: 신설(+31줄, 로직 동일) + 헤더 공개. 호출처 3곳(query_executor.c 1곳, domain_resolve.c 2곳).
+ */
 void
 qexec_clear_function_tmp_obj (FUNCTION_TYPE * funcp)
 {
@@ -1488,6 +1508,18 @@ qexec_clear_function_tmp_obj (FUNCTION_TYPE * funcp)
  *   xasl_p(in) :
  *   regu_var(in) :      :
  *   final(in)  :
+ */
+/*
+ * [리뷰] qexec_clear_regu_var — 질의 종료나 XASL 클론 디캐시 때 regu 변수 한 개의 실행 중 상태(값·캐시 포인터·임시 객체)를 되돌리는 재귀 정리기로, 해제한 페이지
+ * 수를 누적해 돌려준다.
+ * develop: 맨 앞에서 regu_var->domain = regu_var->original_domain 으로 도메인을 되돌리고
+ * REGU_VARIABLE_FETCH_ALL_CONST/FETCH_NOT_CONST/FAST_PEEK 플래그를 지웠다. TYPE_FUNC 에서 tmp_obj 를 인라인으로 지웠고,
+ * TYPE_POSITION 에서 qexec_clear_pos_desc() 로 pos_descr->dom 을 original_domain 으로 되돌렸다.
+ * 이 PR: 도메인 복원과 플래그 리셋이 통째로 없어졌다 — 이 PR 에서는 실행이 XASL 의 domain 필드를 제자리에서 바꾸지 않고(도메인은 DOMAIN_PLAN/실행 소유 저장소에서
+ * 온다) FAST_PEEK 는 적재 시점(stream_to_xasl·domain_plan)에 확정되므로 되돌릴 것이 없다. tmp_obj 정리는
+ * qexec_clear_function_tmp_obj() 호출로, TYPE_POSITION 분기는 삭제(qexec_clear_pos_desc 자체가 PR 에서 제거).
+ * 바뀐 것: 선두 복원·플래그 블록 -20줄, TYPE_FUNC 인라인 -28줄→호출 1줄, TYPE_POSITION 분기 -3줄. TYPE_ATTR_ID 계열에 cache_slot = NULL
+ * 추가(cache_dbvalp 와 보조 맞춤).
  */
 static int
 qexec_clear_regu_var (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, REGU_VARIABLE * regu_var, bool is_final,
@@ -1786,6 +1818,16 @@ qexec_clear_pred (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, PRED_EXPR * pr, b
  *   xasl_p(in) :
  *   list(in)   :
  *   is_final(in)  :
+ */
+/*
+ * [리뷰] qexec_clear_access_spec_list — XASL 노드가 가진 ACCESS_SPEC 사슬을 돌며 스캔별 캐시·술어 regu·열린 자원을 해제하는 정리기로, 해제한 페이지
+ * 수를 돌려준다.
+ * develop: S_INDX_SCAN 에서 isidp->prebuilt_midxkey_domains 배열을 직접 돌며 tp_domain_free 후 배열을 해제했고,
+ * S_PARALLEL_INDEX_SCAN 은 코디네이터 쪽 키 저장소를 건드리지 않았다. 해시 리스트 스캔 분기도 hlsid 해제를 하지 않았다.
+ * 이 PR: 키 도메인 해제를 scan_close_index_key_plan() 한 번으로 대체하고(인덱스 키 계획 저장소의 소유권이 scan_manager 로 감),
+ * S_PARALLEL_INDEX_SCAN 에도 같은 호출을 추가, 해시 리스트 스캔에는 scan_free_hash_list_scan() 방어 호출을 넣었다.
+ * 바뀐 것: 인라인 해제 루프 -12줄 → 호출 2줄, 방어 해제 호출 2개 추가. 주의: 현재 develop 이 가진 p->s_id.partition_stats = NULL(캐시된 XASL
+ * 클론의 스테일 포인터 수정)이 이 브랜치에는 없다 — 분기 이후 develop 에 들어온 수정이라 머지 때 합류시켜야 한다.
  */
 static int
 qexec_clear_access_spec_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, ACCESS_SPEC_TYPE * list, bool is_final,
@@ -3582,6 +3624,16 @@ qexec_get_xasl_list_id (xasl_node * xasl)
  *		 their compiled domains; otherwise it runs nodes the leader's execution also runs (spawned copies, a
  *		 parallel subquery), which hold what that execution gave them so far: its execution domains
  */
+/*
+ * [리뷰] qexec_deep_copy_xasl_state — PX(병렬) 워커가 리더의 XASL_STATE 를 자기 것으로 복제할 때 쓰는 유일한 통로로, 새 xasl_state* 또는 NULL
+ * 을 돌려준다.
+ * develop: vd.dbval_ptr 배열을 db_private_alloc 로 따로 잡고 바인드 값 dbval_cnt 개를 pr_clone_value 로 하나씩 복제했다.
+ * 이 PR: own_load 파라미터가 붙었고, 값 복제 대신 qexec_copy_resolved_domains() 가 '해결된 도메인 + 값 배열'을 통째로 복사한다. vd.dbval_ptr 는
+ * 그 복사본의 resolved_domain.vals 를 가리키게 된다. 진입부에 assert(frozen), 복사 전제에 assert(dbval_ptr ==
+ * resolved_domain.vals).
+ * 바뀐 것: 시그니처에 bool own_load 추가, 값 복제 루프·배열 할당 -22줄 → qexec_copy_resolved_domains 호출 1개. 실패 시 new_xasl_state 해제
+ * 후 NULL.
+ */
 extern xasl_state *
 qexec_deep_copy_xasl_state (THREAD_ENTRY * thread_p, xasl_state * xasl_state_p, bool own_load)
 {
@@ -3616,6 +3668,13 @@ qexec_deep_copy_xasl_state (THREAD_ENTRY * thread_p, xasl_state * xasl_state_p, 
 
 /* Frees a qexec_deep_copy_xasl_state copy: its values (secondary references
  * included), its resolved domain table and the state itself, on the heap that made them. */
+/*
+ * [리뷰] qexec_free_xasl_state — qexec_deep_copy_xasl_state 가 만든 워커 복사본을 그 워커 스레드가 되돌려주는 짝 함수.
+ * develop: vd.dbval_cnt 만큼 pr_clear_value 한 뒤 dbval_ptr 배열과 상태 구조체를 해제했다.
+ * 이 PR: assert(resolved_domain.owner == thread_p) 로 소유 스레드를 확인하고 qexec_clear_resolved_domains() 에 값 해제를 맡긴 뒤
+ * 구조체만 해제한다.
+ * 바뀐 것: 값 해제 루프 -8줄 → 호출 1줄 + 소유자 assert 1줄. 게이트(해결된 도메인 저장소)가 값의 수명을 갖게 된 데 따른 짝 변경.
+ */
 extern void
 qexec_free_xasl_state (THREAD_ENTRY * thread_p, xasl_state * xasl_state)
 {
@@ -3899,6 +3958,14 @@ qexec_ordby_put_next (THREAD_ENTRY * thread_p, const RECDES * recdes, void *arg)
  *         runtime. This is the function's purpose: get an integer from
  *         the XASL to represent the upper bound for the sorted results.
  */
+/*
+ * [리뷰] qexec_fill_sort_limit — ORDER BY ... LIMIT 의 상한을 XASL 의 limit regu 에서 읽어 INTEGER 로 만들어 *limit_ptr 에 넣는다
+ * — qexec_orderby_distinct_by_sorting 이 topn/sort 한계를 정할 때 부른다.
+ * develop: 가져온 DB_VALUE 포인터 dbvalp 를 tp_value_coerce (dbvalp, dbvalp, domainp) 로 제자리에서 INTEGER 로 변환했다.
+ * 이 PR: 지역 DB_VALUE limit_value 를 만들어 그쪽으로 변환하고 dbvalp 를 그 지역 값으로 바꾼다 — LIMIT 은 다른 읽는 쪽과 공유하는 바인드
+ * 값(resolve_domains 의 값 배열)이므로 제자리 변환이 남의 값을 바꾼다는 이유.
+ * 바뀐 것: 지역 값 1개 추가 + 변환 대상 교체(+4줄). 공유 값 배열이 생긴 이 PR 의 전제에 맞춘 짝 수정.
+ */
 static int
 qexec_fill_sort_limit (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state, int *limit_ptr)
 {
@@ -4042,6 +4109,15 @@ qexec_orderby_distinct (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QUERY_OPTIONS
  * list file contains orderable types (non-sets), first the list
  * file is sorted on all columns and then duplications are
  * eliminated on the fly, thus causing and ordered-distinct list file output.
+ */
+/*
+ * [리뷰] qexec_orderby_distinct_by_sorting — 블록의 결과 리스트파일을 ORDER BY/DISTINCT 기준으로 정렬·중복제거해 xasl->list_id 를 바꿔
+ * 끼운다. qexec_orderby_distinct 가 부르고 에러코드를 돌려준다.
+ * develop: outptr_list 가 있으면 qexec_resolve_domains_on_sort_list(order_list, outptr_list->valptrp) 로 XASL 의
+ * orderby_list 를 제자리에서 고쳐 정렬키 도메인을 늦게 바인딩했다(반환값 없음).
+ * 이 PR: qexec_plan_sort_list_domains() 가 계획의 도메인으로 '실행이 소유하는 사본' order_list 를 만들어 준다(에러면 즉시 return). 정렬이 끝나면
+ * order_list != xasl->orderby_list 일 때 그 사본을 qfile_free_sort_list 로 해제한다.
+ * 바뀐 것: 제자리 해결 1줄 → 사본 생성 + 에러 반환(+4줄), 정리부에 사본 해제 블록 +5줄. XASL 을 건드리지 않는 쪽으로 성격이 바뀌었다.
  */
 static int
 qexec_orderby_distinct_by_sorting (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QUERY_OPTIONS option,
@@ -4924,6 +5000,14 @@ qexec_hash_gby_get_next (THREAD_ENTRY * thread_p, RECDES * recdes, void *arg)
  *   recdes(in): record descriptor
  *   arg(in): hash context
  */
+/*
+ * [리뷰] qexec_hash_gby_put_next — 해시 집계가 흘려보낸 부분결과 리스트를 정렬한 뒤 sort_listfile 이 키 순서대로 부르는 출력 콜백으로, 같은 키의 누산기들을
+ * 합쳐 최종 그룹을 만든다.
+ * develop: 누산기 병합 때 agg_list->domain 을 그대로 qdata_aggregate_accumulator_to_accumulator 에 넘겼다.
+ * 이 PR: agg_list->domain 대신 qexec_get_node_domain (&state->xasl_state->vd, agg_list->domain,
+ * agg_list->plan_item) 가 돌려주는 '이 실행이 확정한 도메인'을 넘긴다.
+ * 바뀐 것: 인자 1개를 조회 호출로 교체(+3줄). 집계 노드의 도메인을 XASL 에서 읽던 것을 실행 상태(DOMAIN_PLAN 슬롯)에서 읽는 것으로 바꾼 전형적인 전환.
+ */
 static int
 qexec_hash_gby_put_next (THREAD_ENTRY * thread_p, const RECDES * recdes, void *arg)
 {
@@ -5099,6 +5183,15 @@ qexec_gby_get_next (THREAD_ENTRY * thread_p, RECDES * recdes, void *arg)
  *   return:
  *   recdes(in) :
  *   arg(in)    :
+ */
+/*
+ * [리뷰] qexec_gby_put_next — GROUP BY 정렬의 출력 콜백 — sort_listfile 이 정렬된 입력 튜플을 키 순서로 넘겨주면 그룹 경계를 보고 누산·마무리한다.
+ * GROUPBY_STATE 의 state 를 돌려준다.
+ * develop: 롤업 차원의 누산기 병합에서 ru_agg_list->domain 을 그대로 넘겼다.
+ * 이 PR: qexec_get_node_domain (&info->xasl_state->vd, ru_agg_list->domain, ru_agg_list->plan_item) 로 얻은 실행 확정
+ * 도메인을 지역 ru_domain 에 받아 넘긴다.
+ * 바뀐 것: 지역 변수 1개 + 인자 교체(+3줄). (PEEK 페이지 고정·data_slot 도입 같은 큰 변경은 이미 develop 에 있다 — develop 대비 이 PR 의 델타는 도메인
+ * 조회 한 곳뿐이다.)
  */
 static int
 qexec_gby_put_next (THREAD_ENTRY * thread_p, const RECDES * recdes, void *arg)
@@ -5397,6 +5490,21 @@ exit_on_error:
  *
  * Note: Apply the group_by clause to the given list file to group it
  * using the specified group_by parameters.
+ */
+/*
+ * [리뷰] qexec_groupby — BUILDLIST 블록의 GROUP BY 전체를 모는 함수 — 입력 리스트파일을 정렬하거나 해시 집계 부분결과를 합쳐 그룹 결과 리스트파일을 만들고
+ * xasl->list_id 에 바꿔 끼운다. NO_ERROR/ER_FAILED 를 돌려준다.
+ * develop: outptr_list 가 있으면 qexec_resolve_domains_for_group_by(buildlist, xasl->outptr_list) 로 buildlist 의
+ * groupby_list·regu 리스트 도메인을 제자리에서 늦게 바인딩했다(실패 경로 자체가 없었다). 그 뒤 buildlist->groupby_list 로 바로
+ * qexec_initialize_groupby_state 를 불렀고, qdata_get_valptr_type_list 는 vd 인자가 없었다.
+ * 이 PR: qexec_plan_group_by_domains() 가 계획 도메인으로 실행 소유의 groupby_list 사본을 만들고(실패하면 GOTO_EXIT_ON_ERROR),
+ * qexec_finish_group_by_domains() 가 NULL 만 본 누산기와 해시 집계 리스트 도메인을 마감한다. 상태 초기화는 그 사본으로 하고, key_info 가 도메인을 복사해
+ * 간 직후 사본을 해제한다. qdata_get_valptr_type_list 에 &xasl_state->vd 를 넘긴다.
+ * 바뀐 것: 제자리 해결 1줄 → 사본 생성 + 마감 + 조건부 해제(+16줄), initialize 결과를 지역 initialized 로 받도록 호출 재배치. 새
+ * GOTO_EXIT_ON_ERROR 가 gbstate 초기화 전에 놓였다 — exit_on_error 는 wrapup 으로 떨어지고 wrapup 은
+ * qexec_clear_groupby_state(&gbstate) 를 부르는데, 이 경로에서는 gbstate 가 아직 초기화되지 않은 스택
+ * 변수다(g_dim_levels·current_key.data·output_file·input_scan 이 전부 쓰레기값으로 읽히고 해제된다).
+ * [지적 C1-01]
  */
 static int
 qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state, QFILE_TUPLE_RECORD * tplrec)
@@ -5865,6 +5973,15 @@ qexec_collection_has_null (DB_VALUE * colval)
  * as the lessor side, that tuple will be discarded,
  * then the next comparison will discard the other side.
  */
+/*
+ * [리뷰] qexec_cmp_tpl_vals_merge — 머지 조인에서 바깥/안쪽 튜플의 머지 컬럼들을 왼쪽→오른쪽으로 비교해 DB_LT/EQ/GT/UNK 를 돌려준다 —
+ * qexec_merge_list(_outer) 의 전진 판단이 전적으로 이 값에 달려 있다.
+ * develop: 비null 인 두 값을 tp_value_compare (left, right, 1, 0) 으로 비교했다 — 비교할 때마다 도메인·콜레이션을 그 자리에서 맞췄다.
+ * 이 PR: thread_p·compares(DOMAIN_COMPARE_PLAN 배열)·vd 를 받아, 컬럼 쌍마다 적재/해결 단계가 미리 정해 둔 비교 계획으로
+ * eval_compare_values_resolved() 를 부른다. compares 가 NULL 이면 계획 없이 같은 의미로 동작한다.
+ * 바뀐 것: 시그니처에 thread_p·compares·vd 3개 추가, 비교 호출 1곳 교체. 말미의 'LT/GT 아니면 UNK' 정규화 블록 -10줄 삭제(앞에서 EQ 는 continue
+ * 하므로 결과가 같은 제거).
+ */
 static DB_VALUE_COMPARE_RESULT
 qexec_cmp_tpl_vals_merge (THREAD_ENTRY * thread_p, QFILE_TUPLE_RECORD * left, int *left_ind, TP_DOMAIN ** left_dom,
 			  QFILE_TUPLE_RECORD * rght, int *rght_ind, TP_DOMAIN ** rght_dom, int tval_cnt,
@@ -6061,6 +6178,15 @@ qexec_cmp_tpl_vals_merge (THREAD_ENTRY * thread_p, QFILE_TUPLE_RECORD * left, in
  *
  * Note: The routine assumes that the join column data types for both list
  * files are same.
+ */
+/*
+ * [리뷰] qexec_merge_list — 정렬된 두 리스트파일을 받아 INNER 머지 조인 결과 리스트파일을 만들어 돌려준다(실패 시 NULL). qexec_merge_listfiles 가
+ * JOIN_INNER 일 때 부른다.
+ * develop: (thread_p, outer_list_idp, inner_list_idp, merge_infop, ls_flag) 5인자. 비교는 qexec_cmp_tpl_vals_merge
+ * 에 도메인만 넘겨 불렀다.
+ * 이 PR: compares(const DOMAIN_COMPARE_PLAN * const *) 와 vd 두 인자를 더 받아 5곳의 비교 호출 모두에 그대로 전달한다. 비교 계획은 호출자가
+ * xasl->proc.mergelist.merge_compares 로 넘긴다.
+ * 바뀐 것: 시그니처 +2 인자, 비교 호출 5곳의 전달 인자 추가. 함수 자체의 제어흐름은 그대로.
  */
 static QFILE_LIST_ID *
 qexec_merge_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * outer_list_idp, QFILE_LIST_ID * inner_list_idp,
@@ -6525,6 +6651,12 @@ exit_on_error:
  *   other_outer_join_pred(in)  :
  *   xasl_state(in)     :
  *   ls_flag(in)        :
+ */
+/*
+ * [리뷰] qexec_merge_list_outer — 두 스캔을 직접 돌리며 LEFT/RIGHT/FULL OUTER 머지 조인 결과 리스트파일을 만들어 돌려준다(실패 시 NULL).
+ * develop: (… xasl_state, ls_flag) 로 끝나는 7인자. 비교는 qexec_cmp_tpl_vals_merge 에 도메인만 넘겼다.
+ * 이 PR: compares 인자가 붙고, 함수 선두에서 const VAL_DESCR *vd = &xasl_state->vd 를 꺼내 5곳의 비교 호출에 compares·vd 를 함께 넘긴다.
+ * 바뀐 것: 시그니처 +1 인자, 지역 vd 1줄, 비교 호출 5곳의 전달 인자 추가. qexec_merge_list 와 같은 성격의 짝 변경.
  */
 static QFILE_LIST_ID *
 qexec_merge_list_outer (THREAD_ENTRY * thread_p, SCAN_ID * outer_sid, SCAN_ID * inner_sid,
@@ -7202,6 +7334,14 @@ exit_on_error:
  *
  * Note: For a direct list file merge, currently the outer and inner columns
  * should have the same data type.
+ */
+/*
+ * [리뷰] qexec_merge_listfiles — MERGELIST_PROC 블록의 진입점 — 조인 타입을 보고 inner/outer 머지 루틴을 골라 결과 리스트파일을
+ * xasl->list_id 로 붙인다.
+ * develop: qexec_merge_list(…, ls_flag) / qexec_merge_list_outer(…, ls_flag) 를 비교 계획 없이 불렀다.
+ * 이 PR: 두 호출 모두에 xasl->proc.mergelist.merge_compares 를 넘기고, inner 쪽에는 &xasl_state->vd 도 넘긴다 — 머지 컬럼의 비교 방식을 실행
+ * 전에 확정해 둔 계획에서 가져오는 자리다.
+ * 바뀐 것: 호출 2곳의 인자 추가(+3줄). 이 함수가 '게이트가 정한 비교 계획'을 머지 루틴에 전달하는 통로가 된다.
  */
 static int
 qexec_merge_listfiles (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state)
@@ -12839,6 +12979,14 @@ exit_on_error:
  * The format is the literal the schema keeps, made by db_make_string: a VARCHAR in the system codeset and collation.
  * Its type gives the domain whatever its content, as the load types any literal; no row value resolves it.
  */
+/*
+ * [리뷰] qexec_default_format_domain — 컬럼 DEFAULT 식의 TO_CHAR 포맷 상수가 가져야 할 결과 도메인(시스템 콜레이션의 최대 길이 VARCHAR)을 돌려주는
+ * 헬퍼로, qexec_generate_row_default_expr 과 qexec_execute_insert 이 쓴다.
+ * develop: develop 에 없음 — 이 PR 이 신설. 두 호출처 모두 tp_domain_resolve_value (&format_val, NULL) 로 값에서 도메인을 역산했다.
+ * 이 PR: tp_domain_resolve (DB_TYPE_VARCHAR, NULL, DB_MAX_VARCHAR_PRECISION, 0, NULL, LANG_SYS_COLLATION) 로
+ * 도메인을 못 박고, 디버그 빌드에서는 값에서 역산한 도메인과 타입·정밀도·코드셋·콜레이션이 모두 같은지 assert 한다.
+ * 바뀐 것: 신설(+14줄). '값을 보고 도메인을 정한다'를 '도메인은 미리 정해져 있고 값이 그에 맞는지만 확인한다'로 뒤집은, 이 PR 의 방향을 그대로 보여주는 함수.
+ */
 static TP_DOMAIN *
 qexec_default_format_domain (const DB_VALUE * format_val)
 {
@@ -12861,6 +13009,13 @@ qexec_default_format_domain (const DB_VALUE * format_val)
  *   xasl_state(in): XASL state containing value descriptor
  *   uuid_state(in): UUID generation state
  *   out_val(out): generated value
+ */
+/*
+ * [리뷰] qexec_generate_row_default_expr — INSERT 때 컬럼의 DEFAULT 식(NOW·UUID·TO_CHAR 등)을 평가해 그 행에 넣을 DB_VALUE 를
+ * 만든다.
+ * develop: TO_CHAR 의 포맷 인자가 주어졌을 때 result_domain 을 tp_domain_resolve_value (&format_val, NULL) 로 값에서 역산했다.
+ * 이 PR: 같은 자리에서 qexec_default_format_domain (&format_val) 을 불러 미리 정해진 VARCHAR 도메인을 쓴다.
+ * 바뀐 것: 1줄 교체. 나머지 로직 변화 없음.
  */
 static int
 qexec_generate_row_default_expr (OR_ATTRIBUTE * attr, XASL_STATE * xasl_state, UUID_STATE * uuid_state,
@@ -13097,6 +13252,15 @@ qexec_execute_remote_delete_subquery (THREAD_ENTRY * thread_p, XASL_NODE * xasl,
  *   return: NO_ERROR or ER_code
  *   xasl(in)   : XASL Tree block
  *   xasl_state(in)     :
+ */
+/*
+ * [리뷰] qexec_execute_insert — INSERT_PROC XASL 을 실제로 수행한다 — 클래스 락을 잡고 행을 만들어 heap 에 넣고, RETURNING/생성키 요구가 있으면
+ * xasl->list_id 에 결과 튜플을 쌓는다.
+ * develop: TO_CHAR 기본값 포맷의 결과 도메인을 tp_domain_resolve_value (&format_val, NULL) 로 값에서 역산했다. (dblink 원격 DML 분기와
+ * qfile_add_values_tuple_to_list 전환은 이미 develop 에 들어와 있다.)
+ * 이 PR: 그 한 곳을 qexec_default_format_domain (&format_val) 호출로 바꿨다 — 도메인이 실행 전에 정해져 있고 값은 그에 맞을 뿐이라는 계약을 INSERT
+ * 경로에도 적용한 것.
+ * 바뀐 것: develop 대비 1줄 교체. 그 외 이 함수의 로직은 그대로.
  */
 static int
 qexec_execute_insert (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state, bool skip_aptr)
@@ -15168,6 +15332,14 @@ exit_on_error:
  * be of type BUILDLIST_PROC, BUILDVALUE, UNION_PROC,
  * DIFFERENCE_PROC and INTERSECTION_PROC.
  */
+/*
+ * [리뷰] qexec_start_mainblock_iterations — 스캔이 돌기 전에 블록 종류별 준비를 한다 — outptr_list 에서 출력 타입 리스트를 만들어
+ * xasl->list_id 를 열고, BUILDVALUE 면 집계 리스트를 초기화한다. qexec_execute_mainblock_internal 이 부른다.
+ * develop: qdata_get_valptr_type_list (thread_p, xasl->outptr_list, &type_list) 3인자,
+ * qdata_initialize_aggregate_list (thread_p, agg_list, query_id) 3인자로 불렀다 — 출력 도메인을 regu 의 domain 필드에서 직접 읽었다.
+ * 이 PR: 네 호출 모두 &xasl_state->vd 를 더 넘긴다. 결과 리스트파일의 타입 리스트와 누산기 초기 도메인이 '이 실행이 확정한 도메인'에서 나오게 됐다.
+ * 바뀐 것: 호출 4곳에 vd 인자 추가(+4줄). 블록의 출력 레이아웃을 게이트 결과에서 받는 자리로 바뀌었다.
+ */
 int
 qexec_start_mainblock_iterations (THREAD_ENTRY * thread_p, xasl_node * xasl, xasl_state * xasl_state)
 {
@@ -15402,6 +15574,15 @@ exit_on_error:
  *
  * Note: This routines performs the finish-up operations for BUILDVALUE
  * block iteration.
+ */
+/*
+ * [리뷰] qexec_end_buildvalueblock_iterations — BUILDVALUE 블록의 스캔이 끝난 뒤 집계를 마감하고 HAVING 을 평가해 한 행짜리 결과 리스트파일을
+ * 만든다.
+ * develop: qdata_finalize_aggregate_list (thread_p, agg_list, false) 3인자로 마감했고, 마감 뒤 출력 컬럼 도메인을 손보는 단계가 없었다.
+ * qdata_get_valptr_type_list 도 vd 없이 불렀다.
+ * 이 PR: 마감에 &xasl_state->vd 를 넘기고, 마감 직후 qexec_type_accumulator_outputs (&xasl_state->vd, xasl) 를 불러 보간
+ * 집계(qdata_aggregate_interpolation)가 마감 중에 쓴 도메인을 출력 컬럼에 반영한다. qdata_get_valptr_type_list 에도 vd 를 넘긴다.
+ * 바뀐 것: 호출 2곳에 vd 인자 추가, 출력 컬럼 타입 재확정 블록 +6줄. '첫 행 전에 전부 확정' 원칙에서 유일하게 빠지는 예외(보간 집계)를 마감 시점 한 번으로 모은 자리다.
  */
 static int
 qexec_end_buildvalueblock_iterations (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
@@ -15891,6 +16072,14 @@ qexec_execute_mainblock (THREAD_ENTRY * thread_p, xasl_node * xasl, xasl_state *
  *   empty_result(out): true if no result will be generated
  *
  */
+/*
+ * [리뷰] qexec_check_limit_clause — 최상위 XASL 의 LIMIT 행 수가 유효한지(0 이하면 빈 결과) 검사해 *empty_result 를 채운다. 실행을 시작할지 말지를
+ * 가르는 게이트 앞 검사다.
+ * develop: 파일 내부 static 함수였고, LIMIT 값과 0 의 비교를 tp_value_compare (limit_valp, &zero_val, 1, 0) 으로 그 자리에서 했다.
+ * 이 PR: extern(int)으로 공개돼 domain_resolve.c:2508 의 해결 경로도 부를 수 있고, 비교는 적재/해결이 미리 정한 xasl->limit_compare 계획으로
+ * eval_compare_values_resolved() 를 통해 한다.
+ * 바뀐 것: static 제거 + query_executor.h:116 선언 추가, 비교 호출 1곳 교체(+3줄). 호출처가 2곳(실행 전 게이트, 도메인 해결 경로)으로 늘었다.
+ */
 int
 qexec_check_limit_clause (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state, bool * empty_result)
 {
@@ -15981,6 +16170,23 @@ qexec_execute_dblink_query (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STAT
  *   xasl_state(in)     : XASL state information
  *   p_class_instance_lock_info(in/out): class instance lock info
  *
+ */
+/*
+ * [리뷰] qexec_execute_mainblock_internal — XASL 블록 하나의 실행 본체 — 하위 블록·스펙을 열고 스캔 함수 벡터를 꾸려 루프를 돌리고 결과 리스트파일을
+ * 완성한다. qexec_execute_mainblock 이 부르고 NO_ERROR/에러를 돌려준다.
+ * develop: 진입부에 도메인 스코프 개념이 없었다. BUILDLIST/BUILDVALUE 준비에서 agg_domains_resolved=0 으로 리셋한 뒤
+ * qexec_mark_aggregate_operand_expressions(xasl) 만 부르고, 실제 도메인 해결과 누산기 공유는 첫 행 뒤 qexec_end_one_iteration 으로
+ * 미뤘다. 메모이즈는 new_memoize_storage (thread_p, xptr, XASL_IS_NL_SEMI_OR_ANTI(xptr)) 로 semi/anti 를 match-only 로
+ * 캐싱했다.
+ * 이 PR: 진입부에서 qexec_enter_temporary_scope (&xasl_state->vd, xasl->val_list) 로 상관 서브쿼리의 외부 값 변환 세대를 올린다(바깥 행마다
+ * 새로 변환). 두 집계 준비 분기는 스캔 전에 qexec_setup_aggregate_domains() 로 도메인을 확정하고(실패 시 GOTO_EXIT_ON_ERROR), BUILDLIST 는
+ * qexec_setup_hash_aggregate_lists(), BUILDVALUE 는 qexec_type_accumulator_outputs() 를 부른 뒤 해결됐으면
+ * qdata_link_shared_accumulators() 로 공유를 건다. 메모이즈는 scan_ptr 사슬에 semi/anti 가 하나라도 있으면 건너뛰고 new_memoize_storage
+ * 는 2인자다.
+ * 바뀐 것: 스코프 진입 +4줄, 집계 준비 두 분기 각각 mark 호출 1개 → 확정 블록 +16줄, 메모이즈 조건에 사슬 순회(sa_in_chain) +14줄. 이 PR 의 '실행 전 게이트가
+ * 한 번에 결정'이 가장 또렷하게 드러나는 자리. 다만 메모이즈 쪽은 현재 develop 이 match-only 메모이즈(3인자)로 같은 문제를 다르게 풀어 놓아서 머지 때 둘 중 하나를 골라야
+ * 한다.
+ * [지적 X1-02]
  */
 static int
 qexec_execute_mainblock_internal (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
@@ -17313,6 +17519,15 @@ qexec_clear_a_eval_values (THREAD_ENTRY * thread_p, ANALYTIC_EVAL_TYPE * a_eval_
 #define QP_MAX_RE_EXECUTES_UNDER_DEADLOCKS 10
 #endif
 
+/*
+ * [리뷰] qexec_execute_query — query_manager(xqmgr_execute_query → qmgr_process_query)가 부르는 서버측 질의 실행 진입점 —
+ * XASL_STATE 를 만들어 메인블록을 돌리고 결과 QFILE_LIST_ID 를 돌려준다.
+ * develop: xasl_state 에 바인드 값·시각·난수·스냅샷만 채우고 바로 qexec_execute_mainblock 을 불렀다. 도메인·collation 은 실행 중 행을 읽으면서 하위
+ * 43곳에서 각자 정해졌다.
+ * 이 PR: xasl_state.resolved_domain·domain_execution 을 memset 으로 비우고, 메인블록 직전에 qexec_resolve_domains 로 이 실행의
+ * 도메인을 한 번에 정한다. 실패하면 query_error 로 가고, end: 라벨에서 qexec_clear_resolved_domains 로 해제한다.
+ * 바뀐 것: 실행 전 게이트 호출 + 해제 1쌍과 memset 2줄 추가(분기 추가, +12줄). 이 PR 이 말하는 '실행 전 게이트'가 걸리는 바로 그 자리다.
+ */
 qfile_list_id *
 qexec_execute_query (THREAD_ENTRY * thread_p, xasl_node * xasl, int dbval_cnt, const DB_VALUE * dbval_ptr,
 		     QUERY_ID query_id)
@@ -17761,6 +17976,15 @@ replace_null_dbval (REGU_VARIABLE * regu_var, DB_VALUE * set_dbval)
  *  return:
  *  xasl(in):
  *  xasl_state(in):
+ */
+/*
+ * [리뷰] qexec_execute_connect_by — qexec_execute_mainblock_internal 이 START WITH … CONNECT BY 플랜을 만나면 부르는 계층 질의
+ * 실행기 — input/start_with/result 리스트 파일을 만들어 레벨별로 확장하고 NO_ERROR/ER_FAILED 를 돌려준다.
+ * develop: 해시 리스트 스캔의 probe regu 도메인이 NUMERIC 기본 정밀도일 때, rest_regu_list 에서 고정 정밀도 NUMERIC 항목을 찾아
+ * tp_domain_copy 로 복사본을 만들고 precision/scale 을 덮어써 실행 중에 probe 도메인을 바꿔 끼웠다(약 47줄).
+ * 이 PR: 그 보정 블록이 통째로 사라지고 'probe 도메인은 로드 때 domain_fix_connect_by_probe 가 확정한다'는 주석만 남았다.
+ * qdata_get_valptr_type_list 에는 &xasl_state->vd 를 넘겨 게이트가 정한 도메인으로 리스트 컬럼 타입을 만든다.
+ * 바뀐 것: 실행 중 도메인 교체 블록 삭제(-47줄, 결정 지점이 로드(DOMAIN_PLAN)로 이동), 타입리스트 호출 1곳 인자 추가.
  */
 static int
 qexec_execute_connect_by (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
@@ -18518,6 +18742,14 @@ exit_on_error:
  *  return:
  *  xasl(in):
  *  xasl_state(in):
+ */
+/*
+ * [리뷰] qexec_execute_cte — mainblock_internal 이 CTE 플랜에 대해 부른다 — 비재귀부를 돌리고 재귀부를 수렴할 때까지 반복해 CTE 리스트 파일을 만든다.
+ * develop: 첫 재귀 반복 뒤 qfile_unify_types(non_recursive->list_id, recursive->list_id) 로 두 리스트의 컬럼 타입을 맞췄다. 어느 쪽이
+ * 행을 냈는지는 보지 않았다.
+ * 이 PR: 세 번째 인자로 list1_empty = (non_recursive_part->list_id->tuple_cnt == 0) 을 넘긴다. 비재귀부가 행을 내지 않았으면 그 컬럼에는
+ * NULL 밖에 없으므로 재귀부 도메인을 그대로 받는다.
+ * 바뀐 것: 호출 1곳 인자 추가(+1줄). qfile_unify_types 시그니처가 bool list1_empty 를 받도록 바뀌었다(list_file.h:238).
  */
 static int
 qexec_execute_cte (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state)
@@ -19779,6 +20011,14 @@ exit_on_error:
  *  xasl(in): CONNECT BY xasl
  *  xasl_state(in):
  */
+/*
+ * [리뷰] qexec_start_connect_by_lists — qexec_execute_connect_by 가 시작할 때 부른다 — outptr_list 의 타입 리스트로
+ * input/start_with/result 리스트 파일 세 개를 열어 CONNECTBY_PROC_NODE 에 건다.
+ * develop: qdata_get_valptr_type_list (thread_p, xasl->outptr_list, &type_list) — 컴파일 도메인만으로 컬럼 타입을 만들었다.
+ * 이 PR: &xasl_state->vd 를 추가로 넘겨, 게이트가 정한 도메인으로 세 리스트의 컬럼 타입을 만든다. 세 리스트가 같은 도메인으로 열리는 것이
+ * qexec_update_connect_by_lists 의 동기화 삭제 근거다.
+ * 바뀐 것: 인자 1개 추가(1줄).
+ */
 static int
 qexec_start_connect_by_lists (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state)
 {
@@ -19852,6 +20092,15 @@ exit_on_error:
  *  xasl(in): CONNECT BY xasl
  *  xasl_state(in):
  *  tplrec(in):
+ */
+/*
+ * [리뷰] qexec_update_connect_by_lists — qexec_intprt_fnc 의 행 경로에서 한 튜플을 input_list_id 에(START WITH 조건을 만족하면
+ * start_with_list_id 에도) 적재한다 — 행당 호출.
+ * develop: start_with_list_id 에 튜플을 넣기 직전마다 qexec_sync_start_with_type_list(connect_by) 를 불러, input_list_id 의
+ * descriptor 가 그 사이 해석한 도메인을 start_with_list_id 쪽에 복사했다.
+ * 이 PR: 호출을 지우고 주석만 남겼다 — 두 리스트가 qexec_start_connect_by_lists 에서 같은 도메인으로 열렸고 행이 그것을 바꾸지 않으므로 동기화할 것이 없다.
+ * qexec_sync_start_with_type_list 함수 자체가 PR 에서 삭제됐다(develop 에만 남아 있다).
+ * 바뀐 것: 행마다 돌던 도메인 동기화 호출 삭제(-1줄 + 헬퍼 함수 1개 제거). '행은 읽기만 한다'는 이 PR 의 원칙이 핫패스에서 드러나는 자리다.
  */
 static int
 qexec_update_connect_by_lists (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
@@ -20255,6 +20504,14 @@ wrapup:
  *   N(in):
  *   keep_list_file(in) : whether keep the list file for reuse
  */
+/*
+ * [리뷰] qexec_gby_finalize_group — GROUP BY 정렬 출력 경로(qexec_gby_put_next → qexec_gby_finalize_group_dim)에서 한 그룹이
+ * 끝날 때 누산기를 마감해 그룹 행을 출력 리스트에 쓴다.
+ * develop: qdata_finalize_aggregate_list (thread_p, gbstate->g_dim[N].d_agg_list, keep_list_file) — 집계 마감이 집계
+ * 노드의 컴파일 도메인만 보고 결과 타입을 정했다.
+ * 이 PR: &gbstate->xasl_state->vd 를 추가로 넘겨, 집계 마감이 게이트가 정한 실행 도메인을 읽는다.
+ * 바뀐 것: 인자 1개 추가(+1줄). 집계 쪽 시그니처 변경에 따른 호출부 반영.
+ */
 static void
 qexec_gby_finalize_group (THREAD_ENTRY * thread_p, GROUPBY_STATE * gbstate, int N, bool keep_list_file)
 {
@@ -20523,6 +20780,12 @@ qexec_gby_start_group_dim (THREAD_ENTRY * thread_p, GROUPBY_STATE * gbstate, con
  *   gbstate(in):
  *   recdes(in):
  *   N(in): dimension ID
+ */
+/*
+ * [리뷰] qexec_gby_start_group — GROUP BY 정렬 콜백에서 새 그룹이 시작될 때 누산기 값을 비우고 집계 리스트를 초기화한다.
+ * develop: qdata_initialize_aggregate_list (thread_p, agg_list, gbstate->xasl_state->query_id).
+ * 이 PR: &gbstate->xasl_state->vd 를 추가로 넘겨, 집계 초기화가 첫 값이 아니라 게이트가 정한 도메인을 쓰게 한다.
+ * 바뀐 것: 인자 1개 추가(+1줄).
  */
 static void
 qexec_gby_start_group (THREAD_ENTRY * thread_p, GROUPBY_STATE * gbstate, const RECDES * recdes, int N)
@@ -21005,6 +21268,15 @@ bf2df_str_cmpval (DB_VALUE * value1, DB_VALUE * value2, int do_coercion, int tot
  *
  * Note: Apply the group_by clause to the given list file to group it
  * using the specified group_by parameters.
+ */
+/*
+ * [리뷰] qexec_groupby_index — mainblock_internal 이 인덱스 스캔으로 그룹 순서가 이미 보장된 GROUP BY 를 처리할 때 부른다 — 정렬 없이 스캔하며 그룹
+ * 경계를 잡아 결과 리스트를 만든다.
+ * develop: 출력 리스트 타입을 qdata_get_valptr_type_list(…, &output_type_list) 로 만들었고, 그룹 키 비교 값을 꺼낼 때
+ * qexec_get_tuple_column_value 에 regu_list->value.domain(컴파일 도메인)을 그대로 넘겼다.
+ * 이 PR: 타입 리스트 호출에 &xasl_state->vd 를 넘기고, 컬럼 값 추출에는 qexec_get_node_domain (&xasl_state->vd,
+ * regu_list->value.domain, regu_list->value.plan_item) 으로 이 실행의 도메인을 구해 넘긴다.
+ * 바뀐 것: 인자 추가 1곳 + 도메인 조회를 plan item 경유로 교체 1곳(+3줄).
  */
 int
 qexec_groupby_index (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state, QFILE_TUPLE_RECORD * tplrec)
@@ -21492,6 +21764,18 @@ qexec_clear_analytic_stats_list (ANALYTIC_STATS ** stats_list)
  *   tplrec(out) : Tuple record descriptor to store result tuples
  *   next_func(out) : next unprocessed function
  */
+/*
+ * [리뷰] qexec_execute_analytic — mainblock_internal 이 분석 함수 평가 단계마다 부른다 — 정렬된 입력을 ANALYTIC_STATE 로 훑어 중간/최종 리스트
+ * 파일을 만들고 NO_ERROR/ER_FAILED 를 돌려준다.
+ * develop: qexec_resolve_domains_on_sort_list (analytic_eval->sort_list, buildlist->a_outptr_list_ex->valptrp)
+ * 로 플랜의 sort_list 를 제자리에서 고쳐 늦은 바인딩 도메인을 채운 뒤, 그 플랜 리스트를 그대로 qexec_initialize_analytic_state 에 넘겼다.
+ * 이 PR: qexec_plan_sort_list_domains 가 플랜 sort_list 는 그대로 두고, 해석이 필요한 키가 있을 때만 실행이 소유하는 복사본을 만든다. 그 복사본으로 상태를
+ * 초기화하고 key_info 가 만들어진 직후 qfile_free_sort_list 로 해제한다. 타입 리스트 호출 2곳에 &xasl_state->vd 추가.
+ * 바뀐 것: 플랜 노드 제자리 수정 → 실행 소유 복사본으로 교체, 지역변수 2개(sort_list·initialized)와 해제 경로 추가(+12줄). '결정은 XASL_STATE 에만 두고
+ * 플랜 노드에는 쓰지 않는다'는 원칙의 적용.
+ * [지적 X3-09]
+ * [지적 C2-01]
+ */
 static int
 qexec_execute_analytic (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
 			ANALYTIC_EVAL_TYPE * analytic_eval, QFILE_TUPLE_RECORD * tplrec, bool is_last,
@@ -21853,6 +22137,15 @@ exit_on_error:
  *         - current_values and temp_values for storing and comparing sort key values
  *         are being initialized here.
  */
+/*
+ * [리뷰] qdata_setup_analytic_eval_list — mainblock_internal 이 분석 평가 리스트를 준비할 때 부른다 — 평가 리스트의 각 분석 함수를 초기화하고,
+ * 필요하면 함수별 order_list_id 를 연다.
+ * develop: qdata_initialize_analytic_func(…, xasl_state->query_id) 로 초기화하고, order_list_id 를 열 때 컬럼 도메인 domp[1]
+ * 에 a_func_list->domain(컴파일 도메인)을 그대로 넣었다.
+ * 이 PR: 초기화에 &xasl_state->vd 를 넘기고, domp[1] 은 qexec_analytic_value_domain (&xasl_state->vd, a_func_list) — 이
+ * 실행에서 함수가 가지는 도메인으로 리스트 컬럼을 만든다.
+ * 바뀐 것: 인자 추가 1곳 + 도메인 조회 교체 1곳(2줄).
+ */
 static int
 qdata_setup_analytic_eval_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state)
 {
@@ -21966,6 +22259,14 @@ qdata_setup_analytic_eval_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_
  *   first binding (qdata_evaluate_analytic_func) takes the same one. The list's tuples are laid out by it, so no row
  *   decides it; without a plan answer the column stays variable and takes only NULLs.
  */
+/*
+ * [리뷰] qexec_analytic_value_domain — 분석 함수의 값 리스트 파일 컬럼 도메인을 주는 static 헬퍼 — qdata_setup_analytic_eval_list 와
+ * qexec_initialize_analytic_function_state 가 qfile_open_list 직전에 부른다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 은 두 호출부 모두 func_p->domain 을 그대로 썼다.
+ * 이 PR: qexec_get_node_domain 으로 실행 도메인(없으면 컴파일 도메인)을 구하고, 그것이 variable 이면 qexec_consumer_domain 이 주는 계획 도메인을
+ * 쓴다. 둘 다 없으면 컴파일 도메인을 돌려준다 — 행 없이 리스트 레이아웃을 정하는 자리다.
+ * 바뀐 것: 신설(+13줄 + 전방 선언 1줄).
+ */
 static TP_DOMAIN *
 qexec_analytic_value_domain (const VAL_DESCR * vd, const ANALYTIC_TYPE * func_p)
 {
@@ -21980,6 +22281,16 @@ qexec_analytic_value_domain (const VAL_DESCR * vd, const ANALYTIC_TYPE * func_p)
  *   thread_p(in): thread entry
  *   func_state(in/out): function state
  *   func_p(in): function to initialize state for
+ */
+/*
+ * [리뷰] qexec_initialize_analytic_function_state — qexec_initialize_analytic_state 가 분석 함수 하나마다 부른다 —
+ * ANALYTIC_FUNCTION_STATE 를 채우고 current_key 버퍼와 값 리스트 파일을 연다.
+ * develop: func_state->func_p 만 등록했고, is_skip_sort 경로의 qdata_finalize_analytic_func(…, false) 에는 vd 가 없었으며, 값
+ * 리스트 컬럼 domp[1] 은 func_state->func_p->domain 이었다.
+ * 이 PR: func_state->vd = &xasl_state->vd 로 실행 descriptor 를 상태에 박아 둔다(이후
+ * qexec_analytic_sort_key_header_load·offset 평가가 이걸 쓴다). finalize 에 &xasl_state->vd 를 넘기고, domp[1] 은
+ * qexec_analytic_value_domain 으로 구한다.
+ * 바뀐 것: 구조체 필드 세팅 1줄 추가 + 인자 추가 1곳 + 도메인 조회 교체 1곳(+3줄). 실행 descriptor 를 함수 상태에 전달하는 통로가 생겼다.
  */
 static int
 qexec_initialize_analytic_function_state (THREAD_ENTRY * thread_p, ANALYTIC_FUNCTION_STATE * func_state,
@@ -22122,6 +22433,17 @@ qexec_initialize_analytic_function_state (THREAD_ENTRY * thread_p, ANALYTIC_FUNC
  * to it or fails. Any other key of the state - another function's ORDER BY that shares the sort - compares in its own
  * domain, the type its first value gives.
  */
+/*
+ * [리뷰] qexec_plan_interpolation_sort_key — qexec_initialize_analytic_state 가 MEDIAN/PERCENTILE 이 있을 때 부르는
+ * static 헬퍼 — 보간 함수의 피연산자 정렬 키가 어느 도메인으로 비교될지 SUBKEY_INFO 에 써 둔다(반환 없음).
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 은 같은 자리에서 key_info.key 를 i=0..nkeys 로 돌며 i >=
+ * interpolation_func_sort_prefix_len 이고 col_dom 이 문자열이면 use_cmp_dom = true 만 세웠고 cmp_dom 은 건드리지 않았다.
+ * 이 PR: 보간 함수를 찾아 key[func_p->sort_prefix_size] 하나만 보고, 그 키가 문자열이면 use_cmp_dom = true, cmp_dom =
+ * tp_domain_resolve_default(해결된 도메인 타입), cmp_dom_session_read(세션변수 의존 여부)까지 채운 뒤 return 한다. 해결 도메인은 plan item
+ * 의 fixed.domain 이 비variable 이면 그것, 아니면 qexec_resolved_domain(vd, item).
+ * 바뀐 것: 신설(+34줄)로 develop 의 인라인 루프(-9줄)를 대체. 대상이 'prefix_len 이후의 모든 문자열 키' → 'prefix_size 위치의 키 하나' 로 좁아졌고
+ * cmp_dom 을 명시적으로 쓴다(PR Remarks 2 의 스펙 변경과 같은 방향).
+ */
 static void
 qexec_plan_interpolation_sort_key (ANALYTIC_STATE * analytic_state, ANALYTIC_TYPE * a_func_list, const VAL_DESCR * vd)
 {
@@ -22169,6 +22491,17 @@ qexec_plan_interpolation_sort_key (ANALYTIC_STATE * analytic_state, ANALYTIC_TYP
  *   xasl_state(in)     : XASL tree state information
  *   type_list(in)      :
  *   tplrec(out) 	: Tuple record descriptor to store result tuples
+ */
+/*
+ * [리뷰] qexec_initialize_analytic_state — qexec_execute_analytic 이 평가 단계마다 부른다 — ANALYTIC_STATE 를 채우고 정렬 키 정보를
+ * 만들며 a_regu_list 의 위치 참조 도메인을 확정하고, 성공하면 analytic_state 를 돌려준다(실패 NULL).
+ * develop: 보간 키는 함수 안의 루프로 직접 세웠고, resolve_domain: 라벨에서 a_regu_list 를 돌며 TYPE_POSITION 이면서 도메인이 VARIABLE 이거나
+ * collation flag 가 NORMAL 이 아니면 리스트 파일의 type_list->domp[pos] 를 pos_descr.dom 과 value.domain 양쪽에 써 넣었다 — 실행 중
+ * 플랜 노드 수정이다.
+ * 이 PR: 보간 키는 qexec_plan_interpolation_sort_key 에 위임한다. 위치 참조는 qexec_position_domain_is_variable 로 거른 뒤
+ * qexec_consumer_domain 으로 해석하고, 해석이 없으면 qexec_domain_unresolved(ER_QPROC_DOMAIN_UNRESOLVED, -1383)로 NULL 을
+ * 반환한다. 있으면 qexec_set_node_domain 으로 실행 도메인에만 기록하고 플랜 노드(value.domain·pos_descr.dom)는 건드리지 않는다.
+ * 바뀐 것: 지역변수 subkey 삭제, 보간 블록 위임, 위치 해석 로직 통째 교체 + 미해결 에러 경로 추가(약 -3줄, 로직은 전면 교체).
  */
 static ANALYTIC_STATE *
 qexec_initialize_analytic_state (THREAD_ENTRY * thread_p, ANALYTIC_STATE * analytic_state, ANALYTIC_TYPE * a_func_list,
@@ -22619,6 +22952,13 @@ qexec_analytic_eval_instnum_pred (THREAD_ENTRY * thread_p, ANALYTIC_STATE * anal
  *   key(in):
  *   reinit(in):
  */
+/*
+ * [리뷰] qexec_analytic_start_group — 분석 정렬 콜백(qexec_analytic_put_next)이 새 그룹을 시작할 때 부른다 — 함수 상태를 리셋하고 누산기를
+ * 초기화한다.
+ * develop: qdata_initialize_analytic_func (thread_p, func_state->func_p, xasl_state->query_id).
+ * 이 PR: &xasl_state->vd 를 추가로 넘겨 초기화가 게이트의 도메인을 쓰게 한다.
+ * 바뀐 것: 인자 1개 추가(1줄).
+ */
 static int
 qexec_analytic_start_group (THREAD_ENTRY * thread_p, XASL_STATE * xasl_state, ANALYTIC_FUNCTION_STATE * func_state,
 			    const RECDES * key, bool reinit)
@@ -22716,6 +23056,12 @@ qexec_add_intval_tuple (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id, int v1
  *   xasl_state(in): XASL state
  *   func_state(in): function state
  *   is_same_group(in): true if we're finalizing a sort key, false if a group
+ */
+/*
+ * [리뷰] qexec_analytic_finalize_group — qexec_analytic_put_next 가 그룹 경계에서 부른다 — 분석 함수를 마감해 값 리스트 파일에 결과를 쓴다.
+ * develop: qdata_finalize_analytic_func (thread_p, func_state->func_p, is_same_group).
+ * 이 PR: &xasl_state->vd 를 추가로 넘긴다 — 마감 결과가 쓰이는 값 리스트의 컬럼 도메인과 같은 결정을 보게 한다.
+ * 바뀐 것: 인자 1개 추가(1줄).
  */
 static int
 qexec_analytic_finalize_group (THREAD_ENTRY * thread_p, XASL_STATE * xasl_state, ANALYTIC_FUNCTION_STATE * func_state,
@@ -22990,6 +23336,15 @@ qexec_analytic_evaluate_ntile_function (THREAD_ENTRY * thread_p, ANALYTIC_FUNCTI
  *   val_desc(in): value descriptor
  *   tuple_idx(in): current position of main scan in group
  */
+/*
+ * [리뷰] qexec_analytic_evaluate_offset_function — qexec_analytic_update_group_result 가 LEAD/LAG/NTH_VALUE 를 계산할
+ * 때 부른다 — 오프셋 위치의 튜플을 읽어 함수 값을 채우고 NO_ERROR/ER_FAILED 를 돌려준다.
+ * develop: 윈도 밖이라 default 값을 넣을 때 func_p->domain(컴파일 도메인)으로 tp_value_coerce 했고, 실패 시 같은 도메인으로
+ * tp_domain_status_er_set 했다.
+ * 이 PR: func_state->vd 로 qexec_get_node_domain(…, func_p->domain, func_p->plan_item) 을 구해 지역변수에 받고, coerce 와
+ * 에러 보고 모두 그 도메인을 쓴다. 늦은 바인딩 피연산자면 default 가 게이트가 정한 타입으로 변환된다.
+ * 바뀐 것: 지역 도메인 변수 도입 + 호출 2곳 교체(+2줄).
+ */
 static int
 qexec_analytic_evaluate_offset_function (THREAD_ENTRY * thread_p, ANALYTIC_FUNCTION_STATE * func_state,
 					 ANALYTIC_STATE * analytic_state)
@@ -23251,6 +23606,16 @@ qexec_analytic_evaluate_cume_dist_percent_rank_function (THREAD_ENTRY * thread_p
  *   analytic_state(in): analytic state
  *   tuple_idx(in): current position of main scan in group
  */
+/*
+ * [리뷰] qexec_analytic_evaluate_interpolation_function — qexec_analytic_update_group_result 가
+ * MEDIAN/PERCENTILE_CONT/DISC 값을 계산할 때 부른다 — 정렬된 값 리스트에서 보간 위치의 값(들)을 읽어 함수 값을 만든다.
+ * develop: vd 매개변수가 없어 percentile 비율 reguvar 를 fetch_peek_dbval(…, NULL, …) 로 꺼냈다. 보간 결과 도메인은 &func_p->domain
+ * 을 직접 넘겨 qdata_apply_interpolation_function_coercion / qdata_interpolation_function_values 가 플랜 노드의 도메인 필드를
+ * 제자리에서 갱신했다.
+ * 이 PR: VAL_DESCR *vd 를 매개변수로 받는다. 비율 reguvar 를 vd 로 peek 해 게이트가 정한 상수 값을 읽고, 도메인은 qexec_get_node_domain 으로
+ * 지역변수에 받아 넘긴 뒤 결과를 qexec_set_node_domain 으로 실행 도메인에만 기록한다 — 플랜 노드는 그대로다.
+ * 바뀐 것: 시그니처 +1 인자, 플랜 노드 쓰기 → 실행 상태 쓰기로 교체 2곳, NULL vd peek 을 실행 descriptor peek 으로 교체(+5줄).
+ */
 static int
 qexec_analytic_evaluate_interpolation_function (THREAD_ENTRY * thread_p, ANALYTIC_FUNCTION_STATE * func_state,
 						VAL_DESCR * vd)
@@ -23425,6 +23790,13 @@ qexec_analytic_group_header_load (ANALYTIC_FUNCTION_STATE * func_state)
  *
  * NOTE: if repeated often, loading the actual value can be expensive, so make
  * sure you only set load_value when necessary.
+ */
+/*
+ * [리뷰] qexec_analytic_sort_key_header_load — 분석 그룹 결과 갱신 경로에서 값 리스트 파일의 한 슬롯을 읽어 func_p->value 로 역직렬화한다 — 행당
+ * 호출.
+ * develop: qfile_slot_read_column_value (…, func_state->func_p->domain, …) — 컴파일 도메인으로 읽었다.
+ * 이 PR: func_state->vd 로 qexec_get_node_domain(…, func_p->domain, func_p->plan_item) 을 구해 그 도메인으로 읽는다.
+ * 바뀐 것: 도메인 조회 교체(+1줄, 지역변수 1개).
  */
 static int
 qexec_analytic_sort_key_header_load (ANALYTIC_FUNCTION_STATE * func_state, bool load_value)
@@ -23703,6 +24075,14 @@ qexec_analytic_group_header_next (THREAD_ENTRY * thread_p, ANALYTIC_FUNCTION_STA
  *
  *   Note: Scan the last group from intermediary file and add up to date
  *         analytic result into output file
+ */
+/*
+ * [리뷰] qexec_analytic_update_group_result — qexec_execute_analytic 이 한 그룹을 다 읽은 뒤 부른다 — 그룹 행들을 다시 훑어 각 튜플에 분석
+ * 함수 값을 채워 출력 리스트에 쓴다.
+ * develop: PT_MEDIAN/PT_PERCENTILE_CONT/PT_PERCENTILE_DISC 분기에서 qexec_analytic_evaluate_interpolation_function
+ * (thread_p, func_state) 를 불렀다.
+ * 이 PR: &xasl_state->vd 를 추가로 넘긴다 — 보간 평가가 실행 descriptor 를 받게 하는 호출부 반영.
+ * 바뀐 것: 인자 1개 추가(1줄).
  */
 static int
 qexec_analytic_update_group_result (THREAD_ENTRY * thread_p, ANALYTIC_STATE * analytic_state)
@@ -23996,6 +24376,14 @@ cleanup:
  *   thread_p (in) : thread pointer
  *   xasl (in) : xasl tree
  *   xasl_state (in) : xasl state
+ */
+/*
+ * [리뷰] qexec_analytic_eval_in_processing — qexec_intprt_fnc / qexec_end_one_iteration 이 스캔 도중 부른다 — 정렬 없이 처리
+ * 가능한 분석 함수를 행 단위로 누적하고 그룹 경계에서 마감·재초기화한다.
+ * develop: qdata_finalize_analytic_func(…, is_same_group) 와 qdata_initialize_analytic_func(…, query_id) 를 vd
+ * 없이 불렀다.
+ * 이 PR: 두 호출 모두 &xasl_state->vd 를 추가로 넘긴다.
+ * 바뀐 것: 인자 추가 2곳(+1줄).
  */
 static int
 qexec_analytic_eval_in_processing (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state)
@@ -26405,6 +26793,14 @@ error_return:
  * is_scan_needed (in/out) : whether or not scan is still needed after
  *			     evaluation
  */
+/*
+ * [리뷰] qexec_evaluate_partition_aggregates — qexec_evaluate_aggregates_optimize 가 파티션 테이블의 MIN/MAX/COUNT 를
+ * 인덱스로 바로 구할 수 있을 때 부른다 — 파티션 계층을 돌며 집계를 평가하고, 실패하면 agg_optimized 를 꺼 일반 경로로 되돌린다.
+ * develop: qdata_evaluate_aggregate_hierarchy (thread_p, agg_ptr, hfid, &root_btid, &helpers[i]) — vd 인자가 없었다.
+ * 이 PR: 마지막 인자로 NULL 을 넘긴다. 호출된 쪽은 qexec_get_node_domain(vd=NULL, …) 가 -1 을 돌려주어 컴파일 도메인을 쓰게 되고, 주석은 '최적화된 집계는
+ * 컬럼만 읽으므로 읽을 실행 도메인이 없다'고 적는다.
+ * 바뀐 것: 인자 1개(NULL) 추가(+2줄).
+ */
 static int
 qexec_evaluate_partition_aggregates (THREAD_ENTRY * thread_p, ACCESS_SPEC_TYPE * spec, AGGREGATE_TYPE * agg_list,
 				     bool * is_scan_needed)
@@ -26708,6 +27104,14 @@ qexec_evaluate_aggregates_optimize (THREAD_ENTRY * thread_p, AGGREGATE_TYPE * ag
  * a key over a session variable read too. A NULL-only column compares its NULLs before any domain is
  * read.
  */
+/*
+ * [리뷰] qexec_topn_sort_domains — qexec_setup_topn_proc 이 top-N 힙을 만들기 전에 한 번 부르는 static 헬퍼 — ORDER BY 키마다 비교에
+ * 쓸 도메인을 배열(domains)에 채운다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 은 이 결정을 비교 때마다(qexec_topn_cmpval 안에서) 했다.
+ * 이 PR: 키 도메인이 variable 이면 qexec_plan_domain 으로, 그것도 없으면 qexec_null_bind_domain 으로 계획의 도메인을 한 번 읽어 둔다. 끝까지 없으면
+ * NULL 로 남고, 비교는 tp_value_compare 로 떨어진다.
+ * 바뀐 것: 신설(+29줄). 행마다 하던 도메인 판정을 셋업 1회로 끌어올린 자리다.
+ */
 static void
 qexec_topn_sort_domains (const VAL_DESCR * vd, SORT_LIST * sort_items, const TP_DOMAIN ** domains)
 {
@@ -26733,6 +27137,16 @@ qexec_topn_sort_domains (const VAL_DESCR * vd, SORT_LIST * sort_items, const TP_
  * thread_p (in) :
  * xasl (in) :
  * vd (in) :
+ */
+/*
+ * [리뷰] qexec_setup_topn_proc — ORDER BY … LIMIT 를 힙으로 처리할 수 있는지 판정하고 TOPN_TUPLES 를 할당해 xasl->topn_items 에 건다 —
+ * mainblock_internal 과 PX 스캔의 result_handler::write_initialize 가 부른다.
+ * develop: outptr_list 의 각 value.domain 을 직접 보고 NULL/집합타입/부동정밀도 판정과 메모리 추정을 했고, top_n 은 sizeof(TOPN_TUPLES)
+ * 만큼만 db_private_alloc 했다.
+ * 이 PR: 도메인을 qexec_get_node_domain (vd, value.domain, value.plan_item) 으로 구해 같은 판정을 한다. orderby_list 길이만큼
+ * TP_DOMAIN* 공간을 뒤에 붙여 한 블록으로 할당하고 top_n->sort_domains 를 그 꼬리에 가리킨 뒤 qexec_topn_sort_domains 로 채운다.
+ * top_n->sort_items = xasl->orderby_list 이므로 배열 인덱스가 키 순서와 일치한다.
+ * 바뀐 것: 도메인 조회 교체 3곳 + 가변길이 단일 할당·배열 초기화 추가(+10줄). 한 블록이라 기존 top_n 해제 경로가 도메인 배열도 같이 해제한다.
  */
 int
 qexec_setup_topn_proc (THREAD_ENTRY * thread_p, XASL_NODE * xasl, VAL_DESCR * vd)
@@ -26924,6 +27338,12 @@ error_return:
  * right (in) :
  * arg (in) :
  */
+/*
+ * [리뷰] qexec_topn_compare — top-N 이진 힙의 비교 콜백 — 두 TOPN_TUPLE 을 ORDER BY 키 순서로 비교해 BH_CMP_RESULT 를 돌려준다.
+ * develop: proc->sort_items 를 돌며 qexec_topn_cmpval (left, right, key) 를 불렀고, 도메인 판정은 피호출자가 했다.
+ * 이 PR: 루프에 인덱스 i 를 더해 proc->sort_domains[i] 를 같이 넘긴다 — 셋업 때 정해진 도메인을 그대로 쓴다.
+ * 바뀐 것: 인자 1개 추가 + 인덱스 변수(+1줄). 힙 비교 핫패스.
+ */
 static BH_CMP_RESULT
 qexec_topn_compare (const void *left, const void *right, BH_CMP_ARG arg)
 {
@@ -26957,6 +27377,15 @@ qexec_topn_compare (const void *left, const void *right, BH_CMP_ARG arg)
  * sort_spec (in): sort spec for left and right
  *
  * Note: tp_value_compare is too complex for our case
+ */
+/*
+ * [리뷰] qexec_topn_cmpval — top-N 키 하나의 값 두 개를 비교해 BH_CMP_RESULT 를 돌려주는 행당 비교 함수 — qexec_topn_compare 와
+ * qexec_add_tuple_to_topn 이 부른다.
+ * develop: 비교할 때마다 sort_spec->pos_descr.dom 의 타입이 DB_TYPE_VARIABLE 인지, collation flag 가 TP_DOMAIN_COLL_NORMAL
+ * 이 아닌지 검사해 그러면 tp_value_compare, 아니면 dom->type->cmpval 로 갈라졌다.
+ * 이 PR: 도메인을 인자로 받는다. domain == NULL 이면 tp_value_compare, 아니면 domain->type->cmpval (…, domain->collation_id).
+ * 결정은 qexec_topn_sort_domains 가 미리 해 두었다.
+ * 바뀐 것: 시그니처 +1 인자, 행당 두 번의 도메인 플래그 검사를 포인터 NULL 검사 하나로 교체(-2줄).
  */
 static BH_CMP_RESULT
 qexec_topn_cmpval (DB_VALUE * left, DB_VALUE * right, SORT_LIST * sort_spec, const TP_DOMAIN * domain)
@@ -27029,6 +27458,14 @@ qexec_topn_cmpval (DB_VALUE * left, DB_VALUE * right, SORT_LIST * sort_spec, con
  *
  * Note: We only add a tuple here if the top-n heap has fewer than n elements
  *  or if the new tuple can replace one of the existing tuples
+ */
+/*
+ * [리뷰] qexec_add_tuple_to_topn — 스캔이 만든 튜플을 top-N 힙에 넣을지 판정해 넣거나 버린다 — qexec_end_one_iteration 과 PX
+ * result_handler::write 가 부르는 행당 함수.
+ * develop: topn_items->sort_items 를 돌며 qexec_topn_cmpval (&heap_max->values[pos], tpldescr->f_valp[pos], key)
+ * 로 힙 최대값과 비교했다.
+ * 이 PR: 루프에 인덱스 i 를 더해 topn_items->sort_domains[i] 를 같이 넘긴다.
+ * 바뀐 것: 인자 1개 추가 + 인덱스 변수(+1줄).
  */
 TOPN_STATUS
 qexec_add_tuple_to_topn (THREAD_ENTRY * thread_p, TOPN_TUPLES * topn_items, QFILE_TUPLE_DESCRIPTOR * tpldescr)
@@ -27360,6 +27797,18 @@ qexec_clear_topn_tuple (THREAD_ENTRY * thread_p, TOPN_TUPLE * tuple, int count)
  * vd (in)	   : value descriptor
  * ubound (in/out) : upper bound
  */
+/*
+ * [리뷰] qexec_get_orderbynum_upper_bound — qexec_setup_topn_proc 가 TOP-N 처리를 켤지 정하려고 부르는 함수로, orderby_num
+ * 술어(AND 트리와 비교항)를 재귀로 훑어 이번 실행의 상한값을 ubound 에 담아 돌려준다.
+ * develop: AND 양쪽 상한을 재귀로 구한 뒤 tp_value_compare (&left_bound, &right_bound, 1, 1) 로 큰 쪽을 골랐고, R_LT 이면
+ * qdata_subtract_dbval (val, &one_val, ubound, rhs->domain) 로 컴파일 도메인에 맞춰 1 을 뺐다 — 뺄셈 피연산자의 타입 맞추기는
+ * qdata_subtract_dbval 안에서 행 시점에 일어났다.
+ * 이 PR: 비교는 키 쌍 표를 쓰는 domain_compare_by_type_pair (&left_bound, &right_bound, 1, 1, NULL) 로 바뀌었고, R_LT 경로는 두
+ * 피연산자 타입으로 domain_resolve_operand_coercion (T_SUB, operands, &operand_coercion) 을 한 번 돌려 얻은
+ * conv·operand_domain 을 qdata_coerce_arith_operands 에 넘긴다. 결과 도메인도 qexec_get_node_domain (vd, rhs->domain,
+ * rhs->plan_item) 으로 이번 실행이 확정한 것을 읽는다.
+ * 바뀐 것: 호출 2개 교체 + 피연산자 coercion 해석 블록 삽입(약 +12줄). 시그니처·분기 구조는 그대로.
+ */
 static int
 qexec_get_orderbynum_upper_bound (THREAD_ENTRY * thread_p, PRED_EXPR * pred, VAL_DESCR * vd, DB_VALUE * ubound)
 {
@@ -27678,6 +28127,17 @@ qexec_alloc_agg_hash_context_buildlist_xasl (THREAD_ENTRY * thread_p, xasl_node 
  *   thread_p(in): thread
  *   proc(in): buildlist
  *   xasl_state(in): XASL state
+ */
+/*
+ * [리뷰] qexec_alloc_agg_hash_context — 해시 GROUP BY 를 켤 때 qexec_initialize_groupby_state 가 부르는 준비 함수 — 해시 테이블,
+ * 부분/정렬 리스트 파일, 정렬 키, 키 도메인 배열을 만들어 proc->agg_hash_context 에 채우고 NO_ERROR 를 돌려준다.
+ * develop: key_domains[i] 와 type_list.domp[] 에 regu 의 컴파일 도메인(regu_list->value.domain)을 그대로 넣었다. sort_key 는
+ * key/nkeys 두 필드를 직접 NULL/0 으로 놓았고, 두 부분 리스트의 tpl_descr.f_valp 는 malloc (sizeof (DB_VALUE) * type_cnt) 로 직접 잡고
+ * OOM 에러도 직접 set 했다(포인터 배열을 DB_VALUE 크기로 잡는 과대할당, f_len 은 없었다).
+ * 이 PR: 두 도메인 배열 모두 qexec_get_node_domain (&xasl_state->vd, …, plan_item) 으로 이번 실행이 확정한 도메인을 읽는다. 초기화·할당은 공용
+ * 헬퍼로 — qfile_init_empty_sort_key_info, qfile_tpl_descr_alloc_values (f_valp[n] + f_len[n] 을 한 블록으로),
+ * input_tuple 은 QFILE_TUPLE_RECORD_INITIALIZER.
+ * 바뀐 것: 도메인 읽기 2곳 교체 + 초기화·할당 4곳을 헬퍼로 치환(약 -14/+10줄). 시그니처 동일.
  */
 static int
 qexec_alloc_agg_hash_context (THREAD_ENTRY * thread_p, BUILDLIST_PROC_NODE * proc, XASL_STATE * xasl_state,
@@ -28141,6 +28601,16 @@ qexec_locate_agg_hentry_in_list (THREAD_ENTRY * thread_p, AGGREGATE_HASH_CONTEXT
   return (context->part_scan_code == S_ERROR ? ER_FAILED : NO_ERROR);
 }
 
+/*
+ * [리뷰] qexec_execute_subquery_for_result_cache — 결과 캐시가 걸린 서브쿼리를 실행 대신 캐시 조회로 때우는 함수 —
+ * qexec_execute_mainblock_internal 이 부르고, xcache 에서 XASL 엔트리를 찾아 호스트 변수 값으로 리스트 캐시를 조회해 xasl->list_id 에 복사한다.
+ * develop: 캐시 조회 키를 xasl_state->vd.dbval_ptr[host_var_index[i]] 에서 읽었다. dbval_p 의 malloc 실패를 검사하지 않아 OOM 이면
+ * NULL 을 역참조하고 ent 도 unfix 되지 않았다.
+ * 이 PR: 키를 xasl_state->resolved_domain.in[host_var_index[i]] 에서 읽는다 — RESOLVED_DOMAIN_TABLE.in 은 qmgr 이 복사한
+ * 클라이언트 원본 값이고 vals(= vd.dbval_ptr)는 게이트가 변환까지 끝낸 값이라, qmgr_process_query 가 캐시를 저장한 기준과 같아진다. malloc 실패 시
+ * xcache_unfix 후 ER_OUT_OF_VIRTUAL_MEMORY 를 돌려준다.
+ * 바뀐 것: 입력 출처 1줄 교체 + OOM 분기 추가(+10줄). 시그니처 동일.
+ */
 int
 qexec_execute_subquery_for_result_cache (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state)
 {

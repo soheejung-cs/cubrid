@@ -281,6 +281,12 @@ julian_decode (int jul, int *monthp, int *dayp, int *yearp, int *weekp)
  * day(in): day (1 - 31)
  * year(in):
  */
+/*
+ * [리뷰] db_date_encode_core — 월/일/연을 검사해 `DB_DATE`(율리우스 일자)로 인코딩한다. 날짜 리터럴·CAST 의 최종 관문.
+ * develop: `db_date_encode`(db_date.c:275 영역) 본체. 범위를 벗어나면 `er_set (… ER_DATE_CONVERSION …)` 을 3곳에서 호출했다.
+ * 이 PR: `_core` 로 개명 + `date_conversion_error *` 수용, 3곳을 `date_error->set` 으로 바꿨다.
+ * 바뀐 것: 시그니처 +1 인자, `er_set` 3곳 교체.
+ */
 int
 db_date_encode_core (DB_DATE * date, int month, int day, int year, date_conversion_error * date_error)
 {
@@ -322,6 +328,13 @@ db_date_encode_core (DB_DATE * date, int month, int day, int year, date_conversi
   return NO_ERROR;
 }
 
+/*
+ * [리뷰] db_date_encode — 월/일/연 → `DB_DATE` 인코딩의 공개 진입점(db_date.h).
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 같은 이름이 본체였고, 그 본체가 `_core` 로 옮겨갔다.
+ * 이 PR: 스택에 `date_conversion_error` 를 하나 만들어 `db_date_encode_core` 에 넘기고, 돌아온 뒤 `error.publish ()` 로 기록된 에러
+ * 하나를 그제서야 `er_set`/`er_clear` 한다. 반환값은 core 의 것을 그대로 돌려준다.
+ * 바뀐 것: 신설 8~12줄짜리 얇은 래퍼. 계산 코드는 없고 '에러를 언제 발행하나'만 담당한다 — 발행 지점이 이 한 곳으로 모인다.
+ */
 int
 db_date_encode (DB_DATE * date, int month, int day, int year)
 {
@@ -385,6 +398,12 @@ encode_time (int hour, int minute, int second)
  * minute(in): minute
  * second(in): second
  */
+/*
+ * [리뷰] db_time_encode_core — 시/분/초를 검사해 `DB_TIME`(자정부터의 초)으로 인코딩한다.
+ * develop: `db_time_encode` 본체. `er_set (… ER_TIME_CONVERSION …)` 2곳.
+ * 이 PR: `_core` 로 개명 + `date_conversion_error *` 수용, 2곳 교체.
+ * 바뀐 것: 시그니처 +1 인자, `er_set` 2곳 교체.
+ */
 int
 db_time_encode_core (DB_TIME * timeval, int hour, int minute, int second, date_conversion_error * date_error)
 {
@@ -408,6 +427,13 @@ db_time_encode_core (DB_TIME * timeval, int hour, int minute, int second, date_c
   return NO_ERROR;
 }
 
+/*
+ * [리뷰] db_time_encode — 시/분/초 → `DB_TIME` 인코딩의 공개 진입점.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 같은 이름이 본체였고, 그 본체가 `_core` 로 옮겨갔다.
+ * 이 PR: 스택에 `date_conversion_error` 를 하나 만들어 `db_time_encode_core` 에 넘기고, 돌아온 뒤 `error.publish ()` 로 기록된 에러
+ * 하나를 그제서야 `er_set`/`er_clear` 한다. 반환값은 core 의 것을 그대로 돌려준다.
+ * 바뀐 것: 신설 8~12줄짜리 얇은 래퍼. 계산 코드는 없고 '에러를 언제 발행하나'만 담당한다 — 발행 지점이 이 한 곳으로 모인다.
+ */
 int
 db_time_encode (DB_TIME * timeval, int hour, int minute, int second)
 {
@@ -621,6 +647,12 @@ db_timestamp_encode (DB_TIMESTAMP * utime, DB_DATE * date, DB_TIME * timeval)
  * dest_tz_id(out): pointer to packed timezone identifier of the result
  *		    (can be NULL, in which case no identifier is provided)
  */
+/*
+ * [리뷰] db_timestamp_encode_ses_core — 세션 타임존 기준으로 DATE+TIME 을 UTC TIMESTAMP 로 인코딩하고, 확정된 `TZ_ID` 도 선택적으로 돌려준다.
+ * develop: `db_timestamp_encode_ses` 본체. 세션 리전을 얻어 발행형 `db_timestamp_encode_w_reg` 로 위임했다.
+ * 이 PR: `_core` 로 개명 + `date_conversion_error *` 수용, 위임 대상을 `db_timestamp_encode_w_reg_core` 로 바꿨다.
+ * 바뀐 것: 시그니처 +1 인자, 위임 호출 1곳 교체. 9줄짜리 위임 함수라 그 밖엔 변화 없음.
+ */
 int
 db_timestamp_encode_ses_core (const DB_DATE * date, const DB_TIME * timeval, DB_TIMESTAMP * utime, TZ_ID * dest_tz_id,
 			      date_conversion_error * date_error)
@@ -631,6 +663,13 @@ db_timestamp_encode_ses_core (const DB_DATE * date, const DB_TIME * timeval, DB_
   return db_timestamp_encode_w_reg_core (date, timeval, &ses_tz_region, utime, dest_tz_id, date_error);
 }
 
+/*
+ * [리뷰] db_timestamp_encode_ses — 세션 타임존 기준 TIMESTAMP 인코딩의 공개 진입점.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 같은 이름이 본체였고, 그 본체가 `_core` 로 옮겨갔다.
+ * 이 PR: 스택에 `date_conversion_error` 를 하나 만들어 `db_timestamp_encode_ses_core` 에 넘기고, 돌아온 뒤 `error.publish ()` 로
+ * 기록된 에러 하나를 그제서야 `er_set`/`er_clear` 한다. 반환값은 core 의 것을 그대로 돌려준다.
+ * 바뀐 것: 신설 8~12줄짜리 얇은 래퍼. 계산 코드는 없고 '에러를 언제 발행하나'만 담당한다 — 발행 지점이 이 한 곳으로 모인다.
+ */
 int
 db_timestamp_encode_ses (const DB_DATE * date, const DB_TIME * timeval, DB_TIMESTAMP * utime, TZ_ID * dest_tz_id)
 {
@@ -668,6 +707,15 @@ db_timestamp_encode_sys (const DB_DATE * date, const DB_TIME * timeval, DB_TIMES
  * date(in): encoded julian date
  * time(in): relative time
  * utime(out): pointer to universal time value
+ */
+/*
+ * [리뷰] db_timestamp_encode_utc_core — UTC DATE+TIME 을 epoch 초(`DB_TIMESTAMP`)로 인코딩하고 1970~2038 범위를 강제한다.
+ * TIMESTAMP 로 들어가는 모든 값이 여기서 걸린다.
+ * develop: `db_timestamp_encode_utc` 본체(db_date.c:635 영역). 범위 밖이면 `er_set (ER_WARNING_SEVERITY, …
+ * ER_DATE_CONVERSION …)` 2곳.
+ * 이 PR: `_core` 로 개명 + `date_conversion_error *` 수용, 2곳을 `date_error->set` 으로. **심각도 `ER_WARNING_SEVERITY` 가
+ * 운반체에 그대로 실린다** — publish 가 그 심각도로 재현한다.
+ * 바뀐 것: 시그니처 +1 인자, `er_set` 2곳 교체.
  */
 int
 db_timestamp_encode_utc_core (const DB_DATE * date, const DB_TIME * timeval, DB_TIMESTAMP * utime,
@@ -735,6 +783,13 @@ db_timestamp_encode_utc_core (const DB_DATE * date, const DB_TIME * timeval, DB_
   return NO_ERROR;
 }
 
+/*
+ * [리뷰] db_timestamp_encode_utc — UTC TIMESTAMP 인코딩의 공개 진입점.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 같은 이름이 본체였고, 그 본체가 `_core` 로 옮겨갔다.
+ * 이 PR: 스택에 `date_conversion_error` 를 하나 만들어 `db_timestamp_encode_utc_core` 에 넘기고, 돌아온 뒤 `error.publish ()` 로
+ * 기록된 에러 하나를 그제서야 `er_set`/`er_clear` 한다. 반환값은 core 의 것을 그대로 돌려준다.
+ * 바뀐 것: 신설 8~12줄짜리 얇은 래퍼. 계산 코드는 없고 '에러를 언제 발행하나'만 담당한다 — 발행 지점이 이 한 곳으로 모인다.
+ */
 int
 db_timestamp_encode_utc (const DB_DATE * date, const DB_TIME * timeval, DB_TIMESTAMP * utime)
 {
@@ -755,6 +810,15 @@ db_timestamp_encode_utc (const DB_DATE * date, const DB_TIME * timeval, DB_TIMES
  * utime(out): pointer to universal time value
  * dest_tz_id(out): pointer to packed timezone identifier of the result
 *		    (can be NULL, in which case no identifier is provided)
+ */
+/*
+ * [리뷰] db_timestamp_encode_w_reg_core — 임의 `TZ_REGION` 기준으로 DATE+TIME 을 UTC TIMESTAMP 로 인코딩한다 — 리전 변환 뒤 UTC
+ * 인코딩 2단계.
+ * develop: `db_timestamp_encode_w_reg` 본체, static. 발행형
+ * `tz_conv_tz_datetime_w_region`·`db_timestamp_encode_utc` 를 불렀다.
+ * 이 PR: `_core` 로 개명 + `date_conversion_error *` 수용, 두 하위 호출 모두 `_core` 형. 파일 선두에 `_core` 의 static 선언이
+ * 추가됐다(db_date.c:113 영역).
+ * 바뀐 것: 시그니처 +1 인자, 하위 호출 2곳 교체, 전방 선언 +4줄.
  */
 static int
 db_timestamp_encode_w_reg_core (const DB_DATE * date, const DB_TIME * timeval, const TZ_REGION * tz_region,
@@ -800,6 +864,15 @@ db_timestamp_encode_w_reg_core (const DB_DATE * date, const DB_TIME * timeval, c
   return db_timestamp_encode_utc_core (&utc_date, &utc_time, utime, date_error);
 }
 
+/*
+ * [리뷰] db_timestamp_encode_w_reg — 리전 기준 TIMESTAMP 인코딩의 **파일 내부(static)** 진입점. `db_timestamp_encode` 등 발행이 필요한
+ * 호출자가 쓴다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 같은 이름이 본체였고, 그 본체가 `_core` 로 옮겨갔다.
+ * 이 PR: 스택에 `date_conversion_error` 를 하나 만들어 `db_timestamp_encode_w_reg_core` 에 넘기고, 돌아온 뒤 `error.publish ()`
+ * 로 기록된 에러 하나를 그제서야 `er_set`/`er_clear` 한다. 반환값은 core 의 것을 그대로 돌려준다.
+ * 바뀐 것: 신설 8~12줄짜리 얇은 래퍼. 계산 코드는 없고 '에러를 언제 발행하나'만 담당한다 — 발행 지점이 이 한 곳으로 모인다. develop 에서 이 이름이 static 이었으므로
+ * 래퍼도 static 이다.
+ */
 static int
 db_timestamp_encode_w_reg (const DB_DATE * date, const DB_TIME * timeval, const TZ_REGION * tz_region,
 			   DB_TIMESTAMP * utime, TZ_ID * dest_tz_id)
@@ -819,6 +892,12 @@ db_timestamp_encode_w_reg (const DB_DATE * date, const DB_TIME * timeval, const 
  * date(out): return julian date or zero date
  * time(out): return relative time
  */
+/*
+ * [리뷰] db_timestamp_decode_ses_core — UTC TIMESTAMP 를 세션 타임존의 DATE+TIME 으로 푼다.
+ * develop: `db_timestamp_decode_ses` 본체. 발행형 `db_timestamp_decode_w_reg` 로 위임.
+ * 이 PR: `_core` 로 개명 + `date_conversion_error *` 수용, `db_timestamp_decode_w_reg_core` 로 위임.
+ * 바뀐 것: 시그니처 +1 인자, 위임 호출 1곳 교체.
+ */
 int
 db_timestamp_decode_ses_core (const DB_TIMESTAMP * utime, DB_DATE * date, DB_TIME * timeval,
 			      date_conversion_error * date_error)
@@ -829,6 +908,13 @@ db_timestamp_decode_ses_core (const DB_TIMESTAMP * utime, DB_DATE * date, DB_TIM
   return db_timestamp_decode_w_reg_core (utime, &ses_tz_region, date, timeval, date_error);
 }
 
+/*
+ * [리뷰] db_timestamp_decode_ses — 세션 타임존 기준 TIMESTAMP 디코딩의 공개 진입점.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 같은 이름이 본체였고, 그 본체가 `_core` 로 옮겨갔다.
+ * 이 PR: 스택에 `date_conversion_error` 를 하나 만들어 `db_timestamp_decode_ses_core` 에 넘기고, 돌아온 뒤 `error.publish ()` 로
+ * 기록된 에러 하나를 그제서야 `er_set`/`er_clear` 한다. 반환값은 core 의 것을 그대로 돌려준다.
+ * 바뀐 것: 신설 8~12줄짜리 얇은 래퍼. 계산 코드는 없고 '에러를 언제 발행하나'만 담당한다 — 발행 지점이 이 한 곳으로 모인다.
+ */
 int
 db_timestamp_decode_ses (const DB_TIMESTAMP * utime, DB_DATE * date, DB_TIME * timeval)
 {
@@ -892,6 +978,13 @@ db_timestamp_decode_utc (const DB_TIMESTAMP * utime, DB_DATE * date, DB_TIME * t
  * tz_region(in): timezone region of destination date and time
  * date(out): return julian date or zero date
  * time(out): return relative time
+ */
+/*
+ * [리뷰] db_timestamp_decode_w_reg_core — UTC TIMESTAMP 를 임의 리전의 DATE+TIME 으로 푼다. 실패하면 0 날짜/0 시각을 채운다.
+ * develop: `db_timestamp_decode_w_reg` 본체이자 **`db_date.h` 에 공개돼 있던 함수**(develop db_date.h:70). 발행형
+ * `tz_conv_tz_datetime_w_region` 호출.
+ * 이 PR: `_core` 만 남고 레거시 이름은 **헤더와 함께 삭제됐다**. 남은 호출자는 db_date.c 내부와 object_domain_convert.cpp 뿐이다.
+ * 바뀐 것: 시그니처 +1 인자, 하위 호출 1곳 교체, **공개 진입점 1개 삭제**(db_date.h −2줄). 발행형 래퍼를 일부러 만들지 않았다.
  */
 int
 db_timestamp_decode_w_reg_core (const DB_TIMESTAMP * utime, const TZ_REGION * tz_region, DB_DATE * date,
@@ -970,6 +1063,13 @@ db_timestamp_decode_w_reg_core (const DB_TIMESTAMP * utime, const TZ_REGION * tz
  * date(out): return julian date or zero date
  * time(out): return relative time
  */
+/*
+ * [리뷰] db_timestamp_decode_w_tz_id_core — UTC TIMESTAMP 를 주어진 `TZ_ID` 의 DATE+TIME 으로 푼다. TIMESTAMPTZ 출력·비교가
+ * 행마다 탄다.
+ * develop: `db_timestamp_decode_w_tz_id` 본체(db_date.c:902 영역). 발행형 `tz_utc_datetimetz_to_local` 호출.
+ * 이 PR: `_core` 로 개명 + `date_conversion_error *` 수용, `tz_utc_datetimetz_to_local_core` 호출.
+ * 바뀐 것: 시그니처 +1 인자, 하위 호출 1곳 교체.
+ */
 int
 db_timestamp_decode_w_tz_id_core (const DB_TIMESTAMP * utime, const TZ_ID * tz_id, DB_DATE * date, DB_TIME * timeval,
 				  date_conversion_error * date_error)
@@ -1027,6 +1127,13 @@ db_timestamp_decode_w_tz_id_core (const DB_TIMESTAMP * utime, const TZ_ID * tz_i
   return err;
 }
 
+/*
+ * [리뷰] db_timestamp_decode_w_tz_id — TZ_ID 기준 TIMESTAMP 디코딩의 공개 진입점.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 같은 이름이 본체였고, 그 본체가 `_core` 로 옮겨갔다.
+ * 이 PR: 스택에 `date_conversion_error` 를 하나 만들어 `db_timestamp_decode_w_tz_id_core` 에 넘기고, 돌아온 뒤 `error.publish
+ * ()` 로 기록된 에러 하나를 그제서야 `er_set`/`er_clear` 한다. 반환값은 core 의 것을 그대로 돌려준다.
+ * 바뀐 것: 신설 8~12줄짜리 얇은 래퍼. 계산 코드는 없고 '에러를 언제 발행하나'만 담당한다 — 발행 지점이 이 한 곳으로 모인다.
+ */
 int
 db_timestamp_decode_w_tz_id (const DB_TIMESTAMP * utime, const TZ_ID * tz_id, DB_DATE * date, DB_TIME * timeval)
 {
@@ -3011,6 +3118,13 @@ parse_timedate_separated (char const *str, char const *strend, DB_DATE * date, u
  * time(out):	the converted time.
  * millisecond(out):   the milliseconds part of the converted time
  */
+/*
+ * [리뷰] db_date_parse_time_core — TIME 문자열을 분리형·압축형 가릴 것 없이 읽어 `DB_TIME`+밀리초로 만든다. 문자열→TIME 캐스트의 파서.
+ * develop: `db_date_parse_time` 본체(db_date.c:2933 영역), 약 215줄. 형식 오류마다 `er_set (… ER_TIME_CONVERSION …)` 을
+ * 11곳에서 호출했다.
+ * 이 PR: `_core` 로 개명 + `date_conversion_error *` 수용, 11곳 전부 `date_error->set`.
+ * 바뀐 것: 시그니처 +1 인자, `er_set` 11곳 교체. 파싱 상태기계는 무변경.
+ */
 int
 db_date_parse_time_core (char const *str, int str_len, DB_TIME * time, int *millisecond,
 			 date_conversion_error * date_error)
@@ -3227,6 +3341,13 @@ db_date_parse_time_core (char const *str, int str_len, DB_TIME * time, int *mill
     }
 }
 
+/*
+ * [리뷰] db_date_parse_time — TIME 문자열 파싱의 공개 진입점.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 같은 이름이 본체였고, 그 본체가 `_core` 로 옮겨갔다.
+ * 이 PR: 스택에 `date_conversion_error` 를 하나 만들어 `db_date_parse_time_core` 에 넘기고, 돌아온 뒤 `error.publish ()` 로 기록된
+ * 에러 하나를 그제서야 `er_set`/`er_clear` 한다. 반환값은 core 의 것을 그대로 돌려준다.
+ * 바뀐 것: 신설 8~12줄짜리 얇은 래퍼. 계산 코드는 없고 '에러를 언제 발행하나'만 담당한다 — 발행 지점이 이 한 곳으로 모인다.
+ */
 int
 db_date_parse_time (char const *str, int str_len, DB_TIME * time, int *millisecond)
 {
@@ -3263,6 +3384,16 @@ db_date_parse_time (char const *str, int str_len, DB_TIME * time, int *milliseco
  *		string that was no longer part of the datetime value to be
  *		read. if given, the pointed value should be NULL before entry
  *		to the function
+ */
+/*
+ * [리뷰] db_date_parse_datetime_parts_core — DATETIME 문자열을 읽어 날짜·시각·밀리초 유무와 'TIMESTAMP 범위에
+ * 들어가나'(`fits_as_timestamp`)까지 한 번에 알려 준다. 문자열→DATE/DATETIME/TIMESTAMP 캐스트가 공유하는 파서.
+ * develop: `db_date_parse_datetime_parts` 본체(db_date.c:3176 영역), 약 237줄. `er_set (… ER_TIMESTAMP_CONVERSION
+ * …)` 7곳 + **`fits_as_timestamp` 시험이 실패했을 때 그 흔적을 지우려는 `er_clear ()` 5곳**.
+ * 이 PR: `_core` 로 개명 + `date_conversion_error *` 수용. `er_set` 7곳 → `date_error->set`, `er_clear` 5곳 →
+ * `date_error->clear`, 범위 시험용 `db_timestamp_encode_utc` 5곳 → `_core` 형.
+ * 바뀐 것: 시그니처 +1 인자, `er_set` 7곳·`er_clear` 5곳·하위 호출 5곳 교체. 지우기가 전역이 아니라 운반체에서 일어나므로, 이 함수 바깥에서 먼저 나 있던 에러는 더
+ * 이상 휩쓸려 지워지지 않는다.
  */
 int
 db_date_parse_datetime_parts_core (char const *str, int str_len, DB_DATETIME * datetime, bool * has_explicit_time,
@@ -3502,6 +3633,13 @@ finalcheck:
   return NO_ERROR;
 }
 
+/*
+ * [리뷰] db_date_parse_datetime_parts — DATETIME 문자열 파싱(세부 정보 포함)의 공개 진입점.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 같은 이름이 본체였고, 그 본체가 `_core` 로 옮겨갔다.
+ * 이 PR: 스택에 `date_conversion_error` 를 하나 만들어 `db_date_parse_datetime_parts_core` 에 넘기고, 돌아온 뒤 `error.publish
+ * ()` 로 기록된 에러 하나를 그제서야 `er_set`/`er_clear` 한다. 반환값은 core 의 것을 그대로 돌려준다.
+ * 바뀐 것: 신설 8~12줄짜리 얇은 래퍼. 계산 코드는 없고 '에러를 언제 발행하나'만 담당한다 — 발행 지점이 이 한 곳으로 모인다.
+ */
 int
 db_date_parse_datetime_parts (char const *str, int str_len, DB_DATETIME * datetime, bool * has_explicit_time,
 			      bool * has_explicit_msec, bool * fits_as_timestamp, char const **endp)
@@ -3524,6 +3662,13 @@ db_date_parse_datetime_parts (char const *str, int str_len, DB_DATETIME * dateti
  * datetime(out):
  *		the read and converted datetime
  */
+/*
+ * [리뷰] db_date_parse_datetime_core — DATETIME 문자열 파서의 얇은 진입점 — `db_date_parse_datetime_parts_core` 에 전부 NULL 을
+ * 넘겨 DATETIME 만 받는다.
+ * develop: `db_date_parse_datetime` 본체이자 **`db_date.h` 공개 함수**(develop db_date.h:58).
+ * 이 PR: `_core` 만 남고 발행형 이름은 헤더와 함께 삭제. 호출자는 db_date.c 내부와 object_domain_convert.cpp 뿐이다.
+ * 바뀐 것: 시그니처 +1 인자, 하위 호출 교체, **공개 진입점 1개 삭제**. 본문은 1줄 위임 그대로.
+ */
 int
 db_date_parse_datetime_core (char const *str, int str_len, DB_DATETIME * datetime, date_conversion_error * date_error)
 {
@@ -3538,6 +3683,15 @@ db_date_parse_datetime_core (char const *str, int str_len, DB_DATETIME * datetim
  * str(in):	the date string or datetime string to be read and converted
  * str_len(in): the length of the string to be converted
  * utime(out):	the converted timestamp read from string
+ */
+/*
+ * [리뷰] db_date_parse_timestamp_core — 문자열을 DATETIME 으로 읽은 뒤 세션 타임존으로 TIMESTAMP 로 인코딩한다. 실패하면
+ * `ER_TIMESTAMP_CONVERSION` 하나로 정리해 돌려준다.
+ * develop: `db_date_parse_timestamp` 본체이자 **`db_date.h` 공개 함수**(develop db_date.h:79). 실패 경로에서 `er_clear ();
+ * er_set (… ER_TIMESTAMP_CONVERSION …)` 쌍을 2번 썼다.
+ * 이 PR: `_core` 만 남고 발행형 이름은 헤더와 함께 삭제. `er_clear`/`er_set` 쌍 2곳이 `date_error->clear()/set()` 으로, 하위 호출 2곳이
+ * `_core` 형으로 바뀌었다.
+ * 바뀐 것: 시그니처 +1 인자, `er_clear` 2곳·`er_set` 2곳·하위 호출 2곳 교체, **공개 진입점 1개 삭제**.
  */
 int
 db_date_parse_timestamp_core (char const *str, int str_len, DB_TIMESTAMP * utime, date_conversion_error * date_error)
@@ -3581,6 +3735,14 @@ db_date_parse_timestamp_core (char const *str, int str_len, DB_TIMESTAMP * utime
  * str(in):	the date or datetime string to be read and converted
  * str_len(in): the length of the string to be converted
  * date(out):	the read and converted date
+ */
+/*
+ * [리뷰] db_date_parse_date_core — 문자열을 DATETIME 으로 읽은 뒤 날짜 부분만 꺼낸다. 시각 성분이 있으면 실패로 보고 `ER_DATE_CONVERSION` 을
+ * 남긴다.
+ * develop: `db_date_parse_date` 본체이자 **`db_date.h` 공개 함수**(develop db_date.h:39). 실패 시 `er_clear (); er_set (…
+ * ER_DATE_CONVERSION …)`.
+ * 이 PR: `_core` 만 남고 발행형 이름은 헤더와 함께 삭제. `clear`+`set` 1쌍과 하위 호출 1곳 교체.
+ * 바뀐 것: 시그니처 +1 인자, `er_clear`/`er_set` 각 1곳·하위 호출 1곳 교체, **공개 진입점 1개 삭제**.
  */
 int
 db_date_parse_date_core (char const *str, int str_len, DB_DATE * date, date_conversion_error * date_error)
@@ -3921,6 +4083,14 @@ db_string_to_timestamp (const char *str, DB_TIMESTAMP * utime)
  *		  otherwise
  * is_cast(in): true if the function is called in a casting context
  */
+/*
+ * [리뷰] db_string_to_timestamptz_ex_core — '2024-01-01 09:00 Asia/Seoul' 같은 문자열을 `DB_TIMESTAMPTZ` 로 만든다. 존 표기가
+ * 있었는지도 `has_zone` 으로 알려 준다.
+ * develop: `db_string_to_timestamptz_ex` 본체(db_date.c:3820 영역). 발행형 `tz_create_timestamptz` 호출 + 남는 문자가 있을 때
+ * `er_set (ER_WARNING_SEVERITY, … ER_DATE_CONVERSION …)`.
+ * 이 PR: `_core` 로 개명 + `date_conversion_error *` 수용, `tz_create_timestamptz_core` 호출, `er_set` 1곳 교체.
+ * 바뀐 것: 시그니처 +1 인자, `er_set` 1곳·하위 호출 1곳 교체.
+ */
 int
 db_string_to_timestamptz_ex_core (const char *str, int str_len, DB_TIMESTAMPTZ * ts_tz, bool * has_zone, bool is_cast,
 				  date_conversion_error * date_error)
@@ -3986,6 +4156,13 @@ error_exit:
   return ER_DATE_CONVERSION;
 }
 
+/*
+ * [리뷰] db_string_to_timestamptz_ex — 문자열 → TIMESTAMPTZ 의 공개 진입점.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 같은 이름이 본체였고, 그 본체가 `_core` 로 옮겨갔다.
+ * 이 PR: 스택에 `date_conversion_error` 를 하나 만들어 `db_string_to_timestamptz_ex_core` 에 넘기고, 돌아온 뒤 `error.publish
+ * ()` 로 기록된 에러 하나를 그제서야 `er_set`/`er_clear` 한다. 반환값은 core 의 것을 그대로 돌려준다.
+ * 바뀐 것: 신설 8~12줄짜리 얇은 래퍼. 계산 코드는 없고 '에러를 언제 발행하나'만 담당한다 — 발행 지점이 이 한 곳으로 모인다.
+ */
 int
 db_string_to_timestamptz_ex (const char *str, int str_len, DB_TIMESTAMPTZ * ts_tz, bool * has_zone, bool is_cast)
 {
@@ -4165,6 +4342,16 @@ db_time_to_string (char *buf, int bufsize, DB_TIME * time)
  * bufsize(in): the size of that buffer
  * utime(in): a pointer to a DB_TIMESTAMP to be printed
  */
+/*
+ * [리뷰] db_timestamp_to_string_core — TIMESTAMP 를 세션 타임존 기준 'YYYY-MM-DD HH:MI:SS' 문자열로 찍는다. 반환값은 **쓴 바이트 수**(0
+ * 이면 버퍼 부족)지 에러 코드가 아니다.
+ * develop: `db_timestamp_to_string` 본체(db_date.c:4054 영역). `(void) db_timestamp_decode_ses (...)` 로 디코드 실패를
+ * 무시했다 — 다만 전역 에러는 남았다.
+ * 이 PR: `_core` 로 개명 + `date_conversion_error *` 수용, `(void) db_timestamp_decode_ses_core (..., date_error)` 로
+ * 바꿔 실패 흔적이 운반체에 남는다.
+ * 바뀐 것: 시그니처 +1 인자, 하위 호출 1곳 교체. 반환값 의미(길이)는 그대로이므로, 래퍼의 `publish()` 가 '성공 길이 + 발행된 에러'를 동시에 내놓는 구조도 develop 과
+ * 같다.
+ */
 int
 db_timestamp_to_string_core (char *buf, int bufsize, DB_TIMESTAMP * utime, date_conversion_error * date_error)
 {
@@ -4192,6 +4379,13 @@ db_timestamp_to_string_core (char *buf, int bufsize, DB_TIMESTAMP * utime, date_
   return m + n;
 }
 
+/*
+ * [리뷰] db_timestamp_to_string — TIMESTAMP → 문자열의 공개 진입점. 반환값은 쓴 바이트 수다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 같은 이름이 본체였고, 그 본체가 `_core` 로 옮겨갔다.
+ * 이 PR: 스택에 `date_conversion_error` 를 하나 만들어 `db_timestamp_to_string_core` 에 넘기고, 돌아온 뒤 `error.publish ()` 로
+ * 기록된 에러 하나를 그제서야 `er_set`/`er_clear` 한다. 반환값은 core 의 것을 그대로 돌려준다.
+ * 바뀐 것: 신설 8~12줄짜리 얇은 래퍼. 계산 코드는 없고 '에러를 언제 발행하나'만 담당한다 — 발행 지점이 이 한 곳으로 모인다.
+ */
 int
 db_timestamp_to_string (char *buf, int bufsize, DB_TIMESTAMP * utime)
 {
@@ -4209,6 +4403,12 @@ db_timestamp_to_string (char *buf, int bufsize, DB_TIMESTAMP * utime)
  * bufsize(in): the size of that buffer
  * utime(in): a pointer to a DB_TIMESTAMP to be printed
  * tz_id(in): reference timezone
+ */
+/*
+ * [리뷰] db_timestamptz_to_string_core — TIMESTAMP+TZ_ID 를 존 표기까지 붙여 문자열로 찍는다. 반환값은 쓴 바이트 수.
+ * develop: `db_timestamptz_to_string` 본체(db_date.c:4090 영역). 발행형 `db_timestamp_decode_w_tz_id` 호출.
+ * 이 PR: `_core` 로 개명 + `date_conversion_error *` 수용, `db_timestamp_decode_w_tz_id_core` 호출.
+ * 바뀐 것: 시그니처 +1 인자, 하위 호출 1곳 교체.
  */
 int
 db_timestamptz_to_string_core (char *buf, int bufsize, DB_TIMESTAMP * utime, const TZ_ID * tz_id,
@@ -4259,6 +4459,13 @@ db_timestamptz_to_string_core (char *buf, int bufsize, DB_TIMESTAMP * utime, con
   return n;
 }
 
+/*
+ * [리뷰] db_timestamptz_to_string — TIMESTAMPTZ → 문자열의 공개 진입점.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 같은 이름이 본체였고, 그 본체가 `_core` 로 옮겨갔다.
+ * 이 PR: 스택에 `date_conversion_error` 를 하나 만들어 `db_timestamptz_to_string_core` 에 넘기고, 돌아온 뒤 `error.publish ()` 로
+ * 기록된 에러 하나를 그제서야 `er_set`/`er_clear` 한다. 반환값은 core 의 것을 그대로 돌려준다.
+ * 바뀐 것: 신설 8~12줄짜리 얇은 래퍼. 계산 코드는 없고 '에러를 언제 발행하나'만 담당한다 — 발행 지점이 이 한 곳으로 모인다.
+ */
 int
 db_timestamptz_to_string (char *buf, int bufsize, DB_TIMESTAMP * utime, const TZ_ID * tz_id)
 {
@@ -4388,6 +4595,15 @@ db_datetime_to_string (char *buf, int bufsize, DB_DATETIME * datetime)
  * dt(in): a pointer to a DB_DATETIME to be printed
  * tz_id(in): zone identifier
  */
+/*
+ * [리뷰] db_datetimetz_to_string_core — DATETIME(UTC)+TZ_ID 를 로컬 벽시계 문자열로 찍는다. 로컬 환산이 실패하면 0 날짜로 떨어뜨리고 에러를 지운 뒤
+ * 계속 찍는다.
+ * develop: `db_datetimetz_to_string` 본체(db_date.c:4258 영역). 발행형
+ * `tz_utc_datetimetz_to_local`·`db_datetime_encode` 를 쓰고, 실패 뒤 `er_clear ()` 로 전역 에러를 지웠다.
+ * 이 PR: `_core` 로 개명 + `date_conversion_error *` 수용. 두 하위 호출이 `_core` 형으로, `er_clear ()` 가 `date_error->clear
+ * ()` 로 바뀌었다.
+ * 바뀐 것: 시그니처 +1 인자, 하위 호출 2곳·`er_clear` 1곳 교체. 지우기 범위가 전역에서 이 운반체로 좁아졌다.
+ */
 int
 db_datetimetz_to_string_core (char *buf, int bufsize, DB_DATETIME * dt, const TZ_ID * tz_id,
 			      date_conversion_error * date_error)
@@ -4429,6 +4645,13 @@ db_datetimetz_to_string_core (char *buf, int bufsize, DB_DATETIME * dt, const TZ
   return n;
 }
 
+/*
+ * [리뷰] db_datetimetz_to_string — DATETIMETZ → 문자열의 공개 진입점.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 같은 이름이 본체였고, 그 본체가 `_core` 로 옮겨갔다.
+ * 이 PR: 스택에 `date_conversion_error` 를 하나 만들어 `db_datetimetz_to_string_core` 에 넘기고, 돌아온 뒤 `error.publish ()` 로
+ * 기록된 에러 하나를 그제서야 `er_set`/`er_clear` 한다. 반환값은 core 의 것을 그대로 돌려준다.
+ * 바뀐 것: 신설 8~12줄짜리 얇은 래퍼. 계산 코드는 없고 '에러를 언제 발행하나'만 담당한다 — 발행 지점이 이 한 곳으로 모인다.
+ */
 int
 db_datetimetz_to_string (char *buf, int bufsize, DB_DATETIME * dt, const TZ_ID * tz_id)
 {
@@ -4551,6 +4774,13 @@ db_string_to_datetime (const char *str, DB_DATETIME * datetime)
  * dt_tz(out): a pointer to a DB_DATETIMETZ to be modified
  * has_zone(out): true if string has valid zone information, false otherwise
  */
+/*
+ * [리뷰] db_string_to_datetimetz_ex_core — 문자열을 `DB_DATETIMETZ` 로 만든다 — 날짜·시각 부분을 먼저 읽고 남은 꼬리를 타임존으로 해석한다.
+ * develop: `db_string_to_datetimetz_ex` 본체(db_date.c:4411 영역). `er_set (ER_WARNING_SEVERITY, …
+ * ER_DATE_CONVERSION …)` 2곳 + 발행형 `tz_create_datetimetz` 호출.
+ * 이 PR: `_core` 로 개명 + `date_conversion_error *` 수용, `er_set` 2곳·하위 호출 1곳 교체.
+ * 바뀐 것: 시그니처 +1 인자, `er_set` 2곳·하위 호출 1곳 교체.
+ */
 int
 db_string_to_datetimetz_ex_core (const char *str, int str_len, DB_DATETIMETZ * dt_tz, bool * has_zone,
 				 date_conversion_error * date_error)
@@ -4611,6 +4841,13 @@ db_string_to_datetimetz_ex_core (const char *str, int str_len, DB_DATETIMETZ * d
   return er_status;
 }
 
+/*
+ * [리뷰] db_string_to_datetimetz_ex — 문자열 → DATETIMETZ 의 공개 진입점.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 같은 이름이 본체였고, 그 본체가 `_core` 로 옮겨갔다.
+ * 이 PR: 스택에 `date_conversion_error` 를 하나 만들어 `db_string_to_datetimetz_ex_core` 에 넘기고, 돌아온 뒤 `error.publish ()`
+ * 로 기록된 에러 하나를 그제서야 `er_set`/`er_clear` 한다. 반환값은 core 의 것을 그대로 돌려준다.
+ * 바뀐 것: 신설 8~12줄짜리 얇은 래퍼. 계산 코드는 없고 '에러를 언제 발행하나'만 담당한다 — 발행 지점이 이 한 곳으로 모인다.
+ */
 int
 db_string_to_datetimetz_ex (const char *str, int str_len, DB_DATETIMETZ * dt_tz, bool * has_zone)
 {
@@ -4704,6 +4941,12 @@ db_datetime_decode (const DB_DATETIME * datetime, int *month, int *day, int *yea
  * second(out): second
  * millisecond(out): millisecond
  */
+/*
+ * [리뷰] db_datetime_encode_core — 시각 부분을 밀리초로 접고 날짜 부분을 `db_date_encode_core` 에 넘겨 `DB_DATETIME` 을 만든다.
+ * develop: `db_datetime_encode` 본체(db_date.c:4552 영역), 2줄. 발행형 `db_date_encode` 호출.
+ * 이 PR: `_core` 로 개명 + `date_conversion_error *` 수용, `db_date_encode_core` 호출.
+ * 바뀐 것: 시그니처 +1 인자, 하위 호출 1곳 교체. 본문 2줄 그대로.
+ */
 int
 db_datetime_encode_core (DB_DATETIME * datetime, int month, int day, int year, int hour, int minute, int second,
 			 int millisecond, date_conversion_error * date_error)
@@ -4712,6 +4955,13 @@ db_datetime_encode_core (DB_DATETIME * datetime, int month, int day, int year, i
   return db_date_encode_core (&datetime->date, month, day, year, date_error);
 }
 
+/*
+ * [리뷰] db_datetime_encode — 연월일시분초밀리 → `DB_DATETIME` 인코딩의 공개 진입점.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 같은 이름이 본체였고, 그 본체가 `_core` 로 옮겨갔다.
+ * 이 PR: 스택에 `date_conversion_error` 를 하나 만들어 `db_datetime_encode_core` 에 넘기고, 돌아온 뒤 `error.publish ()` 로 기록된
+ * 에러 하나를 그제서야 `er_set`/`er_clear` 한다. 반환값은 core 의 것을 그대로 돌려준다.
+ * 바뀐 것: 신설 8~12줄짜리 얇은 래퍼. 계산 코드는 없고 '에러를 언제 발행하나'만 담당한다 — 발행 지점이 이 한 곳으로 모인다.
+ */
 int
 db_datetime_encode (DB_DATETIME * datetime, int month, int day, int year, int hour, int minute, int second,
 		    int millisecond)
@@ -4728,6 +4978,14 @@ db_datetime_encode (DB_DATETIME * datetime, int month, int day, int year, int ho
  * datetime(in):
  * i2(in):
  * result_datetime(out):
+ */
+/*
+ * [리뷰] db_subtract_int_from_datetime_core — DATETIME 에서 밀리초 정수를 뺀다. 언더플로·`DB_BIGINT_MIN` 같은 경계를
+ * `ER_QPROC_TIME_UNDERFLOW` 로 막는다.
+ * develop: `db_subtract_int_from_datetime` 본체(db_date.c:4568 영역). `er_set (… ER_QPROC_TIME_UNDERFLOW …)` 3곳 +
+ * 발행형 `db_add_int_to_datetime` 재귀 호출.
+ * 이 PR: `_core` 로 개명 + `date_conversion_error *` 수용, `er_set` 3곳·상호 재귀 호출 1곳 교체.
+ * 바뀐 것: 시그니처 +1 인자, `er_set` 3곳·하위 호출 1곳 교체.
  */
 int
 db_subtract_int_from_datetime_core (DB_DATETIME * dt1, DB_BIGINT bi2, DB_DATETIME * result_datetime,
@@ -4767,6 +5025,13 @@ db_subtract_int_from_datetime_core (DB_DATETIME * dt1, DB_BIGINT bi2, DB_DATETIM
   return NO_ERROR;
 }
 
+/*
+ * [리뷰] db_subtract_int_from_datetime — DATETIME − 밀리초의 공개 진입점.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 같은 이름이 본체였고, 그 본체가 `_core` 로 옮겨갔다.
+ * 이 PR: 스택에 `date_conversion_error` 를 하나 만들어 `db_subtract_int_from_datetime_core` 에 넘기고, 돌아온 뒤 `error.publish
+ * ()` 로 기록된 에러 하나를 그제서야 `er_set`/`er_clear` 한다. 반환값은 core 의 것을 그대로 돌려준다.
+ * 바뀐 것: 신설 8~12줄짜리 얇은 래퍼. 계산 코드는 없고 '에러를 언제 발행하나'만 담당한다 — 발행 지점이 이 한 곳으로 모인다.
+ */
 int
 db_subtract_int_from_datetime (DB_DATETIME * dt1, DB_BIGINT bi2, DB_DATETIME * result_datetime)
 {
@@ -4782,6 +5047,14 @@ db_subtract_int_from_datetime (DB_DATETIME * dt1, DB_BIGINT bi2, DB_DATETIME * r
  * datetime(in):
  * i2(in):
  * result_datetime(out):
+ */
+/*
+ * [리뷰] db_add_int_to_datetime_core — DATETIME 에 밀리초 정수를 더한다. 타임존 오프셋 적용(`tz_utc_datetimetz_to_local_core`)이 결국
+ * 이 함수를 탄다 — TZ 값 한 건마다 도는 경로.
+ * develop: `db_add_int_to_datetime` 본체(db_date.c:4604 영역). `er_set (… ER_QPROC_TIME_UNDERFLOW …)` 3곳 + 발행형
+ * `db_subtract_int_from_datetime` 호출.
+ * 이 PR: `_core` 로 개명 + `date_conversion_error *` 수용, `er_set` 3곳·상호 재귀 호출 1곳 교체.
+ * 바뀐 것: 시그니처 +1 인자, `er_set` 3곳·하위 호출 1곳 교체. 오버플로 판정식은 무변경.
  */
 int
 db_add_int_to_datetime_core (DB_DATETIME * datetime, DB_BIGINT bi2, DB_DATETIME * result_datetime,
@@ -4822,6 +5095,13 @@ db_add_int_to_datetime_core (DB_DATETIME * datetime, DB_BIGINT bi2, DB_DATETIME 
   return NO_ERROR;
 }
 
+/*
+ * [리뷰] db_add_int_to_datetime — DATETIME + 밀리초의 공개 진입점.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 같은 이름이 본체였고, 그 본체가 `_core` 로 옮겨갔다.
+ * 이 PR: 스택에 `date_conversion_error` 를 하나 만들어 `db_add_int_to_datetime_core` 에 넘기고, 돌아온 뒤 `error.publish ()` 로
+ * 기록된 에러 하나를 그제서야 `er_set`/`er_clear` 한다. 반환값은 core 의 것을 그대로 돌려준다.
+ * 바뀐 것: 신설 8~12줄짜리 얇은 래퍼. 계산 코드는 없고 '에러를 언제 발행하나'만 담당한다 — 발행 지점이 이 한 곳으로 모인다.
+ */
 int
 db_add_int_to_datetime (DB_DATETIME * datetime, DB_BIGINT bi2, DB_DATETIME * result_datetime)
 {

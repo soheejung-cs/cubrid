@@ -26,6 +26,13 @@
 struct xasl_node;
 struct xasl_unpack_info;
 struct regu_variable_node;
+/*
+ * [리뷰] cubxasl — 헤더가 pred_expr 포인터를 시그니처에 쓰기 위한 네임스페이스 전방 선언 — xasl 헤더를 끌어들이지 않고 domain_plan_stream_compares 의
+ * 선언을 가능하게 한다.
+ * develop: develop 에 없음 — domain_plan.h 자체가 이 PR 이 신설한 파일이다.
+ * 이 PR: cubxasl::pred_expr 전방 선언 한 줄.
+ * 바뀐 것: 신설 +4줄. 함수가 아니라 선언이라 팩이 함수로 잡은 것이다.
+ */
 namespace cubxasl
 {
   struct pred_expr;

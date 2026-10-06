@@ -54,6 +54,16 @@ static int qdata_analytic_interpolation (cubthread::entry *thread_p, const VAL_D
  * they require in-place coercion of the fetched value. DISTINCT uses its own
  * list file and is also excluded.
  */
+/*
+ * [리뷰] qdata_analytic_is_plain_sum_avg — 분석 함수 하나가 SUM/AVG 빠른 경로(피연산자를 peek 해 누산기에 바로 더하기)를 쓸 수 있는지 판정한다.
+ * qdata_evaluate_analytic_func 가 행마다 맨 처음 부른다.
+ * develop: (func_p) 만 받아 `func_p->opr_dbtype != DB_TYPE_VARIABLE && TP_DOMAIN_COLLATION_FLAG(func_p->domain)
+ * == NORMAL` 이면 true — 즉 컴파일된 노드 필드만 보고 판정했고, VARIABLE 이면 무조건 느린 경로로 보냈다.
+ * 이 PR: val_desc_p 를 함께 받아 opr_dbtype·domain 을 실행 도메인으로 읽는다. 여전히 VARIABLE/비정상 collation 이면 바로 true 를 주지 않고, 실행
+ * 전 게이트가 그 노드를 이미 해결해 뒀는지(qexec_resolved_domain != NULL) 를 보고 해결돼 있으면 빠른 경로를 허용한다.
+ * 바뀐 것: 시그니처 +val_desc_p, 한 줄 조건식이 2단 판정(실행 도메인 조회 + 해결 여부 확인)으로 분해(+10줄). VARIABLE 함수도 게이트가 해결했으면 빠른 경로에 들어올
+ * 수 있게 된 점이 동작 변화다.
+ */
 static inline bool
 qdata_analytic_is_plain_sum_avg (const ANALYTIC_TYPE *func_p, const VAL_DESCR *val_desc_p)
 {
@@ -81,6 +91,16 @@ qdata_analytic_is_plain_sum_avg (const ANALYTIC_TYPE *func_p, const VAL_DESCR *v
  *   query_id(in): Associated query id
  *   vd(in): Value descriptor
  *
+ */
+/*
+ * [리뷰] qdata_initialize_analytic_func — 분석 함수 노드 하나를 실행 시작 상태로 만든다 — curr_cnt/sum_acc 초기화, COUNT·RANK 계열 초기값,
+ * DISTINCT 면 임시 리스트 파일 생성. qexec_initialize_analytic_function_state 가 부른다.
+ * develop: (thread_p, func_p, query_id). SUM/AVG 를 위한 사전 준비가 전혀 없었고, DISTINCT 리스트 컬럼 도메인은
+ * `func_p->operand.domain` — 컴파일된 피연산자 도메인 — 을 그대로 썼다.
+ * 이 PR: `const VAL_DESCR *vd` 를 받는다. SUM/AVG 면 피연산자 실행 도메인(qexec_value_domain)과 함수 도메인(qexec_resolved_domain →
+ * 없으면 qexec_get_node_domain)으로 **덧셈의 피연산자 변환 규칙을 여기서 한 번 결정해** func_p->info.sum_avg.operand_coercion 에 넣어 둔다(첫
+ * 값이 문자열이면 함수 도메인, 아니면 피연산자 타입이 합의 타입). DISTINCT 리스트 컬럼도 qexec_get_node_domain 으로 연다.
+ * 바뀐 것: 시그니처 +vd. SUM/AVG 변환 규칙 사전 결정 블록 신설(+22줄), 리스트 도메인 출처 1줄 교체. 행 루프에서 매번 하던 결정을 파티션 시작 1회로 끌어올린 자리다.
  */
 int
 qdata_initialize_analytic_func (cubthread::entry *thread_p, ANALYTIC_TYPE *func_p, QUERY_ID query_id,
@@ -171,6 +191,27 @@ qdata_initialize_analytic_func (cubthread::entry *thread_p, ANALYTIC_TYPE *func_
  *   func_p(in): Analytic expression node
  *   vd(in): Value descriptor
  *
+ */
+/*
+ * [리뷰] qdata_evaluate_analytic_func — 분석 함수 하나에 행 하나를 먹인다 — 빠른 SUM/AVG 경로, 피연산자 fetch, DISTINCT 적재,
+ * 함수별(NTILE·FIRST/LAST_VALUE·MIN/MAX·SUM/AVG·RANK·STDDEV·MEDIAN/PERCENTILE) 누적. qexec_analytic_evaluate_* 가 매
+ * 행 부른다.
+ * develop: (thread_p, func_p, val_desc_p). 첫 비NULL 행에서 opr_dbtype 가 VARIABLE 이거나 collation 이 비정상이면 **함수 종류별
+ * switch 로 도메인을 그 행의 값에서 정해 `func_p->domain` 과 `func_p->opr_dbtype` 에 써 넣었다**(COUNT→BIGINT, AVG/STDDEV→DOUBLE,
+ * SUM→값 타입 또는 DOUBLE, MEDIAN→…). MEDIAN/PERCENTILE 의 is_first_exec_time 블록도 opr_dbtype 별 switch 로
+ * func_p->domain 을 정했고, default 분기는 DOUBLE→DATETIME→TIME 캐스케이드 캐스트 후 성공한 도메인을 노드에 대입했다. 이후 분기는 전부
+ * func_p->domain 을 직접 읽었고, SUM/AVG 폴백 덧셈은 qdata_add_dbval 이 변환을 그때그때 결정했다. 캐스트 실패 시 에러를 안 세우고 ER_FAILED 만 돌려
+ * 질의가 조용히 끝나는 경로가 있었다.
+ * 이 PR: 머리에서 domain/opr_type 을 실행 도메인으로 한 번 읽는다. 첫 바인딩에서는 값으로 도메인을 '정하지' 않고 **실행 전 게이트가 정해 둔
+ * qexec_resolved_domain() 을 가져다 쓰며, 그게 없으면 qexec_domain_unresolved() 로 에러**를 낸다(보간 함수만 예외로 아래 경로로 내려간다). 결정된
+ * 도메인은 qexec_set_node_domain/qexec_take_operand_type 으로 실행 슬롯에만 기록하고 func_p->domain 은 그대로 둔다. 캐스트 실패에는 반드시 에러를
+ * 세운다(ER_TP_CANT_COERCE 또는 보간용 ER_ARG_CAN_NOT_BE_CASTED_TO_DESIRED_DOMAIN). SUM/AVG 폴백 덧셈은 initialize 가 만들어 둔
+ * operand_coercion 을 qdata_coerce_arith_operands 로 적용한다. MEDIAN/PERCENTILE 의 is_first_exec_time 블록은 해결된 도메인이
+ * 있으면 그걸 쓰고, 없을 때만 축소된 switch 로 내려가되 캐스케이드 대신 plan_item->fixed.domain 한 번 또는 NULL→DOUBLE 로 끝내고, 그래도 못 정하면
+ * qexec_domain_unresolved 로 에러.
+ * 바뀐 것: 함수 종류별 도메인 결정 switch 전체 삭제(-45줄 가량)와 게이트 조회·에러 경로 신설(+30줄), DOUBLE/DATETIME/TIME 캐스케이드 삭제(-25줄),
+ * func_p->domain 직접 참조 10여 곳을 지역 domain 으로 치환, SUM/AVG 덧셈을 사전 해결 coercion 으로 교체, 빠른 경로 판정 순서를 '행 상태
+ * 먼저(curr_cnt/sum_acc), 함수 판정 나중'으로 재배치. 캐스트 실패 시 에러 누락 버그도 함께 메워졌다.
  */
 int
 qdata_evaluate_analytic_func (cubthread::entry *thread_p, ANALYTIC_TYPE *func_p, VAL_DESCR *val_desc_p)
@@ -864,6 +905,16 @@ exit:
  *   is_same_group(in): Don't deallocate list file
  *
  */
+/*
+ * [리뷰] qdata_finalize_analytic_func — 분석 함수의 파티션(또는 그룹) 끝 처리 — DISTINCT 리스트 정렬·스캔 합산, 누산기 스냅샷, 파티션 경계면
+ * part_value 보관, AVG/STDDEV/VARIANCE 의 나눗셈·제곱근. qexec_analytic_finalize_group 이 부른다.
+ * develop: (thread_p, func_p, is_same_group). DISTINCT 스캔 합산의 결과 도메인을 `tmp_domain_ptr != NULL ? tmp_domain_ptr
+ * : func_p->domain` 로 컴파일 노드에서 읽었고, 보간은 qdata_analytic_interpolation(thread_p, func_p, &scan_id) 로 불렀다.
+ * 이 PR: `const VAL_DESCR *vd` 를 받아 그 한 줄을 qexec_get_node_domain(vd, func_p->domain, func_p->plan_item) 로 바꾸고,
+ * qdata_analytic_interpolation 에도 vd 를 넘긴다. 합산·나눗셈·sqrt 로직 자체는 그대로다.
+ * 바뀐 것: 시그니처 +vd, 도메인 참조 1곳 교체 + 하위 호출 1곳 인자 전달(±4줄). 집계 쪽 finalize 와 달리 여기 합산은 여전히 qdata_add_dbval 이 행마다 변환을
+ * 결정한다.
+ */
 int
 qdata_finalize_analytic_func (cubthread::entry *thread_p, ANALYTIC_TYPE *func_p, bool is_same_group,
 			      const VAL_DESCR *vd)
@@ -1216,6 +1267,18 @@ error:
   return ER_FAILED;
 }
 
+/*
+ * [리뷰] qdata_analytic_interpolation — analytic 그룹이 끝날 때 qdata_finalize_analytic_func 가 부르는 보간 계산기 — 정렬된 리스트
+ * 스캔에서 MEDIAN/PERCENTILE_CONT/DISC 의 분위 위치 값을 ana_p->value 에 채우고 NO_ERROR/에러를 돌려준다.
+ * develop: develop(1205)은 (thread_p, ana_p, scan_id) 3인자였고, 결과 도메인을 &ana_p->domain 으로 넘겨
+ * qdata_get_interpolation_function_result 가 공유 XASL 노드의 domain 필드를 그 자리에서 덮어쓰게 했으며, 성공 시 ana_p->opr_dbtype =
+ * TP_DOMAIN_TYPE (ana_p->domain) 도 노드에 직접 썼다.
+ * 이 PR: const VAL_DESCR *vd 가 인자로 추가됐다. 도메인은 qexec_get_node_domain (vd, ana_p->domain, ana_p->plan_item) 로 이번
+ * 실행의 해결표에서 읽어 지역변수에 담고, 성공 시 qexec_set_node_domain / qexec_take_operand_type 로 그 표에 되쓴다 — 노드는 더 이상 실행 중에 수정되지
+ * 않는다.
+ * 바뀐 것: 시그니처에 vd 추가, 공유 XASL 노드 필드(domain·opr_dbtype) 직접 쓰기를 실행별 표 접근자 호출로 교체(약 +5/-2줄). 이 PR 의 '행은 읽기만' 전환이
+ * analytic 쪽에 적용된 지점.
+ */
 static int
 qdata_analytic_interpolation (cubthread::entry *thread_p, const VAL_DESCR *vd, cubxasl::analytic_list_node *ana_p,
 			      QFILE_LIST_SCAN_ID *scan_id)
