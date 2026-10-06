@@ -378,22 +378,6 @@ qdata_valptr_prog_compile (THREAD_ENTRY * thread_p, valptr_list_node * valptr_li
       return;
     }
 
-  /* An expression over a host variable has no resolved result domain until the interpreted
-   * path evaluates it once (expr_compile.h).  Leave the state untried so this row runs
-   * interpreted and the next one compiles against the domain the interpreter resolved,
-   * instead of declining the whole list for the execution. */
-  if (valptr_list_p->eval_prog_defer < EXPR_DOMAIN_DEFER_ROWS)
-    {
-      for (reg_var_p = valptr_list_p->valptrp; reg_var_p != NULL; reg_var_p = reg_var_p->next)
-	{
-	  if (expr_regu_domain_unresolved (&reg_var_p->value))
-	    {
-	      valptr_list_p->eval_prog_defer++;
-	      return;
-	    }
-	}
-    }
-
   valptr_list_p->eval_prog_state = 2;	/* disabled unless everything below succeeds */
 
   for (reg_var_p = valptr_list_p->valptrp; reg_var_p != NULL; reg_var_p = reg_var_p->next)
@@ -447,73 +431,6 @@ qdata_valptr_prog_compile (THREAD_ENTRY * thread_p, valptr_list_node * valptr_li
   valptr_list_p->eval_prog = prog;
   valptr_list_p->eval_prog_idx = idx;
   valptr_list_p->eval_prog_state = 1;
-
-  /* does any covered column carry a domain the plan could not type?  Such a domain is
-   * resolved per execution and restored at every execution end, so the program has to
-   * resolve it from its own result (qdata_valptr_prog_resolve_domains ()). */
-  valptr_list_p->eval_prog_dom_any = false;
-  valptr_list_p->eval_prog_dom_stamp = 0;
-  for (k = 0, reg_var_p = valptr_list_p->valptrp; reg_var_p != NULL; reg_var_p = reg_var_p->next, k++)
-    {
-      if (idx[k] >= 0 && reg_var_p->value.domain != NULL
-	  && TP_DOMAIN_TYPE (reg_var_p->value.domain) == DB_TYPE_VARIABLE)
-	{
-	  valptr_list_p->eval_prog_dom_any = true;
-	  break;
-	}
-    }
-}
-
-/*
- * qdata_valptr_prog_resolve_domains () - give the columns the plan could not type the
- *					  domain the interpreted path would have resolved
- *
- * The optimizer cannot type an expression over a host variable, so the node's domain stays
- * DB_TYPE_VARIABLE in the plan.  fetch_peek_arith () resolves it from the node's first
- * non-NULL result and qexec_clear_regu_var () restores DB_TYPE_VARIABLE when the execution
- * ends, so the resolution is redone once per execution.  A column served by the program
- * never reaches fetch_peek_arith (), so the same resolution happens here, from the value
- * the program just produced, before the consumer copies it into the tuple.  A row whose
- * value is NULL resolves nothing and leaves the column for the next row, exactly as the
- * interpreted path does.
- */
-static void
-qdata_valptr_prog_resolve_domains (valptr_list_node * valptr_list_p, EXPR_PROG * prog, unsigned long long exec_stamp)
-{
-  REGU_VARIABLE_LIST reg_var_p;
-  bool pending = false;
-  int k;
-
-  for (k = 0, reg_var_p = valptr_list_p->valptrp; reg_var_p != NULL; reg_var_p = reg_var_p->next, k++)
-    {
-      REGU_VARIABLE *regu = &reg_var_p->value;
-      TP_DOMAIN *resolved;
-      DB_VALUE *val;
-
-      if (valptr_list_p->eval_prog_idx[k] < 0 || regu->domain == NULL
-	  || TP_DOMAIN_TYPE (regu->domain) != DB_TYPE_VARIABLE
-	  || TP_DOMAIN_TYPE (regu->domain) != DB_TYPE_VARIABLE)
-	{
-	  continue;
-	}
-      val = expr_prog_value (prog, valptr_list_p->eval_prog_idx[k]);
-      resolved = (val != NULL && !DB_IS_NULL (val)) ? tp_domain_resolve_value (val, NULL) : NULL;
-      if (resolved == NULL || TP_DOMAIN_TYPE (resolved) == DB_TYPE_NULL)
-	{
-	  pending = true;
-	  continue;
-	}
-      regu->domain = resolved;
-      if ((regu->type == TYPE_INARITH || regu->type == TYPE_OUTARITH) && regu->value.arithptr != NULL)
-	{
-	  regu->value.arithptr->domain = resolved;
-	}
-    }
-
-  if (!pending && exec_stamp != 0)
-    {
-      valptr_list_p->eval_prog_dom_stamp = exec_stamp;
-    }
 }
 
 /*
@@ -560,9 +477,6 @@ qdata_valptr_prog_ensure (THREAD_ENTRY * thread_p, valptr_list_node * valptr_lis
 	   * whose slots it reads was recompiled: recompile */
 	  qdata_free_valptr_list_prog (thread_p, valptr_list_p);
 	  valptr_list_p->eval_prog_state = 0;
-	  /* a recompile starts its own deferral budget: the domains this execution resolves
-	   * are the ones the new program must be specialized for */
-	  valptr_list_p->eval_prog_defer = 0;
 	  qdata_valptr_prog_compile (thread_p, valptr_list_p, val_desc_p);
 	  prog = (valptr_list_p->eval_prog_state == 1) ? (EXPR_PROG *) valptr_list_p->eval_prog : NULL;
 	}
@@ -572,14 +486,6 @@ qdata_valptr_prog_ensure (THREAD_ENTRY * thread_p, valptr_list_node * valptr_lis
     {
       *error_p = ER_FAILED;
       return NULL;
-    }
-  /* a value descriptor without an execution identity cannot be stamped: stay pessimistic
-   * and check the domains on every row */
-  if (prog != NULL && valptr_list_p->eval_prog_dom_any
-      && (EXPR_PROG_EXEC_STAMP (val_desc_p) == 0
-	  || valptr_list_p->eval_prog_dom_stamp != EXPR_PROG_EXEC_STAMP (val_desc_p)))
-    {
-      qdata_valptr_prog_resolve_domains (valptr_list_p, prog, EXPR_PROG_EXEC_STAMP (val_desc_p));
     }
   return prog;
 }
