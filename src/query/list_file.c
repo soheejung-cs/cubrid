@@ -42,6 +42,7 @@
 #include "log_append.hpp"
 #include "object_primitive.h"
 #include "object_representation.h"
+#include "perf_monitor.h"
 #include "query_manager.h"
 #include "query_opfunc.h"
 #include "stream_to_xasl.h"
@@ -867,17 +868,31 @@ qfile_compare_tuple_values (QFILE_TUPLE_RECORD * lhs, QFILE_TUPLE_RECORD * rhs, 
  *   return:
  *   list_id1(in/out): Destination list identifier
  *   list_id2(in): Source list identifier
+ *   list1_empty(in): the rows list_id1 stands for are none (a destination opened with a branch's types: that branch's)
  *
  * Note: For every destination type which is DB_TYPE_NULL,
  *       set it to the source type.
  *       This should probably set an error for non-null mismatches.
+ *
+ * A list opens with the plan's domains: an empty side contributes no values, so its domain does not
+ * constrain the other side's, as a column no tuple typed (DB_TYPE_VARIABLE) did not.
+ */
+/*
+ * [리뷰] qfile_unify_types — 두 리스트 파일의 컬럼 타입 목록을 하나로 맞춘다 — UNION/병합이 대상 리스트에 소스를 이어 붙이기 전에 부르고, 맞출 수 없으면
+ * ER_QPROC_INCOMPATIBLE_TYPES 를 돌려준다.
+ * develop: 시그니처 (list_id1, list_id2) 두 개. 어느 한쪽 컬럼이 DB_TYPE_VARIABLE 일 때만 상대 도메인을 채택했다.
+ * 이 PR: bool list1_empty 를 호출자에게서 받고 list2_empty 는 list_id2->tuple_cnt == 0 으로 직접 계산한다. 컬럼이 VARIABLE 이거나, 그 쪽
+ * 리스트에 행이 없고 두 도메인 포인터가 다르면, 값이 없는 쪽이 상대 도메인을 받아들인다.
+ * 바뀐 것: 시그니처 +1(list_file.h 포함), 채택 조건 2곳 확장. '행이 없는 쪽은 도메인을 주장하지 않는다'는 규칙이 추가됐다.
+ * [지적 C6-04]
  */
 int
-qfile_unify_types (QFILE_LIST_ID * list_id1_p, const QFILE_LIST_ID * list_id2_p)
+qfile_unify_types (QFILE_LIST_ID * list_id1_p, const QFILE_LIST_ID * list_id2_p, bool list1_empty)
 {
   int i;
   int max_count = list_id1_p->type_list.type_cnt;
   DB_TYPE type1, type2;
+  const bool list2_empty = list_id2_p->tuple_cnt == 0;
 
   if (max_count != list_id2_p->type_list.type_cnt)
     {
@@ -893,15 +908,16 @@ qfile_unify_types (QFILE_LIST_ID * list_id1_p, const QFILE_LIST_ID * list_id2_p)
       type1 = TP_DOMAIN_TYPE (list_id1_p->type_list.domp[i]);
       type2 = TP_DOMAIN_TYPE (list_id2_p->type_list.domp[i]);
 
-      if (type1 == DB_TYPE_VARIABLE)
+      if (type1 == DB_TYPE_VARIABLE || (list1_empty && list_id1_p->type_list.domp[i] != list_id2_p->type_list.domp[i]))
 	{
-	  /* list1's column is unresolved: its tuples hold only NULL (0 bytes) there, so adopting list2's domain is safe */
+	  /* list1 holds no value of this column: its tuples store only NULL (0 bytes) there, so list2's domain reads them */
 	  list_id1_p->type_list.domp[i] = list_id2_p->type_list.domp[i];
 	  continue;
 	}
-      else if (type2 == DB_TYPE_VARIABLE)
+      else if (type2 == DB_TYPE_VARIABLE
+	       || (list2_empty && list_id1_p->type_list.domp[i] != list_id2_p->type_list.domp[i]))
 	{
-	  /* list2's column is unresolved (NULL-only so far); list1's domain stands. */
+	  /* list2 holds no value of this column (NULL only); list1's domain stands */
 	  continue;
 	}
 
@@ -2414,6 +2430,14 @@ qfile_advance (THREAD_ENTRY * thread_p, ADVANCE_FUCTION advance_func, QFILE_TUPL
  *             whether to do 'all' or 'distinct'
  *
  */
+/*
+ * [리뷰] qfile_combine_two_list — 좌·우 리스트 파일을 합쳐 새 결과 리스트 ID 를 만든다(UNION/DIFFERENCE/INTERSECTION 의 실체화) —
+ * query_executor 가 부르고 QFILE_LIST_ID* 를 돌려준다.
+ * develop: qfile_unify_types (dest_list_id_p, rhs_file_p) 로 두 인자만 넘겼다.
+ * 이 PR: 세 번째 인자로 lhs_file_p->tuple_cnt == 0 을 넘긴다 — 좌측 가지에 행이 없으면 dest 가 들고 있는 타입은 '값 없는 가지의 타입'이므로 우측 것으로 바꿔도
+ * 된다는 판정이다.
+ * 바뀐 것: 호출 1줄.
+ */
 QFILE_LIST_ID *
 qfile_combine_two_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * lhs_file_p, QFILE_LIST_ID * rhs_file_p, int flag)
 {
@@ -2504,7 +2528,7 @@ qfile_combine_two_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * lhs_file_p, QFI
       goto error;
     }
 
-  if (rhs_file_p && qfile_unify_types (dest_list_id_p, rhs_file_p) != NO_ERROR)
+  if (rhs_file_p && qfile_unify_types (dest_list_id_p, rhs_file_p, lhs_file_p->tuple_cnt == 0) != NO_ERROR)
     {
       goto error;
     }
@@ -3105,6 +3129,12 @@ qfile_close_and_free_list_file (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id
  *              tuples of the both list files and generates a new list file.
  *              The source list files are not affected.
  */
+/*
+ * [리뷰] qfile_union_list — 리스트 파일 두 개를 UNION 결과 리스트로 이어 붙인다 — 결과 QFILE_LIST_ID* 를 돌려준다.
+ * develop: qfile_unify_types (result_list_id_p, tail) 로 두 인자만 넘겼다.
+ * 이 PR: list1_empty 로 항상 false 를 넘긴다 — 결과 리스트가 비어 있어도 새 완화 규칙을 열지 않는다.
+ * 바뀐 것: 호출 1줄.
+ */
 static QFILE_LIST_ID *
 qfile_union_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id1_p, QFILE_LIST_ID * list_id2_p, int flag)
 {
@@ -3139,7 +3169,7 @@ qfile_union_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id1_p, QFILE_LIS
 	  goto error;
 	}
 
-      if (qfile_unify_types (result_list_id_p, tail) != NO_ERROR)
+      if (qfile_unify_types (result_list_id_p, tail, false) != NO_ERROR)
 	{
 	  goto error;
 	}
@@ -4258,6 +4288,15 @@ qfile_get_estimated_pages_for_sorting (QFILE_LIST_ID * list_id_p, SORTKEY_INFO *
  *   list(in):
  *   types(in):
  */
+/*
+ * [리뷰] qfile_initialize_sort_key_info — SORT_LIST(정렬 키 목록)에서 외부 정렬이 쓸 SORTKEY_INFO 를 만든다 — 키 컬럼마다 비교
+ * 함수·도메인·내림차순/NULL 순서를 채워 넣고 key_info_p 를 돌려준다.
+ * develop: 키 컬럼 도메인이 DB_TYPE_VARIABLE 이면 리스트 타입목록(types->domp[i])의 get_data_cmpdisk_function 을, 아니면
+ * p->pos_descr.dom 의 것을 골랐다 — 정렬 시점에 도메인이 미정일 수 있다는 전제의 분기였다.
+ * 이 PR: 분기를 없애고 언제나 p->pos_descr.dom 의 비교 함수를 쓴다('키의 도메인은 플랜의 것'). 두 경로에서 새 필드 subkey->cmp_dom_session_read =
+ * false 를 초기화한다.
+ * 바뀐 것: 분기 8줄 → 1줄, 필드 초기화 2줄 추가. 정렬이 도메인 미정을 다루던 경로가 사라졌다.
+ */
 SORTKEY_INFO *
 qfile_initialize_sort_key_info (SORTKEY_INFO * key_info_p, SORT_LIST * list_p, QFILE_TUPLE_VALUE_TYPE_LIST * types)
 {
@@ -4310,15 +4349,10 @@ qfile_initialize_sort_key_info (SORTKEY_INFO * key_info_p, SORT_LIST * list_p, Q
 	  subkey->col_dom = p->pos_descr.dom;
 	  subkey->cmp_dom = NULL;
 	  subkey->use_cmp_dom = false;
+	  subkey->cmp_dom_session_read = false;
 
-	  if (p->pos_descr.dom->type->id == DB_TYPE_VARIABLE)
-	    {
-	      subkey->sort_f = types->domp[i]->type->get_data_cmpdisk_function ();
-	    }
-	  else
-	    {
-	      subkey->sort_f = p->pos_descr.dom->type->get_data_cmpdisk_function ();
-	    }
+	  /* the key's domain is the plan's */
+	  subkey->sort_f = p->pos_descr.dom->type->get_data_cmpdisk_function ();
 
 	  subkey->is_desc = (p->s_order == S_ASC) ? 0 : 1;
 	  subkey->is_nulls_first = (p->s_nulls == S_NULLS_LAST) ? 0 : 1;
@@ -4344,6 +4378,7 @@ qfile_initialize_sort_key_info (SORTKEY_INFO * key_info_p, SORT_LIST * list_p, Q
 	  subkey->col_dom = types->domp[i];
 	  subkey->cmp_dom = NULL;
 	  subkey->use_cmp_dom = false;
+	  subkey->cmp_dom_session_read = false;
 	  subkey->sort_f = types->domp[i]->type->get_data_cmpdisk_function ();
 	  subkey->is_desc = 0;
 	  subkey->is_nulls_first = 1;
@@ -6919,101 +6954,6 @@ qfile_has_next_page (PAGE_PTR page_p)
 }
 
 /*
- * qfile_update_domains_on_type_list() - Update domain pointers belongs to
- *   type list of a given list file
- *  return: error code
- *
- */
-int
-qfile_update_domains_on_type_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id_p, valptr_list_node * valptr_list_p)
-{
-  REGU_VARIABLE_LIST reg_var_p;
-  int i, count = 0;
-  bool changed = false;
-
-  assert (list_id_p != NULL);
-
-  list_id_p->is_domain_resolved = true;
-
-  reg_var_p = valptr_list_p->valptrp;
-
-  for (i = 0; i < valptr_list_p->valptr_cnt; i++, reg_var_p = reg_var_p->next)
-    {
-      if (REGU_VARIABLE_IS_FLAGED (&reg_var_p->value, REGU_VARIABLE_HIDDEN_COLUMN))
-	{
-	  continue;
-	}
-
-      if (count >= list_id_p->type_list.type_cnt)
-	{
-	  assert (false);
-	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_GENERIC_ERROR, 0);
-	  goto exit_on_error;
-	}
-
-      if (TP_DOMAIN_TYPE (list_id_p->type_list.domp[count]) == DB_TYPE_VARIABLE)
-	{
-	  if (TP_DOMAIN_TYPE (reg_var_p->value.domain) == DB_TYPE_VARIABLE)
-	    {
-	      /* In this case, we cannot resolve the value's domain. We will try to do for the next tuple. */
-	      if (list_id_p->is_domain_resolved)
-		{
-		  list_id_p->is_domain_resolved = false;
-		}
-	    }
-	  else
-	    {
-	      list_id_p->type_list.domp[count] = reg_var_p->value.domain;
-	      changed = true;
-	    }
-	}
-
-      if (list_id_p->type_list.domp[count]->collation_flag != TP_DOMAIN_COLL_NORMAL)
-	{
-	  if (reg_var_p->value.domain->collation_flag != TP_DOMAIN_COLL_NORMAL)
-	    {
-	      /* In this case, we cannot resolve the value's domain. We will try to do for the next tuple. */
-	      if (list_id_p->is_domain_resolved)
-		{
-		  list_id_p->is_domain_resolved = false;
-		}
-	    }
-	  else
-	    {
-	      list_id_p->type_list.domp[count] = reg_var_p->value.domain;
-	      changed = true;
-	    }
-	}
-
-      count++;
-    }
-
-  /* The number of columns should be same. */
-  if (count != list_id_p->type_list.type_cnt)
-    {
-      assert (false);
-      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_GENERIC_ERROR, 0);
-      goto exit_on_error;
-    }
-
-  if (changed)
-    {
-      qfile_set_layout (&list_id_p->type_list);	/* late domain resolution: recompute layout */
-    }
-
-  return NO_ERROR;
-
-exit_on_error:
-
-  if (changed)
-    {
-      qfile_set_layout (&list_id_p->type_list);
-    }
-  list_id_p->is_domain_resolved = false;
-  return ER_FAILED;
-}
-
-/*
  * qfile_set_tuple_column_value() - Set column value for a fixed size column
  *				    of a tuple inside a list file (in-place)
  *  return: error code
@@ -7197,6 +7137,51 @@ qfile_overwrite_tuple (THREAD_ENTRY * thread_p, PAGE_PTR first_page_p, QFILE_TUP
   return NO_ERROR;
 }
 
+#if !defined (NDEBUG)
+/*
+ * qfile_check_interpolation_type () - debug cross-check (optdebug): the type the analytic setup gave the key before
+ *   the sort is the one the first value gives it (qdata_update_interpolation_func_value_and_domain), unless that
+ *   type rejects the value (a string column or expression is DOUBLE, the function's evaluation rejects the value
+ *   too); a key without a type holds values that function cannot type either
+ */
+/*
+ * [리뷰] qfile_check_interpolation_type — 디버그 전용(NDEBUG 밖) 교차검증 — 분석함수(MEDIAN 등) 정렬 키에 실행 전 게이트가 매긴 타입이, 첫 값으로
+ * 역산한 타입(qdata_update_interpolation_func_value_and_domain)과 같은지 assert 한다. 반환값 없음.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: er_stack_push/pop 으로 에러를 가둔 채 역산 타입과 계획 타입을 비교하고, 계획 타입이 그 값을 거절하면 역산도 실패해야 같다고 본다. 어긋나면 stderr 에 타입
+ * 번호들을 찍고 assert.
+ * 바뀐 것: 신설 약 37줄(릴리스 빌드에는 들어가지 않는다). 정렬 키 타입을 게이트로 옮긴 변경의 자기 검증 장치다.
+ */
+static void
+qfile_check_interpolation_type (DB_VALUE * value, const TP_DOMAIN * resolved)
+{
+  DB_VALUE converted;
+  TP_DOMAIN *expected = NULL;
+  bool resolved_rejects = true;
+
+  db_make_null (&converted);
+  er_stack_push ();
+  const int error = qdata_update_interpolation_func_value_and_domain (value, &converted, &expected);
+  pr_clear_value (&converted);
+  if (resolved != NULL)
+    {
+      resolved_rejects = tp_value_cast (value, &converted, (TP_DOMAIN *) resolved, false) != DOMAIN_COMPATIBLE;
+      pr_clear_value (&converted);
+    }
+  er_stack_pop ();
+
+  const bool same = resolved == NULL ? error != NO_ERROR
+    : resolved_rejects || (error == NO_ERROR && TP_DOMAIN_TYPE (expected) == TP_DOMAIN_TYPE (resolved));
+  if (!same)
+    {
+      fprintf (stderr, "interpolation sort key class: value type %d planned %d expected %d error %d\n",
+	       (int) DB_VALUE_DOMAIN_TYPE (value), resolved != NULL ? (int) TP_DOMAIN_TYPE (resolved) : -1,
+	       expected != NULL ? (int) TP_DOMAIN_TYPE (expected) : -1, error);
+    }
+  assert (same);
+}
+#endif
+
 /*
  * qfile_compare_with_interpolation_domain () -
  *  return: compare result
@@ -7206,6 +7191,19 @@ qfile_overwrite_tuple (THREAD_ENTRY * thread_p, PAGE_PTR first_page_p, QFILE_TUP
  *  subkey(in):
  *
  *  NOTE: median analytic function sort string in different domain
+ *
+ *  The analytic setup gives the key its type before the sort (qexec_plan_interpolation_sort_key), so the workers
+ *  of a parallel sort, which share the key, only read it - a type over a session variable read too.
+ */
+/*
+ * [리뷰] qfile_compare_with_interpolation_domain — 분석함수 정렬에서 문자열 컬럼을 보간용 도메인(DOUBLE 등)으로 캐스팅해 두 값을 비교한다 — 정렬
+ * 비교자가 부르고 DB_VALUE_COMPARE_RESULT 를 돌려준다.
+ * develop: subkey->cmp_dom 이 NULL 이면 첫 비교에서 val0 를 읽어 qdata_update_interpolation_func_value_and_domain 으로 캐스트
+ * 도메인을 알아내 subkey->cmp_dom 에 써 넣었다 — 정렬 도중에 공유 키 구조를 갱신하는 지연 결정이었다.
+ * 이 PR: cmp_dom 이 NULL 이면 아무것도 결정하지 않고 바로 ER_ARG_CAN_NOT_BE_CASTED_TO_DESIRED_DOMAIN 으로 끝낸다 — 타입은
+ * qexec_plan_interpolation_sort_key 가 정렬 전에 정했고, 거기서 NULL 이었다면 그 값은 어차피 타입이 되지 않는 값이라는 판정이다. 디버그 빌드에서만
+ * qfile_check_interpolation_type 으로 교차검증하고, cmp_dom_session_read 인 키는 건너뛴다.
+ * 바뀐 것: 지연 결정 블록 약 12줄 삭제 → 즉시 오류 2줄, 디버그 검증 호출 3곳 추가. 병렬 정렬 워커가 같은 subkey 를 '읽기만' 하게 만드는 변경이다.
  */
 static int
 qfile_compare_with_interpolation_domain (const QFILE_COL_LAYOUT * c, const char *d0, int l0, const char *d1, int l1,
@@ -7226,7 +7224,7 @@ qfile_compare_with_interpolation_domain (const QFILE_COL_LAYOUT * c, const char 
 
   if (subkey->cmp_dom == NULL)
     {
-      /* get the proper domain NOTE: col_dom is string type.  See qexec_initialize_analytic_state */
+      /* NOTE: col_dom is string type.  See qexec_plan_interpolation_sort_key */
       pr_clear_value (&val0);
 
       error = qfile_col_read_body (c, d0, l0, subkey->col_dom, &val0, false);
@@ -7235,16 +7233,16 @@ qfile_compare_with_interpolation_domain (const QFILE_COL_LAYOUT * c, const char 
 	  goto end;
 	}
 
-      error = qdata_update_interpolation_func_value_and_domain (&val0, &val0, &cast_domain);
-      if (error != NO_ERROR)
+      /* a value argument resolve_domains could not type: every value is that one, whose typing
+       * fails for the first value too; a session variable read keeps that for the statement */
+#if !defined (NDEBUG)
+      if (!subkey->cmp_dom_session_read)
 	{
-	  subkey->cmp_dom = NULL;
-	  goto end;
+	  qfile_check_interpolation_type (&val0, NULL);
 	}
-      else
-	{
-	  subkey->cmp_dom = cast_domain;
-	}
+#endif
+      error = ER_ARG_CAN_NOT_BE_CASTED_TO_DESIRED_DOMAIN;
+      goto end;
     }
 
   /* cast to proper domain, then compare */
@@ -7262,6 +7260,14 @@ qfile_compare_with_interpolation_domain (const QFILE_COL_LAYOUT * c, const char 
     {
       goto end;
     }
+
+#if !defined (NDEBUG)
+  if (!subkey->cmp_dom_session_read)
+    {
+      qfile_check_interpolation_type (&val0, subkey->cmp_dom);
+      qfile_check_interpolation_type (&val1, subkey->cmp_dom);
+    }
+#endif
 
   cast_domain = subkey->cmp_dom;
   status = tp_value_cast (&val0, &val0, cast_domain, false);

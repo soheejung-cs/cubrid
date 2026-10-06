@@ -1393,6 +1393,10 @@ static int btree_get_num_visible_oids_from_all_ovf (THREAD_ENTRY * thread_p, BTI
 static void btree_write_default_split_info (BTREE_NODE_SPLIT_INFO * info);
 static int btree_set_vpid_previous_vpid (THREAD_ENTRY * thread_p, BTID_INT * btid, PAGE_PTR page_p, VPID * prev);
 static int btree_compare_individual_key_value (DB_VALUE * key1, DB_VALUE * key2, TP_DOMAIN * key_domain);
+STATIC_INLINE DB_VALUE_COMPARE_RESULT btree_compare_key_with (DB_VALUE * key1, DB_VALUE * key2, TP_DOMAIN * key_domain,
+							      DOMAIN_SEARCH_KEYS search_keys, int do_coercion,
+							      int total_order, int *start_colp)
+  __attribute__ ((ALWAYS_INLINE));
 static int btree_get_next_page_vpid (THREAD_ENTRY * thread_p, PAGE_PTR leaf_page, VPID * next_vpid);
 static PAGE_PTR btree_get_next_page (THREAD_ENTRY * thread_p, PAGE_PTR page_p);
 static int btree_range_opt_check_add_index_key (THREAD_ENTRY * thread_p, BTREE_SCAN * bts,
@@ -5272,6 +5276,15 @@ btree_initialize_new_page (THREAD_ENTRY * thread_p, PAGE_PTR page, void *args)
  * Note: Binary search the page to locate the record that contains the child page pointer to be followed to locate
  *       the key, and return the page identifier for this child page.
  */
+/*
+ * [리뷰] btree_search_nonleaf_page — 비리프 페이지를 이진 탐색해 찾는 키가 속한 자식 페이지(child_vpid)와 슬롯을 돌려준다 — 루트에서 리프로 내려가는 모든
+ * 탐색(btree_search_key_and_apply_functions 계열)이 거친다.
+ * develop: c = btree_compare_key (key, &temp_key, btid->key_type, 1, 1, &start_col) — 키 비교마다 키1/키2/도메인의 타입
+ * 호환성과 문자열 콜레이션을 다시 확인했다.
+ * 이 PR: c = btree_compare_search_key (btid, key, &temp_key, &start_col) — 비교 방식을 BTID_INT 가 들고 있는
+ * 선택(search_compare/search_keys)에 위임한다. 질의 플랜 밖이면 종전과 같은 RESOLVED 경로로 떨어진다.
+ * 바뀐 것: 호출 치환 1줄(±1). '어떻게 비교하나'를 행마다 묻지 않고 스캔 열 때 한 번 정한다는 이 PR 의 방향이 B-tree 하강 경로에 적용된 지점.
+ */
 int
 btree_search_nonleaf_page (THREAD_ENTRY * thread_p, BTID_INT * btid, PAGE_PTR page_ptr, DB_VALUE * key, INT16 * slot_id,
 			   VPID * child_vpid, page_key_boundary * page_bounds)
@@ -5359,7 +5372,7 @@ btree_search_nonleaf_page (THREAD_ENTRY * thread_p, BTID_INT * btid, PAGE_PTR pa
 	  start_col = MIN (left_start_col, right_start_col);
 	}
 
-      c = btree_compare_key (key, &temp_key, btid->key_type, 1, 1, &start_col);
+      c = btree_compare_search_key (btid, key, &temp_key, &start_col);
 
       if (c == DB_UNK)
 	{
@@ -5452,6 +5465,14 @@ btree_search_nonleaf_page (THREAD_ENTRY * thread_p, BTID_INT * btid, PAGE_PTR pa
  * key (in)	    : Searched key.
  * search_key (out) : Output result of search.
  */
+/*
+ * [리뷰] btree_leaf_is_key_between_min_max — 주어진 키가 이 리프 페이지의 첫 키와 마지막 키 사이에 있는지 판정해 search_key 로 알려준다 — 온라인 인덱스
+ * 빌드(btree_key_online_index_IB_insert_list)와 탐색 최적화 경로가 부른다.
+ * develop: 경계 키 두 번 비교를 btree_compare_key (key, &border_key, btid_int->key_type, 1, 1, NULL) 로 했다.
+ * 이 PR: 두 호출 모두 btree_compare_search_key (btid_int, key, &border_key, NULL) 로 바뀐다. 온라인 빌드처럼 질의 플랜이 없는 호출자에서는
+ * btid_int 의 기본값(NONE/RESOLVED)이라 동작이 동일하다.
+ * 바뀐 것: 호출 치환 2줄(±2).
+ */
 static int
 btree_leaf_is_key_between_min_max (THREAD_ENTRY * thread_p, BTID_INT * btid_int, PAGE_PTR leaf, DB_VALUE * key,
 				   BTREE_SEARCH_KEY_HELPER * search_key)
@@ -5513,7 +5534,7 @@ btree_leaf_is_key_between_min_max (THREAD_ENTRY * thread_p, BTID_INT * btid_int,
     }
 
   /* Compare with first key. */
-  c = btree_compare_key (key, &border_key, btid_int->key_type, 1, 1, NULL);
+  c = btree_compare_search_key (btid_int, key, &border_key, NULL);
   btree_clear_key_value (&clear_key, &border_key);
   if (c == DB_EQ)
     {
@@ -5565,7 +5586,7 @@ btree_leaf_is_key_between_min_max (THREAD_ENTRY * thread_p, BTID_INT * btid_int,
       return error_code;
     }
   /* Compare with last key. */
-  c = btree_compare_key (key, &border_key, btid_int->key_type, 1, 1, NULL);
+  c = btree_compare_search_key (btid_int, key, &border_key, NULL);
   btree_clear_key_value (&clear_key, &border_key);
   if (c == DB_EQ)
     {
@@ -5619,6 +5640,14 @@ btree_leaf_is_key_between_min_max (THREAD_ENTRY * thread_p, BTID_INT * btid_int,
  *	 (e.g. after unfixing-refixing leaf node). In this case, the key
  *	 is not considered equal to fence key, but rather bigger than all
  *	 keys in page. The caller should know to go to next page.
+ */
+/*
+ * [리뷰] btree_search_leaf_page — 리프 페이지 안에서 키를 이진 탐색해 '정확히 있음/들어갈 자리' 를 search_key 로 돌려준다 —
+ * btree_advance_and_find_key·btree_get_root_with_key·btree_merge_node_and_advance 등 리프에 닿는 거의 모든 경로의 마지막 단계.
+ * develop: 중간 키와의 비교를 btree_compare_key (key, &temp_key, btid->key_type, 1, 1, &start_col) 로 했다.
+ * 이 PR: btree_compare_search_key (btid, key, &temp_key, &start_col) 로 치환돼, 인덱스 스캔이면 열 때 고른 비교(단일 컬럼이면 컬럼의
+ * cmpval 직행)를 쓴다.
+ * 바뀐 것: 호출 치환 1줄(±1). 이진 탐색 루프 안이라 비교당 타입·콜레이션 확인을 빼는 효과가 가장 큰 자리다(측정치는 이 팩에 없다).
  */
 static int
 btree_search_leaf_page (THREAD_ENTRY * thread_p, BTID_INT * btid, PAGE_PTR page_ptr, DB_VALUE * key,
@@ -5731,7 +5760,7 @@ btree_search_leaf_page (THREAD_ENTRY * thread_p, BTID_INT * btid, PAGE_PTR page_
 	}
 
       /* Compare searched key with current middle key. */
-      c = btree_compare_key (key, &temp_key, btid->key_type, 1, 1, &start_col);
+      c = btree_compare_search_key (btid, key, &temp_key, &start_col);
 
       /* Clear current middle key. */
       btree_clear_key_value (&clear_key, &temp_key);
@@ -6061,6 +6090,14 @@ btree_generate_prefix_domain (BTID_INT * btid)
  *
  * Note: This captures the interesting header info into the BTID_INT structure.
  */
+/*
+ * [리뷰] btree_glean_root_header_info — B-tree 루트 페이지 헤더에서 키 타입·unique·ovfid 같은 정보를 뽑아 BTID_INT 를 채우는, BTID_INT
+ * 의 사실상 유일한 초기화 지점 — btree_prepare_bts 를 비롯해 btree.c 안 10여 곳이 부른다.
+ * develop: copy_buf/copy_buf_len 을 NULL/0 으로 깔고 키 타입 계열만 채웠다. 비교 방식이라는 개념이 BTID_INT 에 없었다.
+ * 이 PR: copy_buf 초기화 옆에 btid->search_compare = BTREE_SEARCH_COMPARE_RESOLVED 와 btid->search_keys =
+ * DOMAIN_SEARCH_KEYS_NONE 을 추가한다 — '질의 플랜 밖' 기본값이고, 인덱스 스캔은 btree_prepare_bts 가 그 뒤에 덮어쓴다.
+ * 바뀐 것: +2줄. BTID_INT 는 보통 스택 지역 변수라, 이 기본값이 '비교 방식이 쓰레기 값이 되지 않는다'를 보장하는 유일한 장치다.
+ */
 int
 btree_glean_root_header_info (THREAD_ENTRY * thread_p, BTREE_ROOT_HEADER * root_header, BTID_INT * btid,
 			      bool is_key_type)
@@ -6089,6 +6126,8 @@ btree_glean_root_header_info (THREAD_ENTRY * thread_p, BTREE_ROOT_HEADER * root_
   /* init index key copy_buf info */
   btid->copy_buf = NULL;
   btid->copy_buf_len = 0;
+  btid->search_compare = BTREE_SEARCH_COMPARE_RESOLVED;
+  btid->search_keys = DOMAIN_SEARCH_KEYS_NONE;
 
   if (is_key_type)
     {
@@ -19411,6 +19450,15 @@ btree_coerce_key (DB_VALUE * keyp, int keysize, TP_DOMAIN * btree_domainp, int k
  * need_to_check_null (in) : True if midxkey NULL needs to be checked.
  * bts_other (in/out)	   : Sets the argument specific to one type of range search.
  */
+/*
+ * [리뷰] btree_prepare_bts — 인덱스 스캔 시작 전에 BTREE_SCAN(bts)을 준비한다 — 루트를 fix 해 btid_int 를 glean 하고, INDX_SCAN_ID 에서
+ * 복사할 것을 복사하고, 키 범위·필터를 세운다. scan_open_index_scan 계열에서 불린다.
+ * develop: index_scan_id_p 가 있으면 index_scan_idp·use_desc_index·oid_ptr·copy_buf/copy_buf_len 만 옮겼다.
+ * 이 PR: 같은 블록에 bts->btid_int.search_keys = scan_index_search_keys (index_scan_id_p) 와
+ * bts->btid_int.search_compare = scan_index_search_compare (index_scan_id_p) 가 추가된다. 두
+ * 헬퍼(scan_manager.c:362·376)는 INDX_SCAN_ID 의 key_plan/key_state 를 보고, 키 플랜이 없으면 NONE/RESOLVED 를 돌려준다.
+ * 바뀐 것: +3줄. 실행 전 게이트가 도출한 키 플랜의 결론이 스토리지 계층으로 넘어오는 유일한 통로이자, 이 PR 의 query→storage 간선이 생기는 지점이다.
+ */
 int
 btree_prepare_bts (THREAD_ENTRY * thread_p, BTREE_SCAN * bts, BTID * btid, INDX_SCAN_ID * index_scan_id_p,
 		   key_val_range * kv_range, FILTER_INFO * filter, const OID * match_class_oid,
@@ -19536,6 +19584,9 @@ btree_prepare_bts (THREAD_ENTRY * thread_p, BTREE_SCAN * bts, BTID * btid, INDX_
       /* TODO: Use index_scan_id_p->copy_buf directly. */
       bts->btid_int.copy_buf = index_scan_id_p->copy_buf;
       bts->btid_int.copy_buf_len = index_scan_id_p->copy_buf_len;
+      /* the comparisons of the scan's search key values, and how they compare */
+      bts->btid_int.search_keys = scan_index_search_keys (index_scan_id_p);
+      bts->btid_int.search_compare = scan_index_search_compare (index_scan_id_p);
     }
 
   /* initialize the key range with given information */
@@ -20125,6 +20176,14 @@ exit_on_error:
  * in B+-tree scan structure. The results of the evaluation of the given conditions are returned through
  * key_range_satisfied and key_filter_satisfied.
  */
+/*
+ * [리뷰] btree_apply_key_range_and_filter — 현재 키에 키 범위 조건과 키 필터를 적용해
+ * is_key_range_satisfied·is_key_filter_satisfied 를 돌려준다 — 범위 스캔이 키를 하나 읽을 때마다 불리는 행당 경로다.
+ * develop: 상한 키와 현재 키(또는 공통 접두 키)의 비교 세 군데가 모두 btree_compare_key (…, bts->btid_int.key_type, 1, 1, …) 였다.
+ * 이 PR: 세 군데 모두 btree_compare_search_key (&bts->btid_int, …) 로 바뀐다. 상한 키는 스캔의 탐색 키이므로, 스캔이 열 때 고른 비교가 그대로
+ * 적용된다.
+ * 바뀐 것: 호출 치환 3줄(±3). 행당 경로라 이 PR 의 성능 의도가 직접 걸리는 자리다.
+ */
 static int
 btree_apply_key_range_and_filter (THREAD_ENTRY * thread_p, BTREE_SCAN * bts, bool is_iss, bool * is_key_range_satisfied,
 				  bool * is_key_filter_satisfied)
@@ -20152,19 +20211,19 @@ btree_apply_key_range_and_filter (THREAD_ENTRY * thread_p, BTREE_SCAN * bts, boo
 	  int start_col = 0;
 	  if (start_col < bts->common_prefix_size)
 	    {
-	      c = btree_compare_key (bts->key_range.upper_key, &bts->common_prefix_key, bts->btid_int.key_type, 1, 1,
-				     &start_col);
+	      c = btree_compare_search_key (&bts->btid_int, bts->key_range.upper_key, &bts->common_prefix_key,
+					    &start_col);
 	    }
 
 	  if (start_col >= bts->common_prefix_size)
 	    {
 	      start_col = bts->common_prefix_size;
-	      c = btree_compare_key (bts->key_range.upper_key, &bts->cur_key, bts->btid_int.key_type, 1, 1, &start_col);
+	      c = btree_compare_search_key (&bts->btid_int, bts->key_range.upper_key, &bts->cur_key, &start_col);
 	    }
 	}
       else
 	{
-	  c = btree_compare_key (bts->key_range.upper_key, &bts->cur_key, bts->btid_int.key_type, 1, 1, NULL);
+	  c = btree_compare_search_key (&bts->btid_int, bts->key_range.upper_key, &bts->cur_key, NULL);
 	}
 
       if (c == DB_UNK)
@@ -23118,9 +23177,107 @@ btree_set_vpid_previous_vpid (THREAD_ENTRY * thread_p, BTID_INT * btid, PAGE_PTR
   return NO_ERROR;
 }
 
+/*
+ * [리뷰] btree_compare_key — B-tree 키 두 개를 인덱스 키 도메인으로 비교하는 공개 함수 — 질의 플랜과 무관한
+ * 삽입·삭제·검증(btree_check_valid_record, 온라인 빌드 등) 전부가 쓴다.
+ * develop: 타입 확인, MIDXKEY 분기, 콜레이션 확인, 비교, 내림차순 뒤집기까지의 본체 전체가 이 함수 안에 있었다.
+ * 이 PR: 본문이 한 줄로 줄고, 새 STATIC_INLINE btree_compare_key_with (…, DOMAIN_SEARCH_KEYS_NONE, …) 에 그대로 위임한다. 동작은
+ * develop 과 같다 — NONE 이면 비교 불가 시 tp_value_compare_with_error 로 떨어지는 옛 경로다.
+ * 바뀐 것: 본체 추출(약 −180줄이 btree_compare_key_with 로 이동), 래퍼 1줄만 남음. 시그니처는 그대로라 기존 호출자 전부 무영향.
+ */
 DB_VALUE_COMPARE_RESULT
 btree_compare_key (DB_VALUE * key1, DB_VALUE * key2, TP_DOMAIN * key_domain, int do_coercion, int total_order,
 		   int *start_colp)
+{
+  return btree_compare_key_with (key1, key2, key_domain, DOMAIN_SEARCH_KEYS_NONE, do_coercion, total_order, start_colp);
+}
+
+/*
+ * btree_compare_search_key () - an index scan's comparison of a key with a key of its search: the columns whose
+ *   values do not compare as they are compare as the scan's key plan resolved before any row
+ *
+ * The scan chose the comparison when it opened (BTID_INT.search_compare): a search whose values all have their
+ * index columns' types and collations compares a single-column key by the column's cmpval and a multi-column key
+ * column by column, without btree_compare_key_with's type and collation checks at each comparison; optdebug still
+ * makes them and checks the answer.
+ */
+/*
+ * [리뷰] btree_compare_search_key — 인덱스 스캔이 '탐색 키'와 인덱스 키를 비교할 때 쓰는 새 공개 함수 —
+ * btree_search_leaf_page·btree_search_nonleaf_page·btree_apply_key_range_and_filter·btree_leaf_is_key_between_min_max·btree_ils_adjust_range·px_scan
+ * 의 leaf_slot_walker 가 부르고 DB_VALUE_COMPARE_RESULT 를 돌려준다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 위 호출자들이 모두 btree_compare_key 를 직접 불렀다.
+ * 이 PR: btid->search_compare 가 RESOLVED 면 종전 경로(btree_compare_key_with)로 위임하고, DIRECT 면 컬럼의 cmpval 을 바로,
+ * MIDXKEY_PLAIN 이면 pr_midxkey_compare_resolved 를 원소 비교 콜백 없이 부른 뒤 is_desc 뒤집기만 한다. NULL 처리는
+ * btree_compare_key_with 와 같은 답(DB_LT/DB_GT)을 그대로 복제했고, 디버그에서는 두 경로의 답과 start_col 까지 일치하는지 assert 한다.
+ * 바뀐 것: 신설 +54줄. '열 때 한 번 정하고 행에서는 읽기만 한다'를 B-tree 비교에 적용한 본체로, 타입·콜레이션 확인을 행당 경로에서 뺀다.
+ */
+DB_VALUE_COMPARE_RESULT
+btree_compare_search_key (const BTID_INT * btid, DB_VALUE * key1, DB_VALUE * key2, int *start_colp)
+{
+  if (btid->search_compare == BTREE_SEARCH_COMPARE_RESOLVED)
+    {
+      return btree_compare_key_with (key1, key2, btid->key_type, btid->search_keys, 1, 1, start_colp);
+    }
+
+#if !defined (NDEBUG)
+  int check_col = start_colp != NULL ? *start_colp : 0;
+#endif
+  DB_VALUE_COMPARE_RESULT c;
+  bool is_desc;
+
+  /* btree_compare_key_with's answers for a NULL */
+  if (DB_IS_NULL (key1))
+    {
+      assert (!DB_IS_NULL (key2));
+      return DB_IS_NULL (key2) ? DB_UNK : DB_LT;
+    }
+  if (DB_IS_NULL (key2))
+    {
+      return DB_GT;
+    }
+
+  if (btid->search_compare == BTREE_SEARCH_COMPARE_DIRECT)
+    {
+      c = btid->key_type->type->cmpval (key1, key2, 1, 1, NULL, btid->key_type->collation_id);
+      /* for single-column desc index */
+      is_desc = btid->key_type->is_desc;
+    }
+  else
+    {
+      bool dom_is_desc[2];
+      int dummy_diff_column;
+      c =
+	pr_midxkey_compare_resolved (db_get_midxkey (key1), db_get_midxkey (key2), 1, 1, -1, start_colp,
+				     &dummy_diff_column, dom_is_desc, NULL, NULL);
+      is_desc = dom_is_desc[0];
+    }
+  if (is_desc)
+    {
+      c = ((c == DB_GT) ? DB_LT : (c == DB_LT) ? DB_GT : c);
+    }
+
+#if !defined (NDEBUG)
+  /* btree_compare_key_with's checks with the scan's search keys give the same answer: else the scan chose wrongly */
+  assert (c == btree_compare_key_with (key1, key2, btid->key_type, btid->search_keys, 1, 1,
+				       start_colp != NULL ? &check_col : NULL));
+  assert (start_colp == NULL || check_col == *start_colp);
+#endif
+
+  return c;
+}
+
+/*
+ * btree_compare_key_with () - btree_compare_key, with an index scan's search keys
+ *
+ * DOMAIN_SEARCH_KEYS_NONE is a B-tree search outside a query plan, whose keys are the index's own: a column whose
+ * values do not compare as they are compares by value. An index scan's search keys compare such columns as its key
+ * plan says; one the plan has no comparison for fails the unresolved-domain check (execution). Inlined into
+ * btree_compare_key and btree_compare_search_key: a key comparison stays one call, and a single-column key reads
+ * search_keys only for values that do not compare as they are.
+ */
+STATIC_INLINE DB_VALUE_COMPARE_RESULT
+btree_compare_key_with (DB_VALUE * key1, DB_VALUE * key2, TP_DOMAIN * key_domain,
+			DOMAIN_SEARCH_KEYS search_keys, int do_coercion, int total_order, int *start_colp)
 {
   DB_VALUE_COMPARE_RESULT c = DB_UNK;
   DB_TYPE key1_type, key2_type;
@@ -23176,8 +23333,10 @@ btree_compare_key (DB_VALUE * key1, DB_VALUE * key2, TP_DOMAIN * key_domain, int
       bool dom_is_desc[2];
       int dummy_diff_column;
       c =
-	pr_midxkey_compare (db_get_midxkey (key1), db_get_midxkey (key2), do_coercion, total_order, -1, start_colp,
-			    &dummy_diff_column, dom_is_desc, NULL);
+	pr_midxkey_compare_resolved (db_get_midxkey (key1), db_get_midxkey (key2), do_coercion, total_order, -1,
+				     start_colp, &dummy_diff_column, dom_is_desc, NULL,
+				     search_keys == DOMAIN_SEARCH_KEYS_OTHER ? domain_search_key_compare_other
+				     : search_keys == DOMAIN_SEARCH_KEYS_OWN ? domain_search_key_compare_own : NULL);
       assert_release (c == DB_UNK || (DB_LT <= c && c <= DB_GT));
 
       if (dom_is_desc[0])
@@ -23226,7 +23385,15 @@ btree_compare_key (DB_VALUE * key1, DB_VALUE * key2, TP_DOMAIN * key_domain, int
 	}
       else
 	{
-	  c = tp_value_compare_with_error (key1, key2, do_coercion, total_order, &comparable);
+	  if (search_keys != DOMAIN_SEARCH_KEYS_NONE)
+	    {
+	      /* a search key value of a type the index does not compare as it is */
+	      c = domain_search_key_compare (search_keys, 0, key1, key2, do_coercion, total_order, &comparable);
+	    }
+	  else
+	    {
+	      c = tp_value_compare_with_error (key1, key2, do_coercion, total_order, &comparable);
+	    }
 
 	  if (!comparable)
 	    {
@@ -23322,6 +23489,18 @@ btree_compare_individual_key_value (DB_VALUE * key1, DB_VALUE * key2, TP_DOMAIN 
  * p_new_oid (in)	    : New candidate OID for top N keys.
  * key_added (out)	    : Outputs true if object made it to top N keys.
  */
+/*
+ * [리뷰] btree_range_opt_check_add_index_key — 다중 범위 최적화(ORDER BY + LIMIT) 의 top-N 배열에 현재 키를 끼워 넣을지 판정해
+ * key_added 로 알려준다 — btree_select_visible_object_for_range_scan 경로에서 행마다 불린다.
+ * develop: sort_col_dom[] 을 전부 &tp_Null_domain 으로 깔고 has_null_domain=true 로 둔 뒤, 행이 올 때마다 아직 NULL 도메인인 컬럼을
+ * tp_domain_resolve_value(실제 값에서 도메인 유추)로 채워 나갔다 — 첫 행의 값이 정렬 도메인을 정하는 구조였다.
+ * 이 PR: 스캔의 키 플랜(bts->index_scan_idp->key_plan)이 없으면 미해결 도메인 게이트(domain_unresolved_error)로 실패하고, 있으면
+ * key_plan->asc_key_type 에서 domain_key_column() 으로 각 정렬 컬럼의 도메인을 한 번에 가져온다. has_null_domain 필드는 코드베이스에서 완전히
+ * 사라졌다.
+ * 바뀐 것: 행당 지연 해결 루프 삭제(−26줄), 플랜에서 도출하는 블록 추가(+13줄). '행은 읽기만 한다'를 가장 또렷하게 보여주는 치환이다. 다만 domain_key_column 의
+ * NULL 여부는 assert 로만 확인하고 릴리스에는 가드가 없다 — develop 은 어떤 경우에도 &tp_Null_domain(비NULL)이었다.
+ * [지적 C11-03]
+ */
 static int
 btree_range_opt_check_add_index_key (THREAD_ENTRY * thread_p, BTREE_SCAN * bts, MULTI_RANGE_OPT * multi_range_opt,
 				     OID * p_new_oid, bool * key_added)
@@ -23330,7 +23509,6 @@ btree_range_opt_check_add_index_key (THREAD_ENTRY * thread_p, BTREE_SCAN * bts, 
   DB_VALUE *new_key_value = NULL;
   int error = NO_ERROR, i = 0;
   TP_DOMAIN *domain;
-  bool has_null_domain;
 
   assert (multi_range_opt->use == true);
 
@@ -23394,9 +23572,17 @@ btree_range_opt_check_add_index_key (THREAD_ENTRY * thread_p, BTREE_SCAN * bts, 
 	}
     }
 
-  /* resolve domains */
+  /* the sort columns' domains: the index's columns, ascending (the sort order is is_desc_order's), from the scan's key
+   * plan once */
   if (multi_range_opt->sort_col_dom == NULL)
     {
+      const domain_plan_index *key_plan = bts->index_scan_idp != NULL ? bts->index_scan_idp->key_plan : NULL;
+      if (key_plan == NULL)
+	{
+	  /* the unresolved-domain check (execution): every index scan has its key plan */
+	  error = domain_unresolved_error ("", -1, DB_TYPE_MIDXKEY);
+	  goto exit;
+	}
       multi_range_opt->sort_col_dom =
 	(TP_DOMAIN **) db_private_alloc (thread_p, multi_range_opt->num_attrs * sizeof (TP_DOMAIN *));
       if (multi_range_opt->sort_col_dom == NULL)
@@ -23407,31 +23593,10 @@ btree_range_opt_check_add_index_key (THREAD_ENTRY * thread_p, BTREE_SCAN * bts, 
 
       for (i = 0; i < multi_range_opt->num_attrs; i++)
 	{
-	  multi_range_opt->sort_col_dom[i] = &tp_Null_domain;
+	  domain = (TP_DOMAIN *) domain_key_column (key_plan->asc_key_type, multi_range_opt->sort_att_idx[i]);
+	  assert (domain != NULL);
+	  multi_range_opt->sort_col_dom[i] = domain;
 	}
-      multi_range_opt->has_null_domain = true;
-    }
-
-  if (multi_range_opt->has_null_domain)
-    {
-      has_null_domain = false;
-      for (i = 0; i < multi_range_opt->num_attrs; i++)
-	{
-	  assert (multi_range_opt->sort_col_dom[i] != NULL);
-	  if (multi_range_opt->sort_col_dom[i] == &tp_Null_domain)
-	    {
-	      domain = tp_domain_resolve_value (&new_key_value[i], NULL);
-	      if (domain != &tp_Null_domain)
-		{
-		  multi_range_opt->sort_col_dom[i] = domain;
-		}
-	      else
-		{
-		  has_null_domain = true;
-		}
-	    }
-	}
-      multi_range_opt->has_null_domain = has_null_domain;
     }
 
   if (multi_range_opt->cnt == multi_range_opt->size)
@@ -24189,6 +24354,15 @@ exit_on_error:
  * thread_p (in) : Thread entry.
  * bts (in/out)	 : B-tree scan.
  */
+/*
+ * [리뷰] btree_ils_adjust_range — 루스 인덱스 스캔(ILS)에서 접두를 건너뛰도록 스캔 범위를 다음 접두로 당긴다 —
+ * btree_select_visible_object_for_range_scan 이 부르고 에러 코드를 돌려준다.
+ * develop: 범위가 그대로일 때 '정말 전진했는가' 를 확인하는 디버그 검증에서 cmp_res = btree_compare_key (target_key, &new_key,
+ * midxkey.domain, 1, 1, NULL) 을 썼다 — 비교 도메인을 지역 midxkey 에서 가져왔다.
+ * 이 PR: cmp_res = btree_compare_search_key (&bts->btid_int, target_key, &new_key, NULL) 로 바뀌어, target_key 가 탐색
+ * 키임을 명시하고 스캔이 고른 비교를 쓴다.
+ * 바뀐 것: 호출 치환 1줄(±1). #if !defined(NDEBUG) 안쪽이라 릴리스 동작에는 영향이 없다.
+ */
 static int
 btree_ils_adjust_range (THREAD_ENTRY * thread_p, BTREE_SCAN * bts)
 {
@@ -24425,8 +24599,8 @@ btree_ils_adjust_range (THREAD_ENTRY * thread_p, BTREE_SCAN * bts)
     {
       int cmp_res;
 
-      /* range did not modify, check if we're advancing */
-      cmp_res = btree_compare_key (target_key, &new_key, midxkey.domain, 1, 1, NULL);
+      /* range did not modify, check if we're advancing (the target is a search key) */
+      cmp_res = btree_compare_search_key (&bts->btid_int, target_key, &new_key, NULL);
       if (use_desc_index)
 	{
 	  assert (cmp_res == DB_GT);

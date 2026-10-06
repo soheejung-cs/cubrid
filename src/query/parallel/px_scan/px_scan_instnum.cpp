@@ -218,6 +218,15 @@ namespace parallel_scan
 #endif /* !SERVER_MODE */
 
 #if defined (SERVER_MODE) || defined (SA_MODE)
+  /*
+   * [리뷰] detect_instnum_mode — PX 스캔 result_handler 의 생성자가 한 번 불러, XASL 의 instnum 술어와 출력 컬럼을 보고 이 스캔의 ROWNUM 처리
+   * 방식(NONE/RENUMBER/ATOMIC_DRAW)을 정하고 pass-through ROWNUM 컬럼 인덱스와 atomic_instnum 의 초기 상태를 채워 돌려준다.
+   * develop: get_instnum_upper_limit_rhs (x, &draw.is_less_than) 로 상한 항의 rhs 와 부등호 종류만 받아 draw 에 넣었다. 한계값을 비교할 때
+   * 쓸 비교 계획은 가져오지 않았다.
+   * 이 PR: 같은 호출에 &draw.limit_compare 를 더 넘겨, 상한 항 inst_num() <= ? 가 컴파일·로드 단계에서 확정해 둔 DOMAIN_COMPARE_PLAN 포인터까지
+   * draw 에 보관한다. 모드 판정 분기는 그대로다.
+   * 바뀐 것: 호출 한 줄의 인자 추가(+1/-1). 게이트가 확정한 비교를 실행 단계로 실어 나르는 통로만 생겼고 제어 흐름은 바뀌지 않았다.
+   */
   instnum_mode
   detect_instnum_mode (XASL_NODE *x, std::vector<int> &rownum_col_indices, atomic_instnum &draw)
   {
@@ -239,7 +248,7 @@ namespace parallel_scan
       }
 
     /* the limit itself is resolved later, once a VAL_DESCR is available. */
-    draw.limit_rhs = get_instnum_upper_limit_rhs (x, &draw.is_less_than);
+    draw.limit_rhs = get_instnum_upper_limit_rhs (x, &draw.is_less_than, &draw.limit_compare);
     if (draw.limit_rhs != nullptr)
       {
 	mode = instnum_mode::ATOMIC_DRAW;
@@ -252,6 +261,16 @@ namespace parallel_scan
     return mode;
   }
 
+  /*
+   * [리뷰] resolve_instnum_limit — 워커의 write_initialize 가 writer_results_mutex 안에서 한 번 불러, VAL_DESCR 가 생긴 뒤
+   * instnum 상한 rhs 를 실제 값으로 평가해 BIGINT 한계로 바꿔 atomic_instnum 에 고정한다. NO_ERROR 또는 ER_FAILED 를 돌려준다.
+   * develop: BIGINT 로 coerce 한 값이 반올림 탓에 원래 한계를 넘는지 tp_value_compare (&coerced, limit_val, 1, 0) 으로 그 자리에서 비교했다
+   * — 두 값의 도메인·콜레이션을 호출 시점에 맞추는 비교다.
+   * 이 PR: eval_compare_values_resolved (thread_p, draw.limit_compare, vd, &coerced, limit_val, 0, NULL) 로, 그 항이
+   * 게이트에서 확정해 둔 비교를 그대로 쓴다. do_coercion 인자는 사라지고(해결된 비교가 들고 있다) total_order 0 은 유지된다. NULL rhs·DOMAIN_OVERFLOW
+   * 분기는 그대로다.
+   * 바뀐 것: 비교 호출 1건 교체(+3/-2)와 주석 1줄. 분기·반환 구조는 불변.
+   */
   int
   resolve_instnum_limit (THREAD_ENTRY *thread_p, atomic_instnum &draw, VAL_DESCR *vd)
   {
@@ -276,8 +295,10 @@ namespace parallel_scan
 	      {
 		/* The coercion rounds, so ask the comparison itself - the question serial asks every
 		 * row - whether the rounded candidate qualifies, and step down once if it does not.
-		 * Rounding lands within 1, so that candidate and its predecessor are the only two. */
-		DB_VALUE_COMPARE_RESULT cmp = tp_value_compare (&coerced, limit_val, 1, 0);
+		 * Rounding lands within 1, so that candidate and its predecessor are the only two.
+		 * It is the term's own comparison, as the load or resolve_domains resolved it. */
+		DB_VALUE_COMPARE_RESULT cmp =
+			eval_compare_values_resolved (thread_p, draw.limit_compare, vd, &coerced, limit_val, 0, NULL);
 		const bool qualifies = draw.is_less_than ? (cmp == DB_LT) : (cmp != DB_GT);
 		if (!qualifies)
 		  {

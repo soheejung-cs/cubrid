@@ -5610,8 +5610,37 @@ determine_round (char *out_str, int *out_prec, int *out_scale, int tmp_int_len, 
  *	 It is not localized in relation to fractional and digit
  *	 grouping symbols.
  */
+/*
+ * [리뷰] numeric_coerce_string_to_num — 문자열을 NUMERIC DB_VALUE 로 파싱하는 공개 진입점 — 파서·실행 엔진 여러 곳이 부르고, 실패하면 에러 스택에 올린
+ * 뒤 에러 코드를 돌려준다.
+ * develop: 파싱 본문 전체를 직접 들고 있었고, 오버플로 두 자리에서 tp_domain_resolve_default (DB_TYPE_NUMERIC) 로 타입명을 만들어 er_set 했다.
+ * 이 PR: 본문을 numeric_coerce_string_to_num_status 로 옮기고, 그 상태가 ER_IT_DATA_OVERFLOW 일 때만 pr_type_name
+ * (DB_TYPE_NUMERIC) 로 er_set 한다.
+ * 바뀐 것: 본문 → 10줄짜리 래퍼. '변환기는 상태만 돌려주고 에러 공표는 레거시 진입점만 한다'는 이 PR 의 규약을 세운다.
+ */
 int
 numeric_coerce_string_to_num (const char *astring, int astring_length, INTL_CODESET codeset, DB_VALUE * result)
+{
+  int ret = numeric_coerce_string_to_num_status (astring, astring_length, codeset, result);
+  if (ret == ER_IT_DATA_OVERFLOW)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_IT_DATA_OVERFLOW, 1, pr_type_name (DB_TYPE_NUMERIC));
+    }
+  return ret;
+}
+
+/* The converters return a status; only the legacy wrapper publishes an error. */
+/*
+ * [리뷰] numeric_coerce_string_to_num_status — numeric_coerce_string_to_num 과 object_domain_convert.cpp 의
+ * 문자열→NUMERIC 변환 셀(tp_value_convert_number)이 공유하는 본문 — 에러를 올리지 않고 NO_ERROR / ER_IT_DATA_OVERFLOW / ER_FAILED 만
+ * 돌려준다.
+ * develop: develop 에는 별도 함수가 없었다 — 같은 코드가 numeric_coerce_string_to_num 안에 있었고 오버플로 때 er_set 까지 했다.
+ * 이 PR: er_set 두 자리와 지역 TP_DOMAIN *domain 을 들어내고 상태만 반환한다. 에러 반환이 `ret == NO_ERROR ? ER_FAILED : ret` 로 바뀌어,
+ * develop 이 끼워 넣던 er_errid() 조회(스택에 남아 있던 다른 에러를 집어오던 동작)가 빠졌다.
+ * 바뀐 것: 함수 분리 + er_set 2곳 삭제 + 에러 반환 1줄 변경. 행마다 도는 변환 경로에서 에러 스택을 건드리지 않게 만든다.
+ */
+int
+numeric_coerce_string_to_num_status (const char *astring, int astring_length, INTL_CODESET codeset, DB_VALUE * result)
 {
   char num_string[DB_MAX_NUMERIC_PRECISION + 1];
   unsigned char num[DB_NUMERIC_BUF_SIZE];
@@ -5623,7 +5652,6 @@ numeric_coerce_string_to_num (const char *astring, int astring_length, INTL_CODE
   char int_digits[NUMERIC_MAX_STRING_SIZE];	/* Integer part valid digits */
   char frac_digits[NUMERIC_MAX_STRING_SIZE];	/* Fractional part valid digits */
   int ret = NO_ERROR;
-  TP_DOMAIN *domain;
 
   /* Parse and compute precision/scale */
   ret =
@@ -5631,11 +5659,6 @@ numeric_coerce_string_to_num (const char *astring, int astring_length, INTL_CODE
 			    &frac_len, &frac_first_sig_digit, &frac_last_sig_digit, &is_zero);
   if (ret != NO_ERROR)
     {
-      if (ret == ER_IT_DATA_OVERFLOW)
-	{
-	  domain = tp_domain_resolve_default (DB_TYPE_NUMERIC);
-	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_IT_DATA_OVERFLOW, 1, pr_type_name (TP_DOMAIN_TYPE (domain)));
-	}
       goto exit_on_error;
     }
 
@@ -5657,8 +5680,6 @@ numeric_coerce_string_to_num (const char *astring, int astring_length, INTL_CODE
       /* If there is no overflow, try to parse the decimal string */
       if (prec > DB_MAX_NUMERIC_PRECISION || scale < DB_MIN_NUMERIC_SCALE)
 	{
-	  domain = tp_domain_resolve_default (DB_TYPE_NUMERIC);
-	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_IT_DATA_OVERFLOW, 1, pr_type_name (TP_DOMAIN_TYPE (domain)));
 	  ret = ER_IT_DATA_OVERFLOW;
 	  goto exit_on_error;
 	}
@@ -5675,7 +5696,7 @@ exit_on_error:
 
   db_value_domain_init (result, DB_TYPE_NUMERIC, DB_DEFAULT_NUMERIC_PRECISION, DB_DEFAULT_NUMERIC_SCALE);
 
-  return (ret == NO_ERROR && (ret = er_errid ()) == NO_ERROR) ? ER_FAILED : ret;
+  return ret == NO_ERROR ? ER_FAILED : ret;
 }
 
 /*
@@ -6423,8 +6444,21 @@ numeric_words_to_bytes (const uint64_t * src, int src_words, uint8_t * dest)
  * they are set to 0, the precision and scale are set to be the maximum
  * amount necessary in order to preserve as much data as possible.
  */
+/* *INDENT-OFF* */
+template <DB_TYPE SRC>
+/*
+ * [리뷰] numeric_coerce_value_to_num — 소스 타입 SRC 가 컴파일 시점에 정해진 숫자→NUMERIC 변환 — object_domain_convert.cpp 의
+ * tp_value_convert_number<SRC, NUMERIC, MODE> 가 부르고, 8개 타입으로 명시적 인스턴스화된다.
+ * develop: develop 에는 이 이름의 함수가 없었다. 같은 본문이 numeric_db_value_coerce_to_num 안에 있었고 DB_VALUE_TYPE (src) 로 행마다
+ * switch 했다.
+ * 이 PR: `template <DB_TYPE SRC>` + if constexpr 사슬로 바뀌어, 변환 셀마다 자기 타입 코드만 남는다. default 대신 static_assert 로 빠진
+ * 타입을 빌드에서 잡는다. src 가 const DB_VALUE * 가 됐고, MONETARY 는 db_value_get_monetary_amount_as_double →
+ * db_get_monetary(src)->amount(같은 값, NULL 검사만 없다).
+ * 바뀐 것: 시그니처 교체(비const→const, 템플릿화), switch 약 90줄 → if constexpr, exit_on_error 반환에서 er_errid() 조회 제거, 명시적
+ * 인스턴스화 8줄 추가.
+ */
 int
-numeric_db_value_coerce_to_num (DB_VALUE * src, DB_VALUE * dest, DB_DATA_STATUS * data_status)
+numeric_coerce_value_to_num (const DB_VALUE *src, DB_VALUE *dest, DB_DATA_STATUS *data_status)
 {
   int ret = NO_ERROR;
   unsigned char num[DB_NUMERIC_BUF_SIZE];	/* copy of a DB_C_NUMERIC */
@@ -6436,89 +6470,72 @@ numeric_db_value_coerce_to_num (DB_VALUE * src, DB_VALUE * dest, DB_DATA_STATUS 
   desired_precision = DB_VALUE_PRECISION (dest);
   desired_scale = DB_VALUE_SCALE (dest);
   /* Check for a non NULL src and a dest whose type is DB_TYPE_NUMERIC */
-  /* Switch on the src type */
-  switch (DB_VALUE_TYPE (src))
+  /* The source type is fixed by the caller. */
+  if constexpr (SRC == DB_TYPE_DOUBLE)
     {
-    case DB_TYPE_DOUBLE:
-      {
-	double adouble = db_get_double (src);
-	ret = numeric_internal_double_to_num (adouble, desired_scale, num, &precision, &scale, &num_is_negative);
-	break;
-      }
-
-    case DB_TYPE_FLOAT:
-      {
-	float adouble = (float) db_get_float (src);
-	ret = numeric_internal_float_to_num (adouble, desired_scale, num, &precision, &scale, &num_is_negative);
-	break;
-      }
-
-    case DB_TYPE_MONETARY:
-      {
-	double adouble = db_value_get_monetary_amount_as_double (src);
-	ret = numeric_internal_double_to_num (adouble, desired_scale, num, &precision, &scale, &num_is_negative);
-	break;
-      }
-
-    case DB_TYPE_INTEGER:
-      {
-	int anint = db_get_int (src);
-
-	numeric_coerce_int_to_num (anint, num, &num_is_negative);
-	precision = get_significant_digit (anint);
-	scale = 0;
-	break;
-      }
-
-    case DB_TYPE_SMALLINT:
-      {
-	int anint = (int) db_get_short (src);
-
-	numeric_coerce_int_to_num (anint, num, &num_is_negative);
-	precision = get_significant_digit (anint);
-	scale = 0;
-	break;
-      }
-
-    case DB_TYPE_BIGINT:
-      {
-	DB_BIGINT bigint = db_get_bigint (src);
-
-	numeric_coerce_bigint_to_num (bigint, num, &num_is_negative);
-	precision = get_significant_digit (bigint);
-	desired_precision = MAX (desired_precision, precision);
-	scale = 0;
-	break;
-      }
-
-    case DB_TYPE_NUMERIC:
-      {
-	bool src_is_float_numeric = false;
-	db_get_numeric_precision_and_scale (src, &precision, &scale, &src_is_float_numeric);
-
-	if (!src_is_float_numeric && precision == (unsigned char) DB_HJOIN_NUMERIC_PRECISION_DEFERRED)
-	  {
-	    precision = numeric_get_precision_digits (db_locate_numeric (src));
-	  }
-
-	numeric_copy (num, db_locate_numeric (src));
-	num_is_negative = numeric_is_negative (src);
-	break;
-      }
-
-    case DB_TYPE_ENUMERATION:
-      {
-	int anint = db_get_enum_short (src);
-	numeric_coerce_int_to_num (anint, num, &num_is_negative);
-	precision = 5;
-	scale = 0;
-	break;
-      }
-
-    default:
-      ret = ER_FAILED;
-      break;
+      double adouble = db_get_double (src);
+      ret = numeric_internal_double_to_num (adouble, desired_scale, num, &precision, &scale, &num_is_negative);
     }
+  else if constexpr (SRC == DB_TYPE_FLOAT)
+    {
+      float adouble = (float) db_get_float (src);
+      ret = numeric_internal_float_to_num (adouble, desired_scale, num, &precision, &scale, &num_is_negative);
+    }
+  else if constexpr (SRC == DB_TYPE_MONETARY)
+    {
+      double adouble = db_get_monetary (src)->amount;
+      ret = numeric_internal_double_to_num (adouble, desired_scale, num, &precision, &scale, &num_is_negative);
+    }
+  else if constexpr (SRC == DB_TYPE_INTEGER)
+    {
+      int anint = db_get_int (src);
+
+      numeric_coerce_int_to_num (anint, num, &num_is_negative);
+      precision = get_significant_digit (anint);
+      scale = 0;
+    }
+  else if constexpr (SRC == DB_TYPE_SMALLINT)
+    {
+      int anint = (int) db_get_short (src);
+
+      numeric_coerce_int_to_num (anint, num, &num_is_negative);
+      precision = get_significant_digit (anint);
+      scale = 0;
+    }
+  else if constexpr (SRC == DB_TYPE_BIGINT)
+    {
+      DB_BIGINT bigint = db_get_bigint (src);
+
+      numeric_coerce_bigint_to_num (bigint, num, &num_is_negative);
+      precision = get_significant_digit (bigint);
+      desired_precision = MAX (desired_precision, precision);
+      scale = 0;
+    }
+  else if constexpr (SRC == DB_TYPE_NUMERIC)
+    {
+      bool src_is_float_numeric = false;
+      db_get_numeric_precision_and_scale (src, &precision, &scale, &src_is_float_numeric);
+
+      if (!src_is_float_numeric && precision == (unsigned char) DB_HJOIN_NUMERIC_PRECISION_DEFERRED)
+	{
+	  precision = numeric_get_precision_digits (db_locate_numeric (src));
+	}
+
+      numeric_copy (num, db_locate_numeric (src));
+      num_is_negative = numeric_is_negative (src);
+    }
+  else if constexpr (SRC == DB_TYPE_ENUMERATION)
+    {
+      int anint = db_get_enum_short (src);
+      numeric_coerce_int_to_num (anint, num, &num_is_negative);
+      precision = 5;
+      scale = 0;
+    }
+  else
+    {
+      static_assert (SRC != SRC, "missing numeric source conversion");
+    }
+
 
   /* Make the destination value */
   if (ret == NO_ERROR)
@@ -6557,8 +6574,53 @@ exit_on_error:
       *data_status = DATA_STATUS_TRUNCATED;
     }
 
-  return (ret == NO_ERROR && (ret = er_errid ()) == NO_ERROR) ? ER_FAILED : ret;
+  return ret == NO_ERROR ? ER_FAILED : ret;
 }
+
+template int numeric_coerce_value_to_num<DB_TYPE_DOUBLE> (const DB_VALUE *, DB_VALUE *, DB_DATA_STATUS *);
+template int numeric_coerce_value_to_num<DB_TYPE_FLOAT> (const DB_VALUE *, DB_VALUE *, DB_DATA_STATUS *);
+template int numeric_coerce_value_to_num<DB_TYPE_MONETARY> (const DB_VALUE *, DB_VALUE *, DB_DATA_STATUS *);
+template int numeric_coerce_value_to_num<DB_TYPE_INTEGER> (const DB_VALUE *, DB_VALUE *, DB_DATA_STATUS *);
+template int numeric_coerce_value_to_num<DB_TYPE_SMALLINT> (const DB_VALUE *, DB_VALUE *, DB_DATA_STATUS *);
+template int numeric_coerce_value_to_num<DB_TYPE_BIGINT> (const DB_VALUE *, DB_VALUE *, DB_DATA_STATUS *);
+template int numeric_coerce_value_to_num<DB_TYPE_NUMERIC> (const DB_VALUE *, DB_VALUE *, DB_DATA_STATUS *);
+template int numeric_coerce_value_to_num<DB_TYPE_ENUMERATION> (const DB_VALUE *, DB_VALUE *, DB_DATA_STATUS *);
+
+/*
+ * [리뷰] numeric_db_value_coerce_to_num — 소스 타입이 런타임에만 정해지는 옛 진입점 — 여러 모듈이 그대로 부르고, DB_VALUE_TYPE (src) 로
+ * numeric_coerce_value_to_num 의 해당 인스턴스를 고른다.
+ * develop: 본문 전체(타입별 switch + NUMERIC 생성 + data_status 설정 + 두 개의 반환 경로)를 직접 들고 있었다.
+ * 이 PR: 8갈래 switch 로 템플릿 인스턴스를 고르는 26줄 디스패처가 됐다. default 는 *data_status = DATA_STATUS_OK 로 쓰고 ER_FAILED 를
+ * 돌려준다.
+ * 바뀐 것: 본문 → 디스패처. develop 의 default 는 data_status 를 전혀 건드리지 않았는데 지금은 DATA_STATUS_OK 로 덮는다.
+ */
+int
+numeric_db_value_coerce_to_num (DB_VALUE *src, DB_VALUE *dest, DB_DATA_STATUS *data_status)
+{
+  switch (DB_VALUE_TYPE (src))
+    {
+    case DB_TYPE_DOUBLE:
+      return numeric_coerce_value_to_num<DB_TYPE_DOUBLE> (src, dest, data_status);
+    case DB_TYPE_FLOAT:
+      return numeric_coerce_value_to_num<DB_TYPE_FLOAT> (src, dest, data_status);
+    case DB_TYPE_MONETARY:
+      return numeric_coerce_value_to_num<DB_TYPE_MONETARY> (src, dest, data_status);
+    case DB_TYPE_INTEGER:
+      return numeric_coerce_value_to_num<DB_TYPE_INTEGER> (src, dest, data_status);
+    case DB_TYPE_SMALLINT:
+      return numeric_coerce_value_to_num<DB_TYPE_SMALLINT> (src, dest, data_status);
+    case DB_TYPE_BIGINT:
+      return numeric_coerce_value_to_num<DB_TYPE_BIGINT> (src, dest, data_status);
+    case DB_TYPE_NUMERIC:
+      return numeric_coerce_value_to_num<DB_TYPE_NUMERIC> (src, dest, data_status);
+    case DB_TYPE_ENUMERATION:
+      return numeric_coerce_value_to_num<DB_TYPE_ENUMERATION> (src, dest, data_status);
+    default:
+      *data_status = DATA_STATUS_OK;
+      return ER_FAILED;
+    }
+}
+/* *INDENT-ON* */
 
 /*
  * numeric_db_value_coerce_from_num () -
@@ -6569,6 +6631,173 @@ exit_on_error:
  *
  * Note: This routine converts a DB_VALUE of type DB_TYPE_NUMERIC into some
  * numerical type.
+ */
+/*
+ * [리뷰] numeric_coerce_num_to_double — NUMERIC → DOUBLE 변환 한 칸 — object_domain_convert.cpp 의
+ * tp_numeric_from_num<DOUBLE, false> 와 numeric_db_value_coerce_from_num 이 공유한다. 성공 NO_ERROR, 넘치면
+ * ER_IT_DATA_OVERFLOW.
+ * develop: develop 에 이 시그니처의 함수는 없었다 — numeric_db_value_coerce_from_num 의 DB_TYPE_DOUBLE case 블록이었다.
+ * 이 PR: 독립 함수. 내용은 develop 의 case 와 같다(저수준 numeric_coerce_num_to_double 로 double 을 얻고 OR_CHECK_DOUBLE_OVERFLOW
+ * 후 db_make_double).
+ * 바뀐 것: case 블록 → 공개 함수 19줄, 헤더에 __cplusplus 가드로 선언. 이름이 기존 저수준 함수(…, double *adouble)와 같고 마지막 인자 타입으로만 갈리는
+ * 오버로드가 됐고, 새 함수가 그 옛 함수를 안에서 부른다.
+ */
+int
+numeric_coerce_num_to_double (const DB_VALUE * src, int scale, DB_VALUE * dest)
+{
+  int ret = NO_ERROR;
+
+  double adouble;
+  numeric_coerce_num_to_double (src, scale, &adouble);
+  if (OR_CHECK_DOUBLE_OVERFLOW (adouble))
+    {
+      ret = ER_IT_DATA_OVERFLOW;
+      goto exit_on_error;
+    }
+  db_make_double (dest, adouble);
+
+  return ret;
+
+exit_on_error:
+  return ret == NO_ERROR ? ER_FAILED : ret;
+}
+
+/*
+ * [리뷰] numeric_coerce_num_to_float — NUMERIC → FLOAT 변환 한 칸 — tp_numeric_from_num<FLOAT, false> 와
+ * numeric_db_value_coerce_from_num 이 공유한다.
+ * develop: develop 에 없음 — numeric_db_value_coerce_from_num 의 DB_TYPE_FLOAT case 블록이었다.
+ * 이 PR: 독립 함수. double 로 받아 OR_CHECK_FLOAT_OVERFLOW 후 db_make_float — develop case 와 동일.
+ * 바뀐 것: case 블록 → 공개 함수 19줄.
+ */
+int
+numeric_coerce_num_to_float (const DB_VALUE * src, int scale, DB_VALUE * dest)
+{
+  int ret = NO_ERROR;
+
+  double adouble;
+  numeric_coerce_num_to_double (src, scale, &adouble);
+  if (OR_CHECK_FLOAT_OVERFLOW (adouble))
+    {
+      ret = ER_IT_DATA_OVERFLOW;
+      goto exit_on_error;
+    }
+  db_make_float (dest, (float) adouble);
+
+  return ret;
+
+exit_on_error:
+  return ret == NO_ERROR ? ER_FAILED : ret;
+}
+
+/*
+ * [리뷰] numeric_coerce_num_to_monetary — NUMERIC → MONETARY 변환 한 칸 — tp_numeric_from_num<MONETARY, false> 와
+ * numeric_db_value_coerce_from_num 이 공유한다.
+ * develop: develop 에 없음 — numeric_db_value_coerce_from_num 의 DB_TYPE_MONETARY case 블록이었다.
+ * 이 PR: 독립 함수. develop 과 마찬가지로 범위 검사 없이 db_make_monetary (dest, DB_CURRENCY_DEFAULT, adouble) 하고 항상 NO_ERROR.
+ * 바뀐 것: case 블록 → 공개 함수 12줄. exit_on_error 라벨이 없는 유일한 비-strict 변환이다.
+ */
+int
+numeric_coerce_num_to_monetary (const DB_VALUE * src, int scale, DB_VALUE * dest)
+{
+  int ret = NO_ERROR;
+
+  double adouble;
+  numeric_coerce_num_to_double (src, scale, &adouble);
+  db_make_monetary (dest, DB_CURRENCY_DEFAULT, adouble);
+
+  return ret;
+
+}
+
+/*
+ * [리뷰] numeric_coerce_num_to_int — NUMERIC → INTEGER 변환 한 칸 — tp_numeric_from_num<INTEGER, false> 와
+ * numeric_db_value_coerce_from_num 이 공유한다.
+ * develop: develop 에 없음 — numeric_db_value_coerce_from_num 의 DB_TYPE_INTEGER case 블록이었다.
+ * 이 PR: 독립 함수. OR_CHECK_INT_OVERFLOW 후 db_make_int (dest, (int) ROUND (adouble)) — develop case 와 동일(반올림한다).
+ * 바뀐 것: case 블록 → 공개 함수 19줄.
+ */
+int
+numeric_coerce_num_to_int (const DB_VALUE * src, int scale, DB_VALUE * dest)
+{
+  int ret = NO_ERROR;
+
+  double adouble;
+  numeric_coerce_num_to_double (src, scale, &adouble);
+  if (OR_CHECK_INT_OVERFLOW (adouble))
+    {
+      ret = ER_IT_DATA_OVERFLOW;
+      goto exit_on_error;
+    }
+  db_make_int (dest, (int) ROUND (adouble));
+
+  return ret;
+
+exit_on_error:
+  return ret == NO_ERROR ? ER_FAILED : ret;
+}
+
+/*
+ * [리뷰] numeric_coerce_num_to_bigint — NUMERIC → BIGINT 변환 한 칸 — tp_numeric_from_num<BIGINT, false> 와
+ * numeric_db_value_coerce_from_num 이 공유한다.
+ * develop: develop 에 이 시그니처는 없었다 — numeric_db_value_coerce_from_num 의 DB_TYPE_BIGINT case 블록이 저수준
+ * numeric_coerce_num_to_bigint (DB_C_NUMERIC, int, DB_BIGINT *, bool) 를 직접 불렀다.
+ * 이 PR: 독립 함수가 되어 같은 저수준 함수를 부르고 db_make_bigint 까지 한다.
+ * 바뀐 것: case 블록 → 공개 함수 19줄. 저수준 동명 함수와 인자 개수·타입으로만 갈리는 오버로드다.
+ */
+int
+numeric_coerce_num_to_bigint (const DB_VALUE * src, int scale, DB_VALUE * dest)
+{
+  int ret = NO_ERROR;
+
+  DB_BIGINT bint;
+  ret = numeric_coerce_num_to_bigint (db_locate_numeric (src), scale, &bint, numeric_is_negative (src));
+  if (ret != NO_ERROR)
+    {
+      goto exit_on_error;
+    }
+
+  db_make_bigint (dest, bint);
+
+  return ret;
+
+exit_on_error:
+  return ret == NO_ERROR ? ER_FAILED : ret;
+}
+
+/*
+ * [리뷰] numeric_coerce_num_to_short — NUMERIC → SMALLINT 변환 한 칸 — tp_numeric_from_num<SHORT, false> 와
+ * numeric_db_value_coerce_from_num 이 공유한다.
+ * develop: develop 에 없음 — numeric_db_value_coerce_from_num 의 DB_TYPE_SMALLINT case 블록이었다.
+ * 이 PR: 독립 함수. OR_CHECK_SHORT_OVERFLOW 후 db_make_short (…, (DB_C_SHORT) ROUND (adouble)) — develop case 와 동일.
+ * 바뀐 것: case 블록 → 공개 함수 19줄.
+ */
+int
+numeric_coerce_num_to_short (const DB_VALUE * src, int scale, DB_VALUE * dest)
+{
+  int ret = NO_ERROR;
+
+  double adouble;
+  numeric_coerce_num_to_double (src, scale, &adouble);
+  if (OR_CHECK_SHORT_OVERFLOW (adouble))
+    {
+      ret = ER_IT_DATA_OVERFLOW;
+      goto exit_on_error;
+    }
+  db_make_short (dest, (DB_C_SHORT) ROUND (adouble));
+
+  return ret;
+
+exit_on_error:
+  return ret == NO_ERROR ? ER_FAILED : ret;
+}
+
+/*
+ * [리뷰] numeric_db_value_coerce_from_num — NUMERIC DB_VALUE 를 dest 의 도메인 타입으로 바꿔 넣는 옛 진입점 — 여러 모듈이 그대로 부르고
+ * data_status 로 절단 여부를 알린다.
+ * develop: DOUBLE/FLOAT/MONETARY/INTEGER/BIGINT/SMALLINT 여섯 case 가 각각 변환 코드를 직접 갖고 있었다(약 90줄).
+ * 이 PR: 그 여섯 case 가 numeric_coerce_num_to_* 호출 + 에러면 exit_on_error 로 바뀌었다. NUMERIC·문자형 등 나머지 case 와 끝의 `(ret
+ * == NO_ERROR && (ret = er_errid ()) == NO_ERROR) ? ER_FAILED : ret` 반환은 그대로다.
+ * 바뀐 것: case 본문 약 90줄 → 호출 6개(약 -60줄). 동작은 같고, 같은 변환을 object_domain_convert.cpp 의 변환 셀과 한 몸으로 쓰게 만드는 것이 목적이다.
  */
 int
 numeric_db_value_coerce_from_num (DB_VALUE * src, DB_VALUE * dest, DB_DATA_STATUS * data_status)
@@ -6583,77 +6812,52 @@ numeric_db_value_coerce_from_num (DB_VALUE * src, DB_VALUE * dest, DB_DATA_STATU
   switch (DB_VALUE_DOMAIN_TYPE (dest))
     {
     case DB_TYPE_DOUBLE:
-      {
-	double adouble;
-	numeric_coerce_num_to_double (src, scale, &adouble);
-	if (OR_CHECK_DOUBLE_OVERFLOW (adouble))
-	  {
-	    ret = ER_IT_DATA_OVERFLOW;
-	    goto exit_on_error;
-	  }
-	db_make_double (dest, adouble);
-	break;
-      }
+      ret = numeric_coerce_num_to_double (src, scale, dest);
+      if (ret != NO_ERROR)
+	{
+	  goto exit_on_error;
+	}
+      break;
 
     case DB_TYPE_FLOAT:
-      {
-	double adouble;
-	numeric_coerce_num_to_double (src, scale, &adouble);
-	if (OR_CHECK_FLOAT_OVERFLOW (adouble))
-	  {
-	    ret = ER_IT_DATA_OVERFLOW;
-	    goto exit_on_error;
-	  }
-	db_make_float (dest, (float) adouble);
-	break;
-      }
+      ret = numeric_coerce_num_to_float (src, scale, dest);
+      if (ret != NO_ERROR)
+	{
+	  goto exit_on_error;
+	}
+      break;
 
     case DB_TYPE_MONETARY:
-      {
-	double adouble;
-	numeric_coerce_num_to_double (src, scale, &adouble);
-	db_make_monetary (dest, DB_CURRENCY_DEFAULT, adouble);
-	break;
-      }
+      ret = numeric_coerce_num_to_monetary (src, scale, dest);
+      if (ret != NO_ERROR)
+	{
+	  goto exit_on_error;
+	}
+      break;
 
     case DB_TYPE_INTEGER:
-      {
-	double adouble;
-	numeric_coerce_num_to_double (src, scale, &adouble);
-	if (OR_CHECK_INT_OVERFLOW (adouble))
-	  {
-	    ret = ER_IT_DATA_OVERFLOW;
-	    goto exit_on_error;
-	  }
-	db_make_int (dest, (int) ROUND (adouble));
-	break;
-      }
+      ret = numeric_coerce_num_to_int (src, scale, dest);
+      if (ret != NO_ERROR)
+	{
+	  goto exit_on_error;
+	}
+      break;
 
     case DB_TYPE_BIGINT:
-      {
-	DB_BIGINT bint;
-	ret = numeric_coerce_num_to_bigint (db_locate_numeric (src), scale, &bint, numeric_is_negative (src));
-	if (ret != NO_ERROR)
-	  {
-	    goto exit_on_error;
-	  }
-
-	db_make_bigint (dest, bint);
-	break;
-      }
+      ret = numeric_coerce_num_to_bigint (src, scale, dest);
+      if (ret != NO_ERROR)
+	{
+	  goto exit_on_error;
+	}
+      break;
 
     case DB_TYPE_SMALLINT:
-      {
-	double adouble;
-	numeric_coerce_num_to_double (src, scale, &adouble);
-	if (OR_CHECK_SHORT_OVERFLOW (adouble))
-	  {
-	    ret = ER_IT_DATA_OVERFLOW;
-	    goto exit_on_error;
-	  }
-	db_make_short (dest, (DB_C_SHORT) ROUND (adouble));
-	break;
-      }
+      ret = numeric_coerce_num_to_short (src, scale, dest);
+      if (ret != NO_ERROR)
+	{
+	  goto exit_on_error;
+	}
+      break;
 
     case DB_TYPE_NUMERIC:
       {
@@ -6766,105 +6970,146 @@ exit_on_error:
 }
 
 /*
- * numeric_db_value_coerce_from_num_strict () - coerce a numeric to the type
- *						of dest
- * return : error code or NO_ERROR
- * src (in)	: the numeric value
- * dest(in/out) : the value to coerce to
+ * [리뷰] numeric_coerce_num_to_double_strict — 비교·피연산자 변환 모드의 엄격 NUMERIC → DOUBLE — object_domain_convert.cpp 의
+ * tp_numeric_from_num<DOUBLE, true> 가 부른다.
+ * develop: develop 에 없음 — numeric_db_value_coerce_from_num_strict (numeric_opfunc.c:6776) 의 DB_TYPE_DOUBLE
+ * case 였고, 그 함수는 switch 를 빠져나와 **성공해도 마지막에 return ER_FAILED** 였다(호출자 object_domain.c 6곳이 그 값을 err 로 받았다).
+ * 이 PR: 독립 함수로 쪼개면서 그 동작을 그대로 남겼다 — 오버플로면 ER_FAILED, 아니면 db_make_double 로 값을 쓴 **뒤에도** ER_FAILED 를 돌려준다. 주석이
+ * 'Preserve the legacy strict entry point, including its failure after writing a value' 로 의도임을 못박는다.
+ * 바뀐 것: develop 함수 106줄을 6개로 분해한 첫 조각(15줄). 헤더에서 numeric_db_value_coerce_from_num_strict 선언이 삭제됐다.
+ * [지적 A1-02]
  */
 int
-numeric_db_value_coerce_from_num_strict (DB_VALUE * src, DB_VALUE * dest)
+numeric_coerce_num_to_double_strict (const DB_VALUE * src, int scale, DB_VALUE * dest)
+{
+
+  double adouble;
+  numeric_coerce_num_to_double (src, scale, &adouble);
+  if (OR_CHECK_DOUBLE_OVERFLOW (adouble))
+    {
+      return ER_FAILED;
+    }
+  db_make_double (dest, adouble);
+
+  /* Preserve the legacy strict entry point, including its failure after writing a value. */
+  return ER_FAILED;
+}
+
+/*
+ * [리뷰] numeric_coerce_num_to_float_strict — 엄격 NUMERIC → FLOAT — tp_numeric_from_num<FLOAT, true> 가 부른다.
+ * develop: develop 에 없음 — numeric_db_value_coerce_from_num_strict 의 DB_TYPE_FLOAT case.
+ * 이 PR: OR_CHECK_FLOAT_OVERFLOW 로 거르고 db_make_float 한 뒤 성공 경로도 ER_FAILED 를 돌려준다(레거시 유지).
+ * 바뀐 것: case 블록 → 공개 함수 15줄.
+ */
+int
+numeric_coerce_num_to_float_strict (const DB_VALUE * src, int scale, DB_VALUE * dest)
+{
+
+  double adouble;
+  numeric_coerce_num_to_double (src, scale, &adouble);
+  if (OR_CHECK_FLOAT_OVERFLOW (adouble))
+    {
+      return ER_FAILED;
+    }
+  db_make_float (dest, (float) adouble);
+
+  /* Preserve the legacy strict entry point, including its failure after writing a value. */
+  return ER_FAILED;
+}
+
+/*
+ * [리뷰] numeric_coerce_num_to_monetary_strict — 엄격 NUMERIC → MONETARY — tp_numeric_from_num<MONETARY, true> 가
+ * 부른다.
+ * develop: develop 에 없음 — numeric_db_value_coerce_from_num_strict 의 DB_TYPE_MONETARY case. 그 case 는 MONETARY
+ * 인데도 OR_CHECK_FLOAT_OVERFLOW 를 썼다.
+ * 이 PR: 그 범위 검사까지 그대로 옮겼고, 성공 경로도 ER_FAILED 를 돌려준다.
+ * 바뀐 것: case 블록 → 공개 함수 15줄. develop 의 FLOAT 범위 검사를 의도적으로 보존했다(비-strict 쪽 numeric_coerce_num_to_monetary 는 검사가
+ * 없다 — 두 경로가 서로 다르다).
+ */
+int
+numeric_coerce_num_to_monetary_strict (const DB_VALUE * src, int scale, DB_VALUE * dest)
+{
+
+  double adouble;
+  numeric_coerce_num_to_double (src, scale, &adouble);
+  if (OR_CHECK_FLOAT_OVERFLOW (adouble))
+    {
+      return ER_FAILED;
+    }
+  db_make_monetary (dest, DB_CURRENCY_DEFAULT, adouble);
+
+  /* Preserve the legacy strict entry point, including its failure after writing a value. */
+  return ER_FAILED;
+}
+
+/*
+ * [리뷰] numeric_coerce_num_to_int_strict — 엄격 NUMERIC → INTEGER — tp_numeric_from_num<INTEGER, true> 가 부른다.
+ * develop: develop 에 없음 — numeric_db_value_coerce_from_num_strict 의 DB_TYPE_INTEGER case.
+ * 이 PR: OR_CHECK_INT_OVERFLOW 이거나 소수부가 0 이 아니면 ER_FAILED. 아니면 db_make_int (…, (int) adouble) — 비-strict 쪽과 달리
+ * 반올림하지 않고 잘라낸다 — 한 뒤에도 ER_FAILED.
+ * 바뀐 것: case 블록 → 공개 함수 15줄.
+ */
+int
+numeric_coerce_num_to_int_strict (const DB_VALUE * src, int scale, DB_VALUE * dest)
+{
+
+  double adouble;
+  numeric_coerce_num_to_double (src, scale, &adouble);
+  if (OR_CHECK_INT_OVERFLOW (adouble) || !numeric_is_fraction_part_zero (src, scale))
+    {
+      return ER_FAILED;
+    }
+  db_make_int (dest, (int) (adouble));
+
+  /* Preserve the legacy strict entry point, including its failure after writing a value. */
+  return ER_FAILED;
+}
+
+/*
+ * [리뷰] numeric_coerce_num_to_bigint_strict — 엄격 NUMERIC → BIGINT — tp_numeric_from_num<BIGINT, true> 가 부른다.
+ * develop: develop 에 없음 — numeric_db_value_coerce_from_num_strict 의 DB_TYPE_BIGINT case.
+ * 이 PR: 저수준 numeric_coerce_num_to_bigint 가 실패하거나 소수부가 0 이 아니면 ER_FAILED, 아니면 db_make_bigint 뒤에도 ER_FAILED.
+ * 바뀐 것: case 블록 → 공개 함수 17줄.
+ */
+int
+numeric_coerce_num_to_bigint_strict (const DB_VALUE * src, int scale, DB_VALUE * dest)
 {
   int ret = NO_ERROR;
-  int scale = db_get_numeric_scale (src, NULL);
 
-  switch (DB_VALUE_DOMAIN_TYPE (dest))
+  DB_BIGINT bint;
+
+  ret = numeric_coerce_num_to_bigint (db_locate_numeric (src), scale, &bint, numeric_is_negative (src));
+  if (ret != NO_ERROR || !numeric_is_fraction_part_zero (src, scale))
     {
-    case DB_TYPE_DOUBLE:
-      {
-	double adouble;
-	numeric_coerce_num_to_double (src, scale, &adouble);
-	if (OR_CHECK_DOUBLE_OVERFLOW (adouble))
-	  {
-	    return ER_FAILED;
-	  }
-	db_make_double (dest, adouble);
-	break;
-      }
-
-    case DB_TYPE_FLOAT:
-      {
-	double adouble;
-	numeric_coerce_num_to_double (src, scale, &adouble);
-	if (OR_CHECK_FLOAT_OVERFLOW (adouble))
-	  {
-	    return ER_FAILED;
-	  }
-	db_make_float (dest, (float) adouble);
-	break;
-      }
-
-    case DB_TYPE_MONETARY:
-      {
-	double adouble;
-	numeric_coerce_num_to_double (src, scale, &adouble);
-	if (OR_CHECK_FLOAT_OVERFLOW (adouble))
-	  {
-	    return ER_FAILED;
-	  }
-	db_make_monetary (dest, DB_CURRENCY_DEFAULT, adouble);
-	break;
-      }
-
-    case DB_TYPE_INTEGER:
-      {
-	double adouble;
-	numeric_coerce_num_to_double (src, scale, &adouble);
-	if (OR_CHECK_INT_OVERFLOW (adouble) || !numeric_is_fraction_part_zero (src, scale))
-	  {
-	    return ER_FAILED;
-	  }
-	db_make_int (dest, (int) (adouble));
-	break;
-      }
-
-    case DB_TYPE_BIGINT:
-      {
-	DB_BIGINT bint;
-
-	ret = numeric_coerce_num_to_bigint (db_locate_numeric (src), scale, &bint, numeric_is_negative (src));
-	if (ret != NO_ERROR || !numeric_is_fraction_part_zero (src, scale))
-	  {
-	    return ER_FAILED;
-	  }
-	db_make_bigint (dest, bint);
-	break;
-      }
-
-    case DB_TYPE_SMALLINT:
-      {
-	double adouble;
-	numeric_coerce_num_to_double (src, scale, &adouble);
-	if (OR_CHECK_SHORT_OVERFLOW (adouble) || !numeric_is_fraction_part_zero (src, scale))
-	  {
-	    return ER_FAILED;
-	  }
-	db_make_short (dest, (DB_C_SHORT) ROUND (adouble));
-	break;
-      }
-
-    case DB_TYPE_NUMERIC:
-      {
-	DB_DATA_STATUS data_status = DATA_STATUS_OK;
-	ret = numeric_db_value_coerce_to_num (src, dest, &data_status);
-	break;
-      }
-
-    default:
-      ret = ER_FAILED;
-      break;
+      return ER_FAILED;
     }
+  db_make_bigint (dest, bint);
 
+  /* Preserve the legacy strict entry point, including its failure after writing a value. */
+  return ER_FAILED;
+}
+
+/*
+ * [리뷰] numeric_coerce_num_to_short_strict — 엄격 NUMERIC → SMALLINT — tp_numeric_from_num<SHORT, true> 가 부른다.
+ * develop: develop 에 없음 — numeric_db_value_coerce_from_num_strict 의 DB_TYPE_SMALLINT case. 그 함수 전체가 이 PR 에서
+ * 삭제됐다.
+ * 이 PR: OR_CHECK_SHORT_OVERFLOW 이거나 소수부가 0 이 아니면 ER_FAILED, 아니면 db_make_short (…, ROUND(adouble)) 뒤에도
+ * ER_FAILED.
+ * 바뀐 것: case 블록 → 공개 함수 15줄. 이로써 develop 의 numeric_db_value_coerce_from_num_strict 는 본문·선언 모두 사라졌다.
+ */
+int
+numeric_coerce_num_to_short_strict (const DB_VALUE * src, int scale, DB_VALUE * dest)
+{
+
+  double adouble;
+  numeric_coerce_num_to_double (src, scale, &adouble);
+  if (OR_CHECK_SHORT_OVERFLOW (adouble) || !numeric_is_fraction_part_zero (src, scale))
+    {
+      return ER_FAILED;
+    }
+  db_make_short (dest, (DB_C_SHORT) ROUND (adouble));
+
+  /* Preserve the legacy strict entry point, including its failure after writing a value. */
   return ER_FAILED;
 }
 

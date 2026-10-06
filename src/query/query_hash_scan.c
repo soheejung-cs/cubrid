@@ -30,11 +30,14 @@
 #endif
 
 #include "fetch.h"
+#include "domain_rules.h"
 #include "memory_alloc.h"
 #include "memory_hash.h"
 #include "object_domain.h"
+#include "object_domain_convert.h"
 #include "object_primitive.h"
 #include "object_representation.h"
+#include "query_executor.h"
 #include "query_opfunc.h"
 #include "string_opfunc.h"
 #include "query_hash_scan.h"
@@ -499,119 +502,280 @@ qdata_print_hash_scan_entry (THREAD_ENTRY * thread_p, FILE * fp, const void *dat
 }
 
 /*
- * qdata_copy_hscan_key () - deep copy hash key
- *   returns: pointer to new hash key
- *   thread_p(in): thread
- *   key(in): source key
+ * How one build key enters the hash table. Where a key pair's types differ (need_coerce_type), a build value is
+ * hashed in its probe key's domain, so that the values the join finds equal hash alike. The scan chooses between
+ * copying the value and converting it once per open, before its first build row, from the domain the plan gives the
+ * key's values (not at every row from the value's type), and the row copies or runs the converter it chose.
  */
-HASH_SCAN_KEY *
-qdata_copy_hscan_key (cubthread::entry * thread_p, HASH_SCAN_KEY * key, REGU_VARIABLE_LIST probe_regu_list,
-		      val_descr * vd)
+enum hash_scan_key_rule
 {
-  HASH_SCAN_KEY *new_key = NULL;
-  int i = 0;
-  DB_TYPE vtype1, vtype2;
-  TP_DOMAIN_STATUS status = DOMAIN_COMPATIBLE;
+  HASH_SCAN_KEY_COPY,		/* the values have the probe key's type: copied */
+  HASH_SCAN_KEY_CONVERT,	/* the resolved converter brings each value into the probe key's domain */
+  HASH_SCAN_KEY_COERCE,		/* tp_value_coerce brings each value into the probe key's domain: a JSON value, which
+				 * its scalar converts, or a string domain whose collation is the values' (LEAVE,
+				 * ENFORCE) */
+  HASH_SCAN_KEY_FAIL		/* the probe key's domain is variable (a node not computed yet in this execution):
+				 * a coercion into it refuses every value (ER_TP_CANT_COERCE) */
+};
 
-  if (key)
-    {
-      /* make a copy */
-      new_key = qdata_alloc_hscan_key (thread_p, key->val_count, false);
-    }
+typedef struct hash_scan_key_entry HASH_SCAN_KEY_ENTRY;
+struct hash_scan_key_entry
+{
+  TP_VALUE_CONVERTER conv;	/* CONVERT: the converter tp_value_coerce runs (DOMAIN_CONVERT_IMPLICIT) */
+  const TP_DOMAIN *target;	/* the probe key's domain */
+  DB_TYPE source;		/* COPY, CONVERT: the type of the key's values */
+  unsigned char rule;		/* hash_scan_key_rule */
+};
 
-  if (new_key)
+struct hash_scan_key_plan
+{
+  int n_keys;
+  HASH_SCAN_KEY_ENTRY key[1];	/* [n_keys] */
+};
+
+/*
+ * qdata_hscan_key_value_domain () - the domain of the values a build key gives in this open
+ *   return: the domain; NULL when the plan has no answer (the unresolved-domain check (execution))
+ *   key(in): the build key
+ *   producers(in): the scan's predicate regus: the list positions the build reads before it builds a key
+ *
+ * A value pointer holds what the position that writes it read, under the domain the list scan gave that position
+ * (scan_plan_list_scan_domains: the resolved domain or a load-fixed domain). Any other key gives the domain the plan
+ * gives it, a key over a session variable read too.
+ */
+/*
+ * [리뷰] qdata_hscan_key_value_domain — qdata_plan_hscan_keys 가 build 쪽 키 regu 의 "값이 실제로 들고 올 도메인"을 알아내려고 부르는 보조
+ * 함수 — TYPE_CONSTANT 키면 같은 dbval 을 채우는 producer(TYPE_POSITION)를 찾아 그 위치의 실행 도메인을, 아니면 그 키의 소비자 도메인을 돌려준다(없으면
+ * NULL).
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 은 build 쪽 producer 를 역추적하지 않고 행마다 probe regu 타입과 값 타입을 비교했을 뿐이다.
+ * 이 PR: producers 리스트를 훑어 vfetch_to 가 키의 dbvalptr 와 같은 TYPE_POSITION 을 찾고, 그 pos_descr 의 실행 도메인을 돌려준다. 못 찾으면
+ * qexec_consumer_domain 결과를 돌려주고, NULL 이면 호출자가 미해결 에러로 만든다.
+ * 바뀐 것: 신규 16줄. 키 플랜을 만들기 위한 도메인 출처 결정이 여기로 모였다.
+ */
+static const TP_DOMAIN *
+qdata_hscan_key_value_domain (const VAL_DESCR * vd, const REGU_VARIABLE * key, REGU_VARIABLE_LIST producers)
+{
+  if (key->type == TYPE_CONSTANT)
     {
-      /* copy values */
-      new_key->val_count = key->val_count;
-      new_key->free_values = true;
-      for (i = 0; i < key->val_count; i++)
+      for (REGU_VARIABLE_LIST producer = producers; producer != NULL; producer = producer->next)
 	{
-	  vtype1 = REGU_VARIABLE_GET_TYPE (&probe_regu_list->value);
-	  vtype2 = DB_VALUE_DOMAIN_TYPE (key->values[i]);
-
-	  if (vtype1 != vtype2)
+	  if (producer->value.type == TYPE_POSITION && producer->value.vfetch_to == key->value.dbvalptr)
 	    {
-	      new_key->values[i] = pr_make_value ();
-	      if (new_key->values[i] == NULL)
-		{
-		  qdata_free_hscan_key (thread_p, new_key, i);
-		  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, sizeof (DB_VALUE *));
-		  return NULL;
-		}
-
-	      status = tp_value_coerce (key->values[i], new_key->values[i], probe_regu_list->value.domain);
-	      if (status != DOMAIN_COMPATIBLE)
-		{
-		  qdata_free_hscan_key (thread_p, new_key, ++i);
-		  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_TP_CANT_COERCE, 2, pr_type_name (vtype2),
-			  pr_type_name (vtype1));
-		  return NULL;
-		}
+	      return qexec_get_node_domain (vd, producer->value.value.pos_descr.dom,
+					    producer->value.value.pos_descr.plan_item);
 	    }
-	  else
-	    {
-	      new_key->values[i] = pr_copy_value (key->values[i]);
-	      if (new_key->values[i] == NULL)
-		{
-		  qdata_free_hscan_key (thread_p, new_key, i);
-		  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, sizeof (DB_VALUE *));
-		  return NULL;
-		}
-	    }
-	  probe_regu_list = probe_regu_list->next;
 	}
     }
-
-  return new_key;
+  return qexec_consumer_domain (vd, qexec_get_node_domain (vd, key->domain, key->plan_item), key->plan_item);
 }
 
 /*
- * qdata_copy_hscan_key_without_alloc () - deep copy hash key
- *   returns: pointer to new hash key
+ * qdata_plan_hscan_keys () - how each build key enters the hash table in this open, resolved before the first build
+ *   row
+ *   return: NO_ERROR, ER_OUT_OF_VIRTUAL_MEMORY, or ER_QPROC_DOMAIN_UNRESOLVED (the unresolved-domain check (execution))
+ *   vd(in): the execution's value descriptor
+ *   hlsid(in/out): a hash list scan whose key pairs' types differ (need_coerce_type); key_plan receives the plan
+ *   producers(in): the scan's predicate regus (qdata_hscan_key_value_domain)
+ *
+ * A build value is copied, or coerced into the probe key's domain where its type is not the probe key's
+ * (tp_value_coerce, ER_TP_CANT_COERCE when that fails). The probe key's domain is the one the scan reads: the
+ * compiled domain, or the resolved domain once the node was computed in this execution; check_hash_list_scan reads
+ * the same. The values' type is the plan's, so each key's choice is made here, once.
+ */
+/*
+ * [리뷰] qdata_plan_hscan_keys — scan_build_hash_list_scan 이 해시 리스트 스캔을 열 때 한 번 부르는 실행 전 게이트 — 키마다 (규칙, 변환기, 목표
+ * 도메인, 원본 타입)을 담은 HASH_SCAN_KEY_PLAN 을 db_private_alloc 로 만들어 hlsid->key_plan 에 달고 NO_ERROR 를 돌려준다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에는 키 플랜이라는 자료구조 자체가 없었고 변환 여부는 행마다 결정됐다.
+ * 이 PR: 키마다 target = probe 의 실행 도메인(qexec_get_node_domain), source = build 값의 도메인 타입을 구해 HASH_SCAN_KEY_COPY /
+ * CONVERT / COERCE / FAIL 중 하나로 확정한다. CONVERT 면 tp_value_find_converter (source, target,
+ * DOMAIN_CONVERT_IMPLICIT) 로 함수 포인터까지 미리 박아 둔다. target 이 NULL 이거나 DB_TYPE_VARIABLE 이면 FAIL, build 쪽 도메인이 없으면
+ * qexec_domain_unresolved.
+ * 바뀐 것: 신규 59줄. 소유권은 hlsid->key_plan 대입 직후 스캔으로 넘어가 에러 반환 경로에서도 scan_close_scan 이 해제한다(주석에 명시) — 하네스의
+ * alloc-free=+1 은 이 위임에서 나온 오탐이다.
+ * [지적 C9-04]
+ */
+int
+qdata_plan_hscan_keys (THREAD_ENTRY * thread_p, const VAL_DESCR * vd, HASH_LIST_SCAN * hlsid,
+		       REGU_VARIABLE_LIST producers)
+{
+  assert (hlsid->need_coerce_type && hlsid->key_plan == NULL);
+  int n_keys = 0;
+  for (REGU_VARIABLE_LIST build = hlsid->build_regu_list; build != NULL; build = build->next)
+    {
+      n_keys++;
+    }
+  const size_t bytes = offsetof (HASH_SCAN_KEY_PLAN, key) + sizeof (HASH_SCAN_KEY_ENTRY) * (size_t) MAX (n_keys, 1);
+  HASH_SCAN_KEY_PLAN *plan = (HASH_SCAN_KEY_PLAN *) db_private_alloc (thread_p, bytes);
+  if (plan == NULL)
+    {
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, bytes);
+      return ER_OUT_OF_VIRTUAL_MEMORY;
+    }
+  plan->n_keys = n_keys;
+  /* the scan owns the plan from here: its close frees it, on error too */
+  hlsid->key_plan = plan;
+
+  REGU_VARIABLE_LIST build = hlsid->build_regu_list;
+  REGU_VARIABLE_LIST probe = hlsid->probe_regu_list;
+  for (int i = 0; i < n_keys; i++, build = build->next, probe = probe->next)
+    {
+      HASH_SCAN_KEY_ENTRY *key = &plan->key[i];
+      key->conv = NULL;
+      /* the probe key's domain now: the one it took if this execution computed it before */
+      key->target = qexec_get_node_domain (vd, probe->value.domain, probe->value.plan_item);
+      key->source = DB_TYPE_NULL;
+      const DB_TYPE target = TP_DOMAIN_TYPE (key->target);
+      if (key->target == NULL || target == DB_TYPE_VARIABLE)
+	{
+	  key->rule = HASH_SCAN_KEY_FAIL;
+	  continue;
+	}
+      const TP_DOMAIN *values = qdata_hscan_key_value_domain (vd, &build->value, producers);
+      if (values == NULL)
+	{
+	  return qexec_domain_unresolved (vd, build->value.plan_item, build->value.domain);
+	}
+      key->source = TP_DOMAIN_TYPE (values);
+      if (key->source == DB_TYPE_NULL || key->source == target)
+	{
+	  key->rule = HASH_SCAN_KEY_COPY;
+	}
+      else if (key->source == DB_TYPE_JSON
+	       || (TP_IS_CHAR_TYPE (target) && TP_DOMAIN_COLLATION_FLAG (key->target) != TP_DOMAIN_COLL_NORMAL))
+	{
+	  key->rule = HASH_SCAN_KEY_COERCE;
+	}
+      else
+	{
+	  key->rule = HASH_SCAN_KEY_CONVERT;
+	  key->conv = tp_value_find_converter (key->source, key->target, DOMAIN_CONVERT_IMPLICIT);
+	}
+    }
+  return NO_ERROR;
+}
+
+/*
+ * [리뷰] qdata_free_hscan_key_plan — scan_close_scan 이 해시 리스트 스캔을 닫을 때 부르는 해제 함수 — hlsid->key_plan 블록을
+ * db_private_free_and_init 로 풀고 포인터를 NULL 로 만든다.
+ * develop: develop 에 없음 — 이 PR 이 신설(해제할 키 플랜이 없었다).
+ * 이 PR: NULL 검사 뒤 해제·NULL 화뿐이라 같은 스캔이 여러 번 닫혀도 안전하다. qdata_plan_hscan_keys 의 alloc 과 짝을 이룬다.
+ * 바뀐 것: 신규 8줄.
+ */
+void
+qdata_free_hscan_key_plan (THREAD_ENTRY * thread_p, HASH_LIST_SCAN * hlsid)
+{
+  if (hlsid->key_plan != NULL)
+    {
+      db_private_free_and_init (thread_p, hlsid->key_plan);
+    }
+}
+
+#if !defined (NDEBUG)
+/* The debug cross-check of a resolved build key conversion: tp_value_coerce gives the same outcome and, where it
+ * converts, a value of the same type that hashes alike. */
+/*
+ * [리뷰] qdata_check_hscan_key_convert — 디버그 빌드에서만 도는 교차검증 — 플랜이 고른 변환 결과가 develop 식 tp_value_coerce 결과와 같은
+ * 성공/실패, 같은 타입, 같은 해시값인지 assert 한다. qdata_copy_hscan_key_without_alloc 이 CONVERT·FAIL 규칙에서 부른다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에는 플랜이 없어 대조할 기준 자체가 없었다.
+ * 이 PR: expected 에 tp_value_coerce (value, &expected, target) 결과를 받아 status 와 비교하고, 둘 다 성공이면 타입과
+ * mht_get_hash_number 까지 같은지 본다. 호출 측은 #if !defined (NDEBUG) 로 감싼다.
+ * 바뀐 것: 신규 15줄. 릴리스 빌드에는 들어가지 않는다.
+ */
+static void
+qdata_check_hscan_key_convert (const DB_VALUE * value, const TP_DOMAIN * target, TP_DOMAIN_STATUS status,
+			       const DB_VALUE * converted)
+{
+  DB_VALUE expected;
+  db_make_null (&expected);
+  const TP_DOMAIN_STATUS expected_status = tp_value_coerce (value, &expected, target);
+  assert ((expected_status == DOMAIN_COMPATIBLE) == (status == DOMAIN_COMPATIBLE));
+  if (expected_status == DOMAIN_COMPATIBLE && status == DOMAIN_COMPATIBLE)
+    {
+      assert (DB_VALUE_DOMAIN_TYPE (&expected) == DB_VALUE_DOMAIN_TYPE (converted));
+      assert (mht_get_hash_number (UINT_MAX, &expected) == mht_get_hash_number (UINT_MAX, converted));
+    }
+  pr_clear_value (&expected);
+}
+#endif
+
+/*
+ * qdata_copy_hscan_key_without_alloc () - the key a build row stores: each value copied, or brought into its probe
+ *   key's domain as the scan resolved it before its first build row
+ *   returns: new_key, or NULL on error (ER_TP_CANT_COERCE where the conversion fails)
  *   thread_p(in): thread
- *   key(in): source key
+ *   key(in): the build row's key
+ *   plan(in): the scan's key plan (qdata_plan_hscan_keys)
+ *   new_key(in/out): the scan's key with values of its own
+ */
+/*
+ * [리뷰] qdata_copy_hscan_key_without_alloc — 해시 리스트 스캔의 probe 단계에서 행마다 부르는 키 복사기 — build 쪽 키 값을 probe 키 도메인에 맞춰
+ * new_key 에 채워 돌려준다(실패 시 NULL).
+ * develop: 인자로 probe_regu_list 를 받아 행마다 키 i 에 대해 REGU_VARIABLE_GET_TYPE (&probe_regu_list->value) 와
+ * DB_VALUE_DOMAIN_TYPE (key->values[i]) 를 비교하고, 다르면 tp_value_coerce, 같으면 pr_clone_value 했다. 즉 타입 판정과 coercion
+ * 선택이 행마다 반복됐다.
+ * 이 PR: 인자가 const HASH_SCAN_KEY_PLAN * plan 으로 바뀌어, 행은 plan->key[i].rule 을 읽어 COPY / CONVERT(미리 찾아둔 conv 로
+ * tp_value_convert) / COERCE / FAIL 로 분기만 한다. NULL 값은 규칙과 무관하게 COPY 로 처리하고, 디버그 빌드는
+ * qdata_check_hscan_key_convert 로 결과를 대조한다. 실패 에러 메시지는 값 타입과 target 도메인 타입으로 만든다.
+ * 바뀐 것: 시그니처 변경(REGU_VARIABLE_LIST → const HASH_SCAN_KEY_PLAN *) + 행별 타입 판정 삭제와 규칙 switch 도입(약 -24/+39줄). 이 PR
+ * 의 "행은 읽기만" 이 적용된 자리다.
+ * [지적 X2-03]
  */
 HASH_SCAN_KEY *
-qdata_copy_hscan_key_without_alloc (cubthread::entry * thread_p, HASH_SCAN_KEY * key,
-				    REGU_VARIABLE_LIST probe_regu_list, HASH_SCAN_KEY * new_key)
+qdata_copy_hscan_key_without_alloc (cubthread::entry * thread_p, HASH_SCAN_KEY * key, const HASH_SCAN_KEY_PLAN * plan,
+				    HASH_SCAN_KEY * new_key)
 {
-  DB_TYPE vtype1, vtype2;
-  TP_DOMAIN_STATUS status = DOMAIN_COMPATIBLE;
-
   if (key == NULL)
     {
       return NULL;
     }
   if (new_key)
     {
+      assert (plan != NULL && plan->n_keys == key->val_count);
       /* copy values */
       new_key->val_count = key->val_count;
       for (int i = 0; i < key->val_count; i++)
 	{
-	  vtype1 = REGU_VARIABLE_GET_TYPE (&probe_regu_list->value);
-	  vtype2 = DB_VALUE_DOMAIN_TYPE (key->values[i]);
-
-	  if (vtype1 != vtype2)
+	  const HASH_SCAN_KEY_ENTRY *entry = &plan->key[i];
+	  const DB_VALUE *value = key->values[i];
+	  const unsigned char rule = DB_IS_NULL (value) ? (unsigned char) HASH_SCAN_KEY_COPY : entry->rule;
+	  /* the plan's type is the value's (NULL aside) */
+	  assert (DB_IS_NULL (value) || entry->rule == HASH_SCAN_KEY_FAIL
+		  || DB_VALUE_DOMAIN_TYPE (value) == entry->source);
+	  pr_clear_value (new_key->values[i]);
+	  TP_DOMAIN_STATUS status;
+	  switch (rule)
 	    {
-	      pr_clear_value (new_key->values[i]);
-	      status = tp_value_coerce (key->values[i], new_key->values[i], probe_regu_list->value.domain);
-	      if (status != DOMAIN_COMPATIBLE)
-		{
-		  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_TP_CANT_COERCE, 2, pr_type_name (vtype2),
-			  pr_type_name (vtype1));
-		  return NULL;
-		}
-	    }
-	  else
-	    {
-	      pr_clear_value (new_key->values[i]);
-	      if (pr_clone_value (key->values[i], new_key->values[i]) != NO_ERROR)
+	    case HASH_SCAN_KEY_COPY:
+	      if (pr_clone_value (value, new_key->values[i]) != NO_ERROR)
 		{
 		  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, sizeof (DB_VALUE *));
 		  return NULL;
 		}
+	      continue;
+	    case HASH_SCAN_KEY_CONVERT:
+	      status = tp_value_convert (entry->conv, entry->target, value, new_key->values[i]);
+	      break;
+	    case HASH_SCAN_KEY_COERCE:
+	      status = tp_value_coerce (value, new_key->values[i], entry->target);
+	      break;
+	    case HASH_SCAN_KEY_FAIL:
+	    default:
+	      status = DOMAIN_INCOMPATIBLE;
+	      break;
 	    }
-	  probe_regu_list = probe_regu_list->next;
+#if !defined (NDEBUG)
+	  if (entry->rule == HASH_SCAN_KEY_CONVERT || entry->rule == HASH_SCAN_KEY_FAIL)
+	    {
+	      qdata_check_hscan_key_convert (value, entry->target, status, new_key->values[i]);
+	    }
+#endif
+	  if (status != DOMAIN_COMPATIBLE)
+	    {
+	      pr_clear_value (new_key->values[i]);
+	      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_TP_CANT_COERCE, 2,
+		      pr_type_name (DB_VALUE_DOMAIN_TYPE (value)), pr_type_name (TP_DOMAIN_TYPE (entry->target)));
+	      return NULL;
+	    }
 	}
     }
 

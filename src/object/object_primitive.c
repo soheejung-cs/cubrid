@@ -47,6 +47,9 @@
 #include "string_opfunc.h"
 #include "system_parameter.h"
 #include "tz_support.h"
+#if defined (SERVER_MODE) || defined (SA_MODE)
+#include "domain_rules.h"
+#endif
 
 #include <utility>
 
@@ -794,7 +797,8 @@ static int mr_data_readval_midxkey (OR_BUF * buf, DB_VALUE * value, TP_DOMAIN * 
 static int mr_index_readval_midxkey (OR_BUF * buf, DB_VALUE * value, TP_DOMAIN * domain, int size, bool copy,
 				     char *copy_buf, int copy_buf_len);
 static DB_VALUE_COMPARE_RESULT pr_midxkey_compare_element (char *mem1, char *mem2, TP_DOMAIN * dom1, TP_DOMAIN * dom2,
-							   int do_coercion, int total_order);
+							   int do_coercion, int total_order, int column,
+							   PR_MIDXKEY_ELEMENT_COMPARE element_compare);
 static DB_VALUE_COMPARE_RESULT mr_index_cmpdisk_midxkey (void *mem1, void *mem2, TP_DOMAIN * domain, int do_coercion,
 							 int total_order, int *start_colp);
 static DB_VALUE_COMPARE_RESULT mr_data_cmpdisk_midxkey (void *mem1, void *mem2, TP_DOMAIN * domain, int do_coercion,
@@ -7684,9 +7688,18 @@ mr_index_readval_midxkey (OR_BUF * buf, DB_VALUE * value, TP_DOMAIN * domain, in
   return rc;
 }
 
+/*
+ * [리뷰] pr_midxkey_compare_element — 다중 컬럼 인덱스 키(MIDXKEY)의 한 컬럼을, 양쪽 도메인이 다를 때 DB_VALUE 로 읽어 비교한다 —
+ * pr_midxkey_compare_resolved 만 부르고 DB_VALUE_COMPARE_RESULT 를 돌려준다.
+ * develop: develop 에서는 시그니처가 (mem1, mem2, dom1, dom2, do_coercion, total_order) 6인자였고, 비교는 무조건
+ * tp_value_compare_with_error 였다.
+ * 이 PR: column 과 element_compare(PR_MIDXKEY_ELEMENT_COMPARE 콜백) 두 인자가 붙었다. 콜백이 있으면 "이 컬럼의 두 키에 대해 플랜이 정한 비교"를
+ * 부르고, NULL 이면 종전대로 tp_value_compare_with_error 로 간다.
+ * 바뀐 것: 시그니처 +2인자, 본문에 if/else 분기 추가(+8줄). 값 읽기·정리(pr_clear_value) 경로는 그대로다.
+ */
 static DB_VALUE_COMPARE_RESULT
 pr_midxkey_compare_element (char *mem1, char *mem2, TP_DOMAIN * dom1, TP_DOMAIN * dom2, int do_coercion,
-			    int total_order)
+			    int total_order, int column, PR_MIDXKEY_ELEMENT_COMPARE element_compare)
 {
   DB_VALUE_COMPARE_RESULT c = DB_UNK;
   DB_VALUE val1, val2;
@@ -7718,7 +7731,15 @@ pr_midxkey_compare_element (char *mem1, char *mem2, TP_DOMAIN * dom1, TP_DOMAIN 
       goto clean_up;
     }
 
-  c = tp_value_compare_with_error (&val1, &val2, do_coercion, total_order, &comparable);
+  if (element_compare != NULL)
+    {
+      /* the caller's plan for this column's two keys */
+      c = element_compare (column, &val1, &val2, do_coercion, total_order, &comparable);
+    }
+  else
+    {
+      c = tp_value_compare_with_error (&val1, &val2, do_coercion, total_order, &comparable);
+    }
 
 clean_up:
   if (DB_NEED_CLEAR (&val1))
@@ -7739,9 +7760,32 @@ clean_up:
   return c;
 }
 
+/*
+ * [리뷰] pr_midxkey_compare — MIDXKEY 두 개를 비교하는 기존 공개 진입점 — B-tree·정렬·리스트 스캔 등 플랜을 모르는 모든 호출자가 쓴다.
+ * develop: develop 에서는 이 이름이 비교 본문 전체(약 300줄)를 갖고 있었다.
+ * 이 PR: 본문이 통째로 pr_midxkey_compare_resolved 로 옮겨가고, 이 함수는 element_compare=NULL 을 넘기는 7줄짜리 래퍼만 남았다 — 즉 "플랜 없음"
+ * 기본값이다.
+ * 바뀐 것: 본문 전체 이동 + 래퍼 신설(-300/+7 규모). 기존 호출자의 시그니처·동작은 그대로다.
+ */
 DB_VALUE_COMPARE_RESULT
 pr_midxkey_compare (DB_MIDXKEY * mul1, DB_MIDXKEY * mul2, int do_coercion, int total_order, int num_index_term,
 		    int *start_colp, int *diff_column, bool * dom_is_desc, int *result_size)
+{
+  return pr_midxkey_compare_resolved (mul1, mul2, do_coercion, total_order, num_index_term, start_colp, diff_column,
+				      dom_is_desc, result_size, NULL);
+}
+
+/*
+ * [리뷰] pr_midxkey_compare_resolved — 위 비교의 실제 본문 — 컬럼을 앞에서부터 맞춰 보며 처음 다른 컬럼과 그 결과를 돌려준다. 플랜이 있는 호출자(해결된 인덱스 키
+ * 비교)는 element_compare 콜백을 넘겨, 도메인이 다른 컬럼의 비교를 미리 정해 둔 방법으로 하게 한다.
+ * develop: develop 에는 없음 — 이 PR 이 신설(본문은 develop 의 pr_midxkey_compare 그대로).
+ * 이 PR: 마지막 인자로 PR_MIDXKEY_ELEMENT_COMPARE 콜백을 받아 pr_midxkey_compare_element 에 컬럼 번호와 함께 넘긴다.
+ * 바뀐 것: 함수 분리 + 인자 1개 추가. 본문 내 변경은 pr_midxkey_compare_element 호출 한 줄(i 와 콜백 전달)뿐이다.
+ */
+DB_VALUE_COMPARE_RESULT
+pr_midxkey_compare_resolved (DB_MIDXKEY * mul1, DB_MIDXKEY * mul2, int do_coercion, int total_order,
+			     int num_index_term, int *start_colp, int *diff_column, bool * dom_is_desc,
+			     int *result_size, PR_MIDXKEY_ELEMENT_COMPARE element_compare)
 {
   DB_VALUE_COMPARE_RESULT c = DB_UNK;
   int i;
@@ -7919,7 +7963,7 @@ pr_midxkey_compare (DB_MIDXKEY * mul1, DB_MIDXKEY * mul2, int do_coercion, int t
 		  /* coercion and comparison
 		   * val1 and val2 have different domain
 		   */
-		  c = pr_midxkey_compare_element (mem1, mem2, dom1, dom2, do_coercion, total_order);
+		  c = pr_midxkey_compare_element (mem1, mem2, dom1, dom2, do_coercion, total_order, i, element_compare);
 		}
 
 	      if (c == DB_EQ)
@@ -15416,6 +15460,14 @@ mr_data_cmpdisk_json (void *mem1, void *mem2, TP_DOMAIN * domain, int do_coercio
  * we only return DB_UNK when either one is null and
  * total_order is false
  */
+/*
+ * [리뷰] mr_cmpval_json — JSON 값 두 개를 비교하는 PR_TYPE 콜백 — 스칼라로 풀 수 있으면 풀어서 비교하고 DB_VALUE_COMPARE_RESULT 를 돌려준다.
+ * develop: develop 에서는 푼 스칼라 두 개를 항상 tp_value_compare_with_error 로 비교했다.
+ * 이 PR: 서버/SA 빌드에서는 domain_compare_by_type_pair(…, NULL) 로 간다 — 키 쌍 표(서버 부팅 때 한 번 만들어 서버가 멈출 때까지 사는
+ * DOMAIN_TYPE_PAIR_TABLE)의 한 칸을 읽어 비교 방법을 얻으므로 행마다 타입 짝을 다시 풀지 않는다. 클라이언트 빌드는 종전 그대로다.
+ * 바뀐 것: 비교 호출 1곳을 #if SERVER_MODE||SA_MODE 로 갈랐다(+7줄). 주석으로 "스칼라의 타입은 문서의 데이터"라는 근거를 남겼다 — 컴파일이 알 수 없는 타입 짝이라
+ * 키 쌍 표가 맡는다.
+ */
 static DB_VALUE_COMPARE_RESULT
 mr_cmpval_json (DB_VALUE * value1, DB_VALUE * value2, int do_coercion, int total_order, int *start_colp, int collation)
 {
@@ -15495,7 +15547,13 @@ mr_cmpval_json (DB_VALUE * value1, DB_VALUE * value2, int do_coercion, int total
 	}
     }
 
+  /* the scalars' types are the documents' data: the server reads the key pair table, which holds the comparison of
+   * every pair of keys a value can have, resolved before any row */
+#if defined (SERVER_MODE) || defined (SA_MODE)
+  cmp_result = domain_compare_by_type_pair (&scalar_value1, &scalar_value2, do_coercion, total_order, NULL);
+#else
   cmp_result = tp_value_compare_with_error (&scalar_value1, &scalar_value2, do_coercion, total_order, NULL);
+#endif
 
   pr_clear_value (&scalar_value1);
   pr_clear_value (&scalar_value2);

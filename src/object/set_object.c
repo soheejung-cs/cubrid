@@ -39,6 +39,9 @@
 #include "object_primitive.h"
 #include "object_representation.h"
 #include "set_object.h"
+#if defined (SERVER_MODE) || defined (SA_MODE)
+#include "domain_rules.h"
+#endif
 
 #if !defined(SERVER_MODE)
 #include "locator_cl.h"
@@ -310,11 +313,53 @@ set_final (void)
  *
  */
 
+/*
+ * col_element_compare() - the comparison of two collection elements, as
+ *                         tp_value_compare makes it
+ *      return: DB_VALUE_COMPARE_RESULT
+ *  a(in) : first value
+ *  b(in) : second value
+ *  do_coerce(in) :
+ *  total_order(in) :
+ *
+ *  Note :
+ *      The server reads the key pair table, which holds the comparison of
+ *      every pair of keys an element can have, resolved before any row:
+ *      the elements' types are the collection's data.
+ */
+/*
+ * [리뷰] col_element_compare — 컬렉션(COL) 원소 두 개를 비교하는 이 파일의 단일 창구 — 서버/SA 빌드에서는 domain_compare_by_type_pair(…,
+ * NULL) 로, 클라이언트 빌드에서는 종전대로 tp_value_compare 로 보낸다. DB_VALUE_COMPARE_RESULT 를 돌려주고, 이 파일의 비교·탐색·집합연산이 모두 이것만
+ * 부른다.
+ * develop: develop 에는 없음 — 이 PR 이 신설. develop 에서는 열 군데 호출부가 tp_value_compare 를 직접 불렀다.
+ * 이 PR: #if defined (SERVER_MODE) || defined (SA_MODE) 로 갈라, 서버에서는 키 쌍 표를 읽는 비교로 간다.
+ * domain_compare_by_type_pair 는 두 값의 (타입, collation) 키 쌍으로 키 쌍 표(서버 부팅 때 한 번 만들어 서버가 멈출 때까지 사는
+ * DOMAIN_TYPE_PAIR_TABLE)의 한 칸을 읽어 비교 방법을 얻는다 — 행마다 타입 짝을 다시 풀지 않는다. can_compare 인자로 NULL 을 넘겨
+ * tp_value_compare 의 계약(에러를 따로 돌려주지 않음)을 유지한다.
+ * 바뀐 것: 신설(+26줄, 주석 포함) + 파일 상단에 domain_rules.h 조건부 include 추가. 같은 소스가 서버/클라이언트에서 서로 다른 비교 구현을 쓰게 된 분기점이다.
+ */
+static DB_VALUE_COMPARE_RESULT
+col_element_compare (DB_VALUE * a, DB_VALUE * b, int do_coerce, int total_order)
+{
+#if defined (SERVER_MODE) || defined (SA_MODE)
+  return domain_compare_by_type_pair (a, b, do_coerce, total_order, NULL);
+#else
+  return tp_value_compare (a, b, do_coerce, total_order);
+#endif
+}
+
+/*
+ * [리뷰] col_value_compare — 컬렉션 원소 비교를 바깥(object_primitive 등)에 내주는 공개 래퍼 — do_coerce=0, total_order=1 로 고정해
+ * 부른다.
+ * develop: develop 에서는 본문이 `return tp_value_compare (a, b, 0, 1);` 한 줄이었다.
+ * 이 PR: 같은 인자로 col_element_compare 를 부른다 — 서버에서는 키 쌍 표 경로로 간다.
+ * 바뀐 것: 호출 대상 1곳 치환(tp_value_compare → col_element_compare). 동작은 빌드 모드에 따라 갈린다.
+ */
 int
 col_value_compare (DB_VALUE * a, DB_VALUE * b)
 {
   /* note that the coerce flag is OFF */
-  return tp_value_compare (a, b, 0, 1);
+  return col_element_compare (a, b, 0, 1);
 }
 
 /*
@@ -961,6 +1006,12 @@ non_null_index (COL * col, long lower, long upper)
  * 	sorted in ascending order.
  */
 
+/*
+ * [리뷰] col_bsearch — 정렬된 COL 에서 값의 삽입 위치(와 존재 여부)를 블록 단위 이분 탐색으로 찾는다 — col_find 가 부르고 인덱스를 돌려준다.
+ * develop: develop 과 알고리즘은 같다. 비교 세 군데가 tp_value_compare 직접 호출이었다.
+ * 이 PR: 세 비교가 모두 col_element_compare 를 거친다 — 서버에서는 한 번 만들어 둔 키 쌍 표를 읽는다.
+ * 바뀐 것: 호출 대상 3곳 치환(-3/+3). 탐색 로직·경계 조건은 손대지 않았다.
+ */
 static long
 col_bsearch (COL * col, long lower, long upper, long *found, DB_VALUE * val, int do_coerce)
 {
@@ -977,12 +1028,12 @@ col_bsearch (COL * col, long lower, long upper, long *found, DB_VALUE * val, int
   while (lowblock < highblock)
     {
       midblock = (lowblock + highblock) / 2;
-      if (tp_value_compare (val, &col->array[midblock][0], do_coerce, 1) < 0)
+      if (col_element_compare (val, &col->array[midblock][0], do_coerce, 1) < 0)
 	{
 	  /* value is left of/lower than the middle block */
 	  highblock = midblock - 1;
 	}
-      else if (tp_value_compare (val, &col->array[midblock][BLOCKING_LESS1], do_coerce, 1) > 0)
+      else if (col_element_compare (val, &col->array[midblock][BLOCKING_LESS1], do_coerce, 1) > 0)
 	{
 	  /* value is right of/higher than middle block */
 	  lowblock = midblock + 1;
@@ -1009,7 +1060,7 @@ col_bsearch (COL * col, long lower, long upper, long *found, DB_VALUE * val, int
 
   while (offset <= midoffset && compare > 0)
     {
-      compare = tp_value_compare (val, &col->array[lowblock][offset], do_coerce, 1);
+      compare = col_element_compare (val, &col->array[lowblock][offset], do_coerce, 1);
       if (compare > 0)
 	{
 	  offset++;		/* have not found position yet */
@@ -1132,6 +1183,13 @@ col_is_all_null (COL * col)
  *
  */
 
+/*
+ * [리뷰] col_find — 컬렉션에서 값의 위치를 찾아 삽입 인덱스를 돌려주는 진입점 — 정렬 여부·temp OID·MULTISET 여부에 따라 col_bsearch 또는 선형 탐색을 쓴다.
+ * setobj_add_element 류가 부른다.
+ * develop: develop 과 분기 구조는 같고, 비교 세 군데가 tp_value_compare 직접 호출이었다.
+ * 이 PR: 세 비교(마지막 삽입 위치 기준 좌우 판정, MULTISET 동치 구간 이분 탐색, 비정렬 선형 탐색)가 col_element_compare 를 거친다.
+ * 바뀐 것: 호출 대상 3곳 치환(-3/+3). DB_UNK 를 ER_GENERIC_ERROR 로 바꾸는 기존 처리도 그대로다.
+ */
 long
 col_find (COL * col, long *found, DB_VALUE * val, int do_coerce)
 {
@@ -1199,7 +1257,7 @@ col_find (COL * col, long *found, DB_VALUE * val, int do_coerce)
 	      else
 		{
 		  /* determine which side of last insertion index to search from. */
-		  compare = tp_value_compare (val, INDEX (col, insertindex), do_coerce, 1);
+		  compare = col_element_compare (val, INDEX (col, insertindex), do_coerce, 1);
 		  if (compare == DB_UNK)
 		    {
 		      insertindex = ER_GENERIC_ERROR;
@@ -1236,7 +1294,7 @@ col_find (COL * col, long *found, DB_VALUE * val, int do_coerce)
 			  while (insertindex < rightindex - 1)
 			    {
 			      temp = (insertindex + rightindex) / 2;
-			      compare = tp_value_compare (val, INDEX (col, temp), do_coerce, 1);
+			      compare = col_element_compare (val, INDEX (col, temp), do_coerce, 1);
 			      if (compare == 0)
 				{
 				  insertindex = temp;
@@ -1256,7 +1314,7 @@ col_find (COL * col, long *found, DB_VALUE * val, int do_coerce)
 	      /* sequence of unordered values. Must do sequential search */
 	      while (insertindex < col->size)
 		{
-		  if (tp_value_compare (val, INDEX (col, insertindex), do_coerce, 1) == 0)
+		  if (col_element_compare (val, INDEX (col, insertindex), do_coerce, 1) == 0)
 		    {
 		      *found = 1;
 		      break;
@@ -1872,6 +1930,13 @@ col_permanent_oids (COL * col)
  *      We will return DB_UNK if the VOBJ is malformed.
  */
 
+/*
+ * [리뷰] setvobj_compare — VOBJ(가상 객체) 두 개를 비교한다 — 3원소 시퀀스의 [1](클래스)·[2](OID)를 차례로 비교해 DB_VALUE_COMPARE_RESULT 를
+ * 돌려준다. tp_value_compare 의 VOBJ 경로가 부른다.
+ * develop: develop 에서는 두 비교가 tp_value_compare 직접 호출이었다.
+ * 이 PR: 두 비교가 col_element_compare 를 거친다.
+ * 바뀐 것: 호출 대상 2곳 치환(-2/+2).
+ */
 DB_VALUE_COMPARE_RESULT
 setvobj_compare (COL * set1, COL * set2, int do_coercion, int total_order)
 {
@@ -1883,11 +1948,11 @@ setvobj_compare (COL * set1, COL * set2, int do_coercion, int total_order)
       cmp = DB_EQ;
       if (DB_VALUE_DOMAIN_TYPE (&set1->array[0][2]) != DB_TYPE_OID)
 	{
-	  cmp = tp_value_compare (&set1->array[0][1], &set2->array[0][1], do_coercion, 1);
+	  cmp = col_element_compare (&set1->array[0][1], &set2->array[0][1], do_coercion, 1);
 	}
       if (cmp == DB_EQ)
 	{
-	  cmp = tp_value_compare (&set1->array[0][2], &set2->array[0][2], do_coercion, total_order);
+	  cmp = col_element_compare (&set1->array[0][2], &set2->array[0][2], do_coercion, total_order);
 	}
       else
 	{
@@ -5107,6 +5172,12 @@ setobj_ismember (COL * col, DB_VALUE * proposed_value, int check_null)
  *  Note :
  *      set1 and set2 to be of a set or multiset type.
  */
+/*
+ * [리뷰] setobj_compare — 두 집합의 포함 관계를 판정한다 — 양쪽을 정렬한 뒤 병합 순회로 DB_EQ/DB_SUBSET/DB_SUPERSET/DB_NE/DB_UNK 를 돌려준다.
+ * develop: develop 에서는 병합 순회의 비교가 tp_value_compare 직접 호출이었다.
+ * 이 PR: 그 비교가 col_element_compare 를 거친다 — 서버에서는 원소 타입 짝 판정이 미리 풀려 있다.
+ * 바뀐 것: 호출 대상 1곳 치환(-1/+1).
+ */
 DB_VALUE_COMPARE_RESULT
 setobj_compare (COL * set1, COL * set2, int do_coercion)
 {
@@ -5157,7 +5228,7 @@ setobj_compare (COL * set1, COL * set2, int do_coercion)
 	      while (index1 < set1->size && index2 < set2->size && (set1_could_be_subset || set2_could_be_subset)
 		     && status == DB_EQ)
 		{
-		  rc = tp_value_compare (INDEX (set1, index1), INDEX (set2, index2), do_coercion, 0);
+		  rc = col_element_compare (INDEX (set1, index1), INDEX (set2, index2), do_coercion, 0);
 		  switch (rc)
 		    {
 		    case DB_EQ:	/* element appears in both sets */
@@ -5226,6 +5297,12 @@ setobj_compare (COL * set1, COL * set2, int do_coercion)
  *  total_order(in) :
  *
  */
+/*
+ * [리뷰] setobj_compare_order — 같은 크기의 두 집합을 사전식으로 비교해 순서를 정한다 — 크기 비교 후 원소를 앞에서부터 맞춰 보고 처음 다른 자리의 결과를 돌려준다.
+ * develop: develop 에서는 원소 비교가 tp_value_compare 직접 호출이었다.
+ * 이 PR: col_element_compare 를 거친다.
+ * 바뀐 것: 호출 대상 1곳 치환(-1/+1).
+ */
 DB_VALUE_COMPARE_RESULT
 setobj_compare_order (COL * set1, COL * set2, int do_coercion, int total_order)
 {
@@ -5274,7 +5351,7 @@ setobj_compare_order (COL * set1, COL * set2, int do_coercion, int total_order)
   /* same size, compare elements until order is determined */
   for (i = 0; i < set1->size; i++)
     {
-      rc = tp_value_compare (INDEX (set1, i), INDEX (set2, i), do_coercion, total_order);
+      rc = col_element_compare (INDEX (set1, i), INDEX (set2, i), do_coercion, total_order);
       if (rc != DB_EQ)
 	{
 	  return rc;
@@ -5292,6 +5369,12 @@ setobj_compare_order (COL * set1, COL * set2, int do_coercion, int total_order)
  *
  */
 
+/*
+ * [리뷰] setobj_difference — 두 집합의 차집합을 result 에 채운다 — 정렬 후 병합 순회로 set1 에만 있는 원소를 setobj_add_element 한다.
+ * develop: develop 에서는 본 비교와 DB_UNK 재판정 비교 두 곳이 tp_value_compare 직접 호출이었다.
+ * 이 PR: 두 비교 모두 col_element_compare 를 거친다.
+ * 바뀐 것: 호출 대상 2곳 치환(-2/+2). NULL 처리 규칙은 그대로다.
+ */
 int
 setobj_difference (COL * set1, COL * set2, COL * result)
 {
@@ -5323,7 +5406,7 @@ setobj_difference (COL * set1, COL * set2, COL * result)
 	}
       else
 	{
-	  rc = tp_value_compare (val1, val2, 1, 0);
+	  rc = col_element_compare (val1, val2, 1, 0);
 
 	  switch (rc)
 	    {
@@ -5343,7 +5426,7 @@ setobj_difference (COL * set1, COL * set2, COL * result)
 				 * result SHOULD be added to the result. */
 	      /* At least one of these must be a collection with an embedded NULL, we need to increment to the next
 	       * pair of values, but must check again to see which index to increase for total ordering. */
-	      rc = tp_value_compare (val1, val2, 1, 1);
+	      rc = col_element_compare (val1, val2, 1, 1);
 	      if (rc == DB_GT)
 		{
 		  index2++;
@@ -5380,6 +5463,12 @@ setobj_difference (COL * set1, COL * set2, COL * result)
  *      than appending.
  */
 
+/*
+ * [리뷰] setobj_union — 두 집합(또는 시퀀스)의 합집합을 result 에 채운다 — SEQUENCE 면 단순 이어붙이고, 아니면 정렬 후 병합 순회한다.
+ * develop: develop 에서는 병합 순회의 비교가 tp_value_compare 직접 호출이었다.
+ * 이 PR: col_element_compare 를 거친다.
+ * 바뀐 것: 호출 대상 1곳 치환(-1/+1).
+ */
 int
 setobj_union (COL * set1, COL * set2, COL * result)
 {
@@ -5432,7 +5521,7 @@ setobj_union (COL * set1, COL * set2, COL * result)
 	    }
 	  else
 	    {
-	      rc = tp_value_compare (val1, val2, 1, 0);
+	      rc = col_element_compare (val1, val2, 1, 0);
 
 	      switch (rc)
 		{
@@ -5483,6 +5572,12 @@ setobj_union (COL * set1, COL * set2, COL * result)
  *
  */
 
+/*
+ * [리뷰] setobj_intersection — 두 집합의 교집합을 result 에 채운다 — 정렬 후 병합 순회하며 DB_EQ 인 원소만 담는다.
+ * develop: develop 에서는 본 비교와 DB_UNK 재판정 비교 두 곳이 tp_value_compare 직접 호출이었다.
+ * 이 PR: 두 비교 모두 col_element_compare 를 거친다.
+ * 바뀐 것: 호출 대상 2곳 치환(-2/+2).
+ */
 int
 setobj_intersection (COL * set1, COL * set2, COL * result)
 {
@@ -5516,7 +5611,7 @@ setobj_intersection (COL * set1, COL * set2, COL * result)
 	}
       else
 	{
-	  rc = tp_value_compare (val1, val2, 1, 0);
+	  rc = col_element_compare (val1, val2, 1, 0);
 
 	  switch (rc)
 	    {
@@ -5536,7 +5631,7 @@ setobj_intersection (COL * set1, COL * set2, COL * result)
 				 * be added to the result. */
 	      /* At least one of these must be a collection with an embedded NULL, we need to increment to the next
 	       * pair of values, but must check again to see which side to increase for total ordering. */
-	      rc = tp_value_compare (val1, val2, 1, 1);
+	      rc = col_element_compare (val1, val2, 1, 1);
 	      if (rc == DB_GT)
 		{
 		  index2++;
@@ -5566,6 +5661,13 @@ setobj_intersection (COL * set1, COL * set2, COL * result)
  *      Compares value to the members of set using op.
  *      If any member compares favorably, returns 1
  */
+/*
+ * [리뷰] setobj_issome — value 가 집합 원소들과 주어진 =SOME/<>SOME 등 연산을 만족하는지 1/0/-1(NULL 있음)로 답한다 — IN/ANY/SOME 술어 평가가
+ * 부른다.
+ * develop: develop 에서는 원소 순회의 비교가 tp_value_compare 직접 호출이었다.
+ * 이 PR: col_element_compare 를 거친다.
+ * 바뀐 것: 호출 대상 1곳 치환(-1/+1).
+ */
 int
 setobj_issome (DB_VALUE * value, COL * set, PT_OP_TYPE op, int do_coercion)
 {
@@ -5580,7 +5682,7 @@ setobj_issome (DB_VALUE * value, COL * set, PT_OP_TYPE op, int do_coercion)
 
   for (i = 0; i < set->size; i++)
     {
-      status = tp_value_compare (value, INDEX (set, i), do_coercion, 0);
+      status = col_element_compare (value, INDEX (set, i), do_coercion, 0);
       if (status == DB_UNK)
 	{
 	  has_null = 1;

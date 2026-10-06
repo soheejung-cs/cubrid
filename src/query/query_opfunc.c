@@ -38,6 +38,7 @@
 #include "fetch.h"
 #include "list_file.h"
 #include "object_domain.h"
+#include "object_domain_convert.h"
 #include "object_primitive.h"
 #include "object_representation.h"
 #include "set_object.h"
@@ -65,12 +66,6 @@
 #include <regex>
 // XXX: SHOULD BE THE LAST INCLUDE HEADER
 #include "memory_wrapper.hpp"
-
-#if defined(__GNUC__)
-#define QDATA_NOINLINE __attribute__ ((noinline))
-#else
-#define QDATA_NOINLINE
-#endif
 
 #define NOT_NULL_VALUE(a, b)	((a) ? (a) : (b))
 #define INITIAL_OID_STACK_SIZE  1
@@ -608,66 +603,33 @@ qdata_collect_tuple_values (THREAD_ENTRY * thread_p, valptr_list_node * valptr_l
 }
 
 /*
- * qdata_generate_tuple_desc_unresolved () - collect, resolve this list's late domains, then size (cold path).
- *   return: QPROC_TPLDESCR_SUCCESS, QPROC_TPLDESCR_RETRY_xxx, or QPROC_TPLDESCR_FAILURE
- *
- * Kept out of line on purpose: with both loop specializations inlined into one function, GCC 8 stopped inlining
- * qdata_get_dbval_from_constant_regu_variable () into the hot fused loop and every column paid a call (Q01 perf).
- * NULL-only or unresolved-collation columns can keep this path active across several rows.
- */
-static QDATA_NOINLINE QPROC_TPLDESCR_STATUS
-qdata_generate_tuple_desc_unresolved (THREAD_ENTRY * thread_p, valptr_list_node * valptr_list_p,
-				      val_descr * val_desc_p, qfile_list_id * list_id)
-{
-  qfile_tuple_descriptor *tuple_desc_p = &list_id->tpl_descr;
-  QPROC_TPLDESCR_STATUS status;
-
-  status = qdata_collect_tuple_values < false > (thread_p, valptr_list_p, val_desc_p, tuple_desc_p, NULL);
-  if (status == QPROC_TPLDESCR_FAILURE)
-    {
-      return status;
-    }
-  if (!list_id->is_domain_resolved && qfile_update_domains_on_type_list (thread_p, list_id, valptr_list_p) != NO_ERROR)
-    {
-      return QPROC_TPLDESCR_FAILURE;
-    }
-  if (status != QPROC_TPLDESCR_SUCCESS)
-    {
-      return status;
-    }
-
-  tuple_desc_p->tpl_size =
-    qfile_tuple_size_from_values (&list_id->type_list, tuple_desc_p->f_valp, tuple_desc_p->f_len, tuple_desc_p->f_cnt,
-				  &tuple_desc_p->has_null);
-  if (tuple_desc_p->tpl_size < 0)
-    {
-      return QPROC_TPLDESCR_FAILURE;
-    }
-  if (tuple_desc_p->tpl_size >= QFILE_MAX_TUPLE_SIZE_IN_PAGE)
-    {
-      return QPROC_TPLDESCR_RETRY_BIG_REC;
-    }
-  return QPROC_TPLDESCR_SUCCESS;
-}
-
-/*
  * qdata_generate_tuple_desc_for_valptr_list () - collect and size the destination list's tuple descriptor.
  *   return: QPROC_TPLDESCR_SUCCESS, QPROC_TPLDESCR_RETRY_xxx, or QPROC_TPLDESCR_FAILURE
  *   list_id(in/out): destination with f_valp/f_len already allocated
  *
- * Fuse collection and sizing only when this list's domains are settled. Otherwise collection must precede domain
- * resolution and sizing. The compressed string, if any, is deallocated later, after copying the db_value into the tuple.
+ * The list opened with the plan's domains (qdata_get_valptr_type_list), so its layout is settled before the first
+ * tuple and no row resolves a column: collection and sizing are one pass. The compressed string, if any, is
+ * deallocated later, after copying the db_value into the tuple.
+ */
+/*
+ * [리뷰] qdata_generate_tuple_desc_for_valptr_list — 결과 행 하나를 리스트 파일 튜플로 적재하기 직전에
+ * qexec_generate_tuple_descriptor·qexec_insert_tuple_into_list 등이 부르는 함수 — valptr 리스트의 보이는 컬럼 값을 모아
+ * list_id->tpl_descr 에 담고 튜플 크기를 재어 SUCCESS / RETRY_SET_TYPE / RETRY_BIG_REC / FAILURE 를 돌려준다.
+ * develop: 인자가 qfile_tuple_descriptor * 였고 본문 68줄이 직접 돌았다 — 컬럼마다 값을 꺼내 SET 타입인지 보고
+ * qdata_get_tuple_value_size_from_dbval 로 값 하나하나의 크기를 재어 tpl_size 에 누적한 뒤, 마지막에 QFILE_MAX_TUPLE_SIZE_IN_PAGE 와
+ * 비교했다.
+ * 이 PR: 인자가 qfile_list_id * 로 바뀌어 list_id->type_list.layout_ready 를 assert 하고, 본문은 공용 템플릿
+ * qdata_collect_tuple_values<true> 호출 한 줄이다. 크기는 리스트를 열 때 확정된 컬럼 레이아웃(qfile_tuple_size_add_value /
+ * qfile_tuple_size_finalize)으로 잰다.
+ * 바뀐 것: 시그니처 변경 + 본문 전부를 템플릿으로 이관(-60줄). 행 경로의 컬럼별 크기 계산이 "열 때 확정된 레이아웃 조회"로 바뀐 자리다.
  */
 QPROC_TPLDESCR_STATUS
 qdata_generate_tuple_desc_for_valptr_list (THREAD_ENTRY * thread_p, valptr_list_node * valptr_list_p,
 					   val_descr * val_desc_p, qfile_list_id * list_id)
 {
-  if (list_id->is_domain_resolved && list_id->type_list.layout_ready)
-    {
-      return qdata_collect_tuple_values < true > (thread_p, valptr_list_p, val_desc_p, &list_id->tpl_descr,
-						  &list_id->type_list);
-    }
-  return qdata_generate_tuple_desc_unresolved (thread_p, valptr_list_p, val_desc_p, list_id);
+  assert (list_id->type_list.layout_ready);
+  return qdata_collect_tuple_values < true > (thread_p, valptr_list_p, val_desc_p, &list_id->tpl_descr,
+					      &list_id->type_list);
 }
 
 /*
@@ -2397,6 +2359,219 @@ qdata_cast_to_domain (DB_VALUE * dbval_p, DB_VALUE * result_p, TP_DOMAIN * domai
   return error;
 }
 
+/* The error of an operand coercion that fails, as tp_value_auto_cast sets it: it names the value the cast took - for an
+ * ENUM added to a string, its name, which is cast to VARCHAR first */
+/*
+ * [리뷰] qdata_operand_coercion_error — qdata_coerce_arith_operands 가 피연산자 변환에 실패했을 때 에러를 올리는 보조 함수 — ENUM 이면 값을
+ * VARCHAR 로 캐스트해 이름으로 메시지를 만들고, 그 외에는 값 그대로 tp_domain_status_er_set 을 불러 에러 코드를 돌려준다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 각 산술 함수가 캐스트 실패 지점에서 tp_domain_status_er_set 을 직접 불렀다.
+ * 이 PR: ENUM 분기만 따로 두어 사용자에게 보이는 값이 서수가 아니라 이름이 되게 하고, 임시 name 값은 pr_clear_value 로 정리한다.
+ * 바뀐 것: 신규 14줄. 네 산술 함수에 흩어져 있던 에러 보고가 게이트 한 곳으로 모였다.
+ */
+static int
+qdata_operand_coercion_error (TP_DOMAIN_STATUS status, const DB_VALUE * value, const TP_DOMAIN * target)
+{
+  if (DB_VALUE_DOMAIN_TYPE (value) != DB_TYPE_ENUMERATION)
+    {
+      return tp_domain_status_er_set (status, ARG_FILE_LINE, value, target);
+    }
+  DB_VALUE name;
+  db_make_null (&name);
+  (void) tp_value_cast (value, &name, tp_domain_resolve_default (DB_TYPE_VARCHAR), false);
+  const int error = tp_domain_status_er_set (status, ARG_FILE_LINE, &name, target);
+  pr_clear_value (&name);
+  return error;
+}
+
+#if !defined (NDEBUG)
+/* Whether two types are one for an operand coercion: a character, bit or collection type stands for its type family */
+/*
+ * [리뷰] qdata_operand_coercion_type_holds — 디버그 교차검증(qdata_assert_operand_coercion_resolved)이 "플랜이 정한 도메인"과 "지금
+ * 다시 풀어 본 도메인"을 같다고 볼지 판정하는 술어 — 같은 타입이거나 CHAR/BIT/SET 같은 과(科) 안이면 true.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: value == resolved 이거나 양쪽이 모두 CHAR 계열 / BIT 계열 / SET 계열이면 true 인 6줄 술어.
+ * 바뀐 것: 신규 6줄. 릴리스 동작에는 영향이 없다(검증 경로에서만 쓰인다).
+ */
+static bool
+qdata_operand_coercion_type_holds (DB_TYPE value, DB_TYPE resolved)
+{
+  return value == resolved || (TP_IS_CHAR_TYPE (value) && TP_IS_CHAR_TYPE (resolved))
+    || (TP_IS_BIT_TYPE (value) && TP_IS_BIT_TYPE (resolved)) || (TP_IS_SET_TYPE (value) && TP_IS_SET_TYPE (resolved));
+}
+
+/*
+ * qdata_assert_operand_coercion_resolved () - debug cross-check: the operand coercion a caller resolved for two values
+ *   that are not NULL is the resolver's type rules over the values' own types: the same target types, and the
+ *   converter of the value's own type, CHAR and VARCHAR standing for each other (their converters read any string)
+ */
+/*
+ * [리뷰] qdata_assert_operand_coercion_resolved — qdata_coerce_arith_operands 가 디버그 빌드에서만 부르는 자기검증 — 플랜이 심어 준
+ * conv/operand_domain 이 지금 값 타입으로 다시 푼 결과와 같은지 assert 하고, 어긋나면 stderr 에 opcode·피연산자 타입·양쪽 도메인을 찍는다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 은 행 시점에 캐스트를 고르므로 비교할 "미리 정한 값"이 없었다.
+ * 이 PR: 피연산자 2개 각각에 대해, 둘 다 변환이 없으면 통과, 아니면 qdata_operand_coercion_type_holds 로 도메인 일치를 보고, 변환기 포인터가 다르면
+ * CHAR↔VARCHAR 형제 타입으로 찾은 변환기와 같은지까지 확인한 뒤 assert 한다.
+ * 바뀐 것: 신규 39줄.
+ */
+static void
+qdata_assert_operand_coercion_resolved (OPERATOR_TYPE opcode, const TP_VALUE_CONVERTER * conv,
+					const TP_DOMAIN * const *operand_domain, const DB_VALUE * dbval1_p,
+					const DB_VALUE * dbval2_p)
+{
+  const DB_VALUE *values[2] = { dbval1_p, dbval2_p };
+  const DOMAIN_OPERAND operands[2] = {
+    {NULL, DB_VALUE_DOMAIN_TYPE (dbval1_p), -1, false}, {NULL, DB_VALUE_DOMAIN_TYPE (dbval2_p), -1, false}
+  };
+  DOMAIN_OPERAND_COERCION expected;
+  domain_resolve_operand_coercion (opcode, operands, &expected);
+  for (int i = 0; i < 2; i++)
+    {
+      if (conv[i] == NULL && expected.conv[i] == NULL)
+	{
+	  /* neither converts the value: its type is the operator's to take */
+	  continue;
+	}
+      const DB_TYPE type = DB_VALUE_DOMAIN_TYPE (values[i]);
+      const TP_DOMAIN *resolved = operand_domain[i];
+      bool same = resolved != NULL
+	&& qdata_operand_coercion_type_holds (TP_DOMAIN_TYPE (expected.operand_domain[i]), TP_DOMAIN_TYPE (resolved));
+      if (same && conv[i] != expected.conv[i])
+	{
+	  const DB_TYPE sibling =
+	    type == DB_TYPE_CHAR ? DB_TYPE_VARCHAR : type == DB_TYPE_VARCHAR ? DB_TYPE_CHAR : type;
+	  same = sibling != type && conv[i] != NULL && expected.conv[i] != NULL
+	    && conv[i] == tp_value_find_converter (sibling, resolved, DOMAIN_CONVERT_ASSIGN);
+	}
+      if (!same)
+	{
+	  fprintf (stderr, "planned pre-cast: opcode=%d operand=%d value=%d/%d planned=%d expected=%d\n",
+		   (int) opcode, i, (int) DB_VALUE_DOMAIN_TYPE (values[0]), (int) DB_VALUE_DOMAIN_TYPE (values[1]),
+		   resolved != NULL ? (int) TP_DOMAIN_TYPE (resolved) : -1,
+		   expected.operand_domain[i] != NULL ? (int) TP_DOMAIN_TYPE (expected.operand_domain[i]) : -1);
+	}
+      assert (same);
+    }
+}
+
+/*
+ * qdata_assert_operands_coerced () - debug cross-check: qdata_{add,subtract,multiply,divide}_dbval cast nothing, so the
+ *   two values that are not NULL come in the types their operand coercion gives - the resolver's type rules over them
+ *   converts nothing more. A caller that did not plan the operand coercion fails here.
+ */
+/*
+ * [리뷰] qdata_assert_operands_coerced — qdata_add/subtract/multiply/divide_dbval 이 디버그 빌드에서 맨 앞에 부르는 자기검증 — 들어온
+ * 두 값 타입으로 피연산자 coercion 을 다시 풀어 "변환할 것이 하나도 없어야 한다"를 assert 한다. 즉 산술 커널이 더는 캐스트하지 않는다는 사후 조건의 코드화다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: domain_resolve_operand_coercion 을 돌려 conv[0]·conv[1] 이 모두 NULL 인지 보고, 아니면 stderr 에 찍고 assert 한다.
+ * 바뀐 것: 신규 15줄. 네 산술 함수에서 캐스트 코드를 들어낸 근거를 디버그에서 지키는 장치.
+ */
+static void
+qdata_assert_operands_coerced (OPERATOR_TYPE opcode, const DB_VALUE * dbval1_p, const DB_VALUE * dbval2_p)
+{
+  const DOMAIN_OPERAND operands[2] = {
+    {NULL, DB_VALUE_DOMAIN_TYPE (dbval1_p), -1, false}, {NULL, DB_VALUE_DOMAIN_TYPE (dbval2_p), -1, false}
+  };
+  DOMAIN_OPERAND_COERCION operand_coercion;
+  domain_resolve_operand_coercion (opcode, operands, &operand_coercion);
+  if (operand_coercion.conv[0] != NULL || operand_coercion.conv[1] != NULL)
+    {
+      fprintf (stderr, "unplanned pre-cast: opcode=%d values=%d/%d\n", (int) opcode,
+	       (int) DB_VALUE_DOMAIN_TYPE (dbval1_p), (int) DB_VALUE_DOMAIN_TYPE (dbval2_p));
+    }
+  assert (operand_coercion.conv[0] == NULL && operand_coercion.conv[1] == NULL);
+}
+#endif
+
+/*
+ * qdata_coerce_arith_operands () - an addition, subtraction, multiplication or division over its operands' operand
+ *   coercion, resolved before any row, then the typed operator, which casts nothing
+ *   return: NO_ERROR or ER_code
+ *   opcode(in): T_ADD, T_SUB, T_MUL or T_DIV
+ *   conv(in), operand_domain(in): conv[0..1] and operand_domain[0..1] of the operand coercion - a node's
+ *	       RESOLVED_DOMAIN, a SUM's or AVG's DOMAIN_OPERAND_COERCION (domain_resolve_operand_coercion); conv NULL
+ *	       converts nothing
+ *   temporaries(in): [2] an operand its scope converted once already: the operator takes it in place
+ *	       of the conversion; NULL none
+ *
+ * Over two values that are not NULL, each operand the plan converts gets a value of its own, in this order - the
+ * second operand first but for a subtraction - and a conversion that fails has tp_value_auto_cast's outcome: NULL
+ * under return_null_on_function_errors, the error otherwise. A NULL operand converts nothing: an operator answers a
+ * NULL operand before any operand coercion.
+ */
+/*
+ * [리뷰] qdata_coerce_arith_operands — 산술 연산의 실행 전 관문 — fetch·집계·분석함수·TOP-N 상한 계산이 플랜의 conv/operand_domain 을 들고
+ * 부르면, 필요한 쪽만 변환해 qdata_add/subtract/multiply/divide_dbval 로 넘기고 임시 변환값을 정리한 뒤 에러 코드를 돌려준다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 에서는 네 산술 함수가 각자 cast_dom1/cast_dom2 를 고르고 tp_value_auto_cast 를
+ * 행마다 돌렸다.
+ * 이 PR: conv 가 NULL 이거나 피연산자가 NULL 값이면 그대로 산술 함수로 넘긴다. 변환 순서는 T_SUB 만 0→1, 나머지는 1→0 으로 develop 이 2번 피연산자를 먼저
+ * 캐스트하던 순서를 보존한다. 스코프 임시값(temporaries[i])이 이미 있으면 변환 대신 그 값을 need_clear=false 로 빌려 쓰고, 변환 실패는
+ * PRM_ID_RETURN_NULL_ON_FUNCTION_ERRORS 면 NULL 로 삼키고 아니면 qdata_operand_coercion_error 로 올린다. 실제로 변환한 자리만 used
+ * 비트로 표시해 끝에서 해제한다.
+ * 바뀐 것: 신규 62줄. 헤더(query_opfunc.h:82)에 temporaries = NULL 기본 인자가 있어 기존 호출자는 7인자로도 부른다.
+ * [지적 C9-03]
+ */
+int
+qdata_coerce_arith_operands (OPERATOR_TYPE opcode, const TP_VALUE_CONVERTER * conv,
+			     const TP_DOMAIN * const *operand_domain, DB_VALUE * dbval1_p, DB_VALUE * dbval2_p,
+			     DB_VALUE * result_p, TP_DOMAIN * domain_p, const DB_VALUE * const *temporaries)
+{
+  assert (opcode == T_ADD || opcode == T_SUB || opcode == T_MUL || opcode == T_DIV);
+  int (*arith_operator) (DB_VALUE *, DB_VALUE *, DB_VALUE *, TP_DOMAIN *) = opcode == T_ADD ? qdata_add_dbval
+    : opcode == T_SUB ? qdata_subtract_dbval : opcode == T_MUL ? qdata_multiply_dbval : qdata_divide_dbval;
+  if (conv == NULL || dbval1_p == NULL || dbval2_p == NULL || DB_IS_NULL (dbval1_p) || DB_IS_NULL (dbval2_p))
+    {
+      return arith_operator (dbval1_p, dbval2_p, result_p, domain_p);
+    }
+#if !defined (NDEBUG)
+  qdata_assert_operand_coercion_resolved (opcode, conv, operand_domain, dbval1_p, dbval2_p);
+#endif
+  DB_VALUE *operand[2] = { dbval1_p, dbval2_p };
+  DB_VALUE converted[2];
+  int used = 0;
+  int error = NO_ERROR;
+  for (int k = 0; k < 2 && error == NO_ERROR; k++)
+    {
+      const int i = opcode == T_SUB ? k : 1 - k;
+      if (conv[i] == NULL)
+	{
+	  continue;
+	}
+      if (temporaries != NULL && temporaries[i] != NULL)
+	{
+	  /* a copy that frees nothing: the scope's value stays its owner's */
+	  converted[i] = *temporaries[i];
+	  converted[i].need_clear = false;
+	  operand[i] = &converted[i];
+	  continue;
+	}
+      used |= 1 << i;
+      const TP_DOMAIN_STATUS status = tp_value_convert (conv[i], operand_domain[i], operand[i], &converted[i]);
+      if (status != DOMAIN_COMPATIBLE)
+	{
+	  if (!prm_get_bool_value (PRM_ID_RETURN_NULL_ON_FUNCTION_ERRORS))
+	    {
+	      error = qdata_operand_coercion_error (status, operand[i], operand_domain[i]);
+	      break;
+	    }
+	  pr_clear_value (&converted[i]);
+	  db_make_null (&converted[i]);
+	  er_clear ();
+	}
+      operand[i] = &converted[i];
+    }
+  if (error == NO_ERROR)
+    {
+      error = arith_operator (operand[0], operand[1], result_p, domain_p);
+    }
+  for (int i = 0; i < 2; i++)
+    {
+      if (used & (1 << i))
+	{
+	  pr_clear_value (&converted[i]);
+	}
+    }
+  return error;
+}
+
 /*
  * qdata_add_dbval () -
  *   return: NO_ERROR, or ER_code
@@ -2414,17 +2589,22 @@ qdata_cast_to_domain (DB_VALUE * dbval_p, DB_VALUE * result_p, TP_DOMAIN * domai
  *                        precision/scale.
  *                        MAX_FLT + MAX_DBL = MAX_DBL
  */
+/*
+ * [리뷰] qdata_add_dbval — 두 DB_VALUE 를 더해 result_p 에 넣는 산술 커널 — fetch_peek_arith, 집계 누산, 분석함수가 행마다 부르고 에러 코드를
+ * 돌려준다.
+ * develop: 함수 안에서 타입 조합을 보고 행마다 캐스트했다 — ENUM 은 상대가 문자/비트면 VARCHAR, 아니면 SMALLINT 로 캐스트한 뒤 자기 자신을 재귀 호출했고,
+ * 숫자+문자열은 문자열을 DOUBLE, 날짜+실수/문자열은 BIGINT, 문자열+문자열은 양쪽 DOUBLE 로 tp_value_auto_cast 했다(지역 cast_value1/2,
+ * cast_dom1/2 사용).
+ * 이 PR: 캐스트 블록이 전부 사라지고, 들어온 값이 이미 피연산자 coercion 이 준 타입이라는 전제를 디버그에서 qdata_assert_operands_coerced (T_ADD, …)
+ * 로 확인만 한다. plus-as-concat, NULL, zero date, 피연산자 순서 뒤집기, 타입별 switch 는 그대로다.
+ * 바뀐 것: 캐스트 경로 통째 삭제 + 디버그 검증 추가로 295줄 → 200줄(약 -95줄). 시그니처 동일.
+ */
 int
 qdata_add_dbval (DB_VALUE * dbval1_p, DB_VALUE * dbval2_p, DB_VALUE * result_p, tp_domain * domain_p)
 {
   DB_TYPE type1;
   DB_TYPE type2;
   int error = NO_ERROR;
-  DB_VALUE cast_value1;
-  DB_VALUE cast_value2;
-  TP_DOMAIN *cast_dom1 = NULL;
-  TP_DOMAIN *cast_dom2 = NULL;
-  TP_DOMAIN_STATUS dom_status;
 
   if (domain_p != NULL && TP_DOMAIN_TYPE (domain_p) == DB_TYPE_NULL)
     {
@@ -2433,49 +2613,6 @@ qdata_add_dbval (DB_VALUE * dbval1_p, DB_VALUE * dbval2_p, DB_VALUE * result_p, 
 
   type1 = dbval1_p ? DB_VALUE_DOMAIN_TYPE (dbval1_p) : DB_TYPE_NULL;
   type2 = dbval2_p ? DB_VALUE_DOMAIN_TYPE (dbval2_p) : DB_TYPE_NULL;
-
-  /* Enumeration */
-  if (type1 == DB_TYPE_ENUMERATION)
-    {
-      if (TP_IS_CHAR_BIT_TYPE (type2))
-	{
-	  cast_dom1 = tp_domain_resolve_default (DB_TYPE_VARCHAR);
-	}
-      else
-	{
-	  cast_dom1 = tp_domain_resolve_default (DB_TYPE_SMALLINT);
-	}
-
-      dom_status = tp_value_auto_cast (dbval1_p, &cast_value1, cast_dom1);
-      if (dom_status != DOMAIN_COMPATIBLE)
-	{
-	  error = tp_domain_status_er_set (dom_status, ARG_FILE_LINE, dbval1_p, cast_dom1);
-	  return error;
-	}
-      error = qdata_add_dbval (&cast_value1, dbval2_p, result_p, domain_p);
-      pr_clear_value (&cast_value1);
-      return error;
-    }
-  else if (type2 == DB_TYPE_ENUMERATION)
-    {
-      if (TP_IS_CHAR_BIT_TYPE (type1))
-	{
-	  cast_dom2 = tp_domain_resolve_default (DB_TYPE_VARCHAR);
-	}
-      else
-	{
-	  cast_dom2 = tp_domain_resolve_default (DB_TYPE_SMALLINT);
-	}
-      dom_status = tp_value_auto_cast (dbval2_p, &cast_value2, cast_dom2);
-      if (dom_status != DOMAIN_COMPATIBLE)
-	{
-	  error = tp_domain_status_er_set (dom_status, ARG_FILE_LINE, dbval2_p, cast_dom2);
-	  return error;
-	}
-      error = qdata_add_dbval (dbval1_p, &cast_value2, result_p, domain_p);
-      pr_clear_value (&cast_value2);
-      return error;
-    }
 
   /* plus as concat : when both operands are string or bit */
   if (prm_get_bool_value (PRM_ID_PLUS_AS_CONCAT) == true)
@@ -2491,8 +2628,12 @@ qdata_add_dbval (DB_VALUE * dbval1_p, DB_VALUE * dbval2_p, DB_VALUE * result_p, 
       return NO_ERROR;
     }
 
-  db_make_null (&cast_value1);
-  db_make_null (&cast_value2);
+  /* The operands come in the types their operand coercion gave them, resolved before any row
+   * (qdata_coerce_arith_operands): an ENUM's name or ordinal, a string as DOUBLE, a floating number or a string next to
+   * a date as BIGINT. */
+#if !defined (NDEBUG)
+  qdata_assert_operands_coerced (T_ADD, dbval1_p, dbval2_p);
+#endif
 
   /* not all pairs of operands types can be handled; for some of these pairs, reverse the order of operands to match
    * the handled case */
@@ -2508,57 +2649,6 @@ qdata_add_dbval (DB_VALUE * dbval1_p, DB_VALUE * dbval2_p, DB_VALUE * result_p, 
       dbval2_p = temp;
       type1 = DB_VALUE_DOMAIN_TYPE (dbval1_p);
       type2 = DB_VALUE_DOMAIN_TYPE (dbval2_p);
-    }
-
-  /* number + string : cast string to DOUBLE, add as numbers */
-  if (TP_IS_NUMERIC_TYPE (type1) && TP_IS_CHAR_TYPE (type2))
-    {
-      /* cast string to double */
-      cast_dom2 = tp_domain_resolve_default (DB_TYPE_DOUBLE);
-    }
-  /* date + number : cast number to bigint, add as date + bigint */
-  /* date + string : cast string to bigint, add as date + bigint */
-  else if (TP_IS_DATE_OR_TIME_TYPE (type1) && (TP_IS_FLOATING_NUMBER_TYPE (type2) || TP_IS_CHAR_TYPE (type2)))
-    {
-      /* cast number to BIGINT */
-      cast_dom2 = tp_domain_resolve_default (DB_TYPE_BIGINT);
-    }
-  /* string + string: cast number to bigint, add as date + bigint */
-  else if (TP_IS_CHAR_TYPE (type1) && TP_IS_CHAR_TYPE (type2))
-    {
-      /* cast number to BIGINT */
-      cast_dom1 = tp_domain_resolve_default (DB_TYPE_DOUBLE);
-      cast_dom2 = tp_domain_resolve_default (DB_TYPE_DOUBLE);
-    }
-
-  if (cast_dom2 != NULL)
-    {
-      dom_status = tp_value_auto_cast (dbval2_p, &cast_value2, cast_dom2);
-      if (dom_status != DOMAIN_COMPATIBLE)
-	{
-	  error = tp_domain_status_er_set (dom_status, ARG_FILE_LINE, dbval2_p, cast_dom2);
-	  return error;
-	}
-      dbval2_p = &cast_value2;
-    }
-
-  if (cast_dom1 != NULL)
-    {
-      dom_status = tp_value_auto_cast (dbval1_p, &cast_value1, cast_dom1);
-      if (dom_status != DOMAIN_COMPATIBLE)
-	{
-	  error = tp_domain_status_er_set (dom_status, ARG_FILE_LINE, dbval1_p, cast_dom1);
-	  return error;
-	}
-      dbval1_p = &cast_value1;
-    }
-
-  type1 = dbval1_p ? DB_VALUE_DOMAIN_TYPE (dbval1_p) : DB_TYPE_NULL;
-  type2 = dbval2_p ? DB_VALUE_DOMAIN_TYPE (dbval2_p) : DB_TYPE_NULL;
-
-  if (DB_IS_NULL (dbval1_p) || DB_IS_NULL (dbval2_p))
-    {
-      return NO_ERROR;
     }
 
   if (qdata_is_zero_value_date (dbval1_p) || qdata_is_zero_value_date (dbval2_p))
@@ -4794,150 +4884,35 @@ qdata_subtract_date_to_dbval (DB_VALUE * date_val_p, DB_VALUE * dbval_p, DB_VALU
  *                        precision/scale.
  *                        MAX_FLT - MAX_DBL = -MAX_DBL
  */
+/*
+ * [리뷰] qdata_subtract_dbval — 두 DB_VALUE 를 빼 result_p 에 넣는 산술 커널 — fetch·집계·분석함수와
+ * qexec_get_orderbynum_upper_bound 가 부른다.
+ * develop: ENUM 은 SMALLINT 로 캐스트하고 재귀 호출했고, 숫자-문자열/문자열-숫자/문자열-문자열은 DOUBLE, 날짜-실수는 BIGINT, TIME 상대 문자열은 TIME,
+ * DATE 상대 문자열은 양쪽 DATETIME 으로 맞추는 등 타입 조합별 캐스트 결정과 tp_value_auto_cast 를 행마다 수행했다.
+ * 이 PR: 캐스트 결정과 실행이 모두 사라지고, 디버그에서 qdata_assert_operands_coerced (T_SUB, …) 로 "이미 맞춰져 들어온다"만 확인한다. zero
+ * date·타입별 switch·결과 도메인 보정은 그대로.
+ * 바뀐 것: 274줄 → 150줄(약 -124줄). 이 배치에서 가장 많이 줄어든 함수다. 시그니처 동일.
+ */
 int
 qdata_subtract_dbval (DB_VALUE * dbval1_p, DB_VALUE * dbval2_p, DB_VALUE * result_p, tp_domain * domain_p)
 {
   DB_TYPE type1;
   DB_TYPE type2;
   int error = NO_ERROR;
-  DB_VALUE cast_value1;
-  DB_VALUE cast_value2;
-  TP_DOMAIN *cast_dom1 = NULL;
-  TP_DOMAIN *cast_dom2 = NULL;
-  TP_DOMAIN_STATUS dom_status;
 
   if ((domain_p != NULL && TP_DOMAIN_TYPE (domain_p) == DB_TYPE_NULL) || DB_IS_NULL (dbval1_p) || DB_IS_NULL (dbval2_p))
     {
       return NO_ERROR;
     }
 
-  db_make_null (&cast_value1);
-  db_make_null (&cast_value2);
-
+  /* The operands come in the types their operand coercion gave them, resolved before any row
+   * (qdata_coerce_arith_operands): an ENUM's ordinal, a string as DOUBLE, TIME or DATETIME and the date beside it as
+   * DATETIME, a floating number next to a date as BIGINT. */
+#if !defined (NDEBUG)
+  qdata_assert_operands_coerced (T_SUB, dbval1_p, dbval2_p);
+#endif
   type1 = DB_VALUE_DOMAIN_TYPE (dbval1_p);
   type2 = DB_VALUE_DOMAIN_TYPE (dbval2_p);
-
-  if (type1 == DB_TYPE_ENUMERATION)
-    {
-      /* The enumeration will always be casted to SMALLINT */
-      cast_dom1 = tp_domain_resolve_default (DB_TYPE_SMALLINT);
-      dom_status = tp_value_auto_cast (dbval1_p, &cast_value1, cast_dom1);
-      if (dom_status != DOMAIN_COMPATIBLE)
-	{
-	  error = tp_domain_status_er_set (dom_status, ARG_FILE_LINE, dbval1_p, cast_dom1);
-	  return error;
-	}
-      return qdata_subtract_dbval (&cast_value1, dbval2_p, result_p, domain_p);
-    }
-  else if (type2 == DB_TYPE_ENUMERATION)
-    {
-      cast_dom2 = tp_domain_resolve_default (DB_TYPE_SMALLINT);
-      dom_status = tp_value_auto_cast (dbval2_p, &cast_value2, cast_dom2);
-      if (dom_status != DOMAIN_COMPATIBLE)
-	{
-	  error = tp_domain_status_er_set (dom_status, ARG_FILE_LINE, dbval2_p, cast_dom2);
-	  return error;
-	}
-      return qdata_subtract_dbval (dbval1_p, &cast_value2, result_p, domain_p);
-    }
-
-  /* number - string : cast string to number, substract as numbers */
-  if (TP_IS_NUMERIC_TYPE (type1) && TP_IS_CHAR_TYPE (type2))
-    {
-      /* cast string to double */
-      cast_dom2 = tp_domain_resolve_default (DB_TYPE_DOUBLE);
-    }
-  /* string - number: cast string to number, substract as numbers */
-  else if (TP_IS_CHAR_TYPE (type1) && TP_IS_NUMERIC_TYPE (type2))
-    {
-      /* cast string to double */
-      cast_dom1 = tp_domain_resolve_default (DB_TYPE_DOUBLE);
-    }
-  /* string - string: cast string to number, substract as numbers */
-  else if (TP_IS_CHAR_TYPE (type1) && TP_IS_CHAR_TYPE (type2))
-    {
-      /* cast string to double */
-      cast_dom1 = tp_domain_resolve_default (DB_TYPE_DOUBLE);
-      cast_dom2 = tp_domain_resolve_default (DB_TYPE_DOUBLE);
-    }
-  /* date - number : cast floating point number to bigint, date - bigint = date */
-  else if (TP_IS_DATE_OR_TIME_TYPE (type1) && TP_IS_FLOATING_NUMBER_TYPE (type2))
-    {
-      /* cast number to BIGINT */
-      cast_dom2 = tp_domain_resolve_default (DB_TYPE_BIGINT);
-    }
-  /* number - date: cast floating point number to bigint, bigint - date= date */
-  else if (TP_IS_FLOATING_NUMBER_TYPE (type1) && TP_IS_DATE_OR_TIME_TYPE (type2))
-    {
-      /* cast number to BIGINT */
-      cast_dom1 = tp_domain_resolve_default (DB_TYPE_BIGINT);
-    }
-  /* TIME - string : cast string to TIME , date - TIME = bigint */
-  /* DATE - string : cast string to DATETIME, the other operand to DATETIME DATETIME - DATETIME = bigint */
-  else if (TP_IS_DATE_OR_TIME_TYPE (type1) && TP_IS_CHAR_TYPE (type2))
-    {
-      if (type1 == DB_TYPE_TIME)
-	{
-	  cast_dom2 = tp_domain_resolve_default (DB_TYPE_TIME);
-	}
-      else
-	{
-	  cast_dom2 = tp_domain_resolve_default (DB_TYPE_DATETIME);
-
-	  if (type1 != DB_TYPE_DATETIME)
-	    {
-	      cast_dom1 = tp_domain_resolve_default (DB_TYPE_DATETIME);
-	    }
-	}
-    }
-  /* string - TIME : cast string to TIME, TIME - TIME = bigint */
-  /* string - DATE : cast string to DATETIME, the other operand to DATETIME DATETIME - DATETIME = bigint */
-  else if (TP_IS_CHAR_TYPE (type1) && TP_IS_DATE_OR_TIME_TYPE (type2))
-    {
-      if (type2 == DB_TYPE_TIME)
-	{
-	  cast_dom1 = tp_domain_resolve_default (DB_TYPE_TIME);
-	}
-      else
-	{
-	  /* cast string to same 'date' */
-	  cast_dom1 = tp_domain_resolve_default (DB_TYPE_DATETIME);
-	  if (type2 != DB_TYPE_DATETIME)
-	    {
-	      cast_dom2 = tp_domain_resolve_default (DB_TYPE_DATETIME);
-	    }
-	}
-    }
-
-  if (cast_dom1 != NULL)
-    {
-      dom_status = tp_value_auto_cast (dbval1_p, &cast_value1, cast_dom1);
-      if (dom_status != DOMAIN_COMPATIBLE)
-	{
-	  error = tp_domain_status_er_set (dom_status, ARG_FILE_LINE, dbval1_p, cast_dom1);
-	  return error;
-	}
-      dbval1_p = &cast_value1;
-    }
-
-  if (cast_dom2 != NULL)
-    {
-      dom_status = tp_value_auto_cast (dbval2_p, &cast_value2, cast_dom2);
-      if (dom_status != DOMAIN_COMPATIBLE)
-	{
-	  error = tp_domain_status_er_set (dom_status, ARG_FILE_LINE, dbval2_p, cast_dom2);
-	  return error;
-	}
-      dbval2_p = &cast_value2;
-    }
-
-  type1 = DB_VALUE_DOMAIN_TYPE (dbval1_p);
-  type2 = DB_VALUE_DOMAIN_TYPE (dbval2_p);
-
-  if (DB_IS_NULL (dbval1_p) || DB_IS_NULL (dbval2_p))
-    {
-      return NO_ERROR;
-    }
 
   if (qdata_is_zero_value_date (dbval1_p) || qdata_is_zero_value_date (dbval2_p))
     {
@@ -5488,78 +5463,32 @@ qdata_multiply_sequence_to_dbval (DB_VALUE * seq_val_p, DB_VALUE * dbval_p, DB_V
  *
  * Note: Multiply two db_values.
  */
+/*
+ * [리뷰] qdata_multiply_dbval — 두 DB_VALUE 를 곱해 result_p 에 넣는 산술 커널 — fetch·집계·분석함수가 행마다 부른다.
+ * develop: 숫자*문자열, 문자열*숫자, 문자열*문자열 조합에서 문자열 쪽(또는 양쪽)을 DOUBLE 로 tp_value_auto_cast 한 뒤 곱했고, 캐스트 뒤 타입을 다시 읽고
+ * NULL 검사를 한 번 더 했다.
+ * 이 PR: 캐스트 블록이 사라지고 디버그에서 qdata_assert_operands_coerced (T_MUL, …) 만 돈다. 주석에 "문자열은 DOUBLE 로" 라는 플랜 쪽 규칙이 적혔다.
+ * 바뀐 것: 151줄 → 98줄(약 -53줄). 시그니처 동일.
+ */
 int
 qdata_multiply_dbval (DB_VALUE * dbval1_p, DB_VALUE * dbval2_p, DB_VALUE * result_p, tp_domain * domain_p)
 {
   DB_TYPE type1;
   DB_TYPE type2;
   int error = NO_ERROR;
-  DB_VALUE cast_value1;
-  DB_VALUE cast_value2;
-  TP_DOMAIN *cast_dom1 = NULL;
-  TP_DOMAIN *cast_dom2 = NULL;
-  TP_DOMAIN_STATUS dom_status;
 
   if ((domain_p != NULL && TP_DOMAIN_TYPE (domain_p) == DB_TYPE_NULL) || DB_IS_NULL (dbval1_p) || DB_IS_NULL (dbval2_p))
     {
       return NO_ERROR;
     }
 
+  /* The operands come in the types their operand coercion gave them, resolved before any row
+   * (qdata_coerce_arith_operands): a string as DOUBLE. */
+#if !defined (NDEBUG)
+  qdata_assert_operands_coerced (T_MUL, dbval1_p, dbval2_p);
+#endif
   type1 = DB_VALUE_DOMAIN_TYPE (dbval1_p);
   type2 = DB_VALUE_DOMAIN_TYPE (dbval2_p);
-
-  db_make_null (&cast_value1);
-  db_make_null (&cast_value2);
-
-  /* number * string : cast string to DOUBLE, multiply as number * DOUBLE */
-  if (TP_IS_NUMERIC_TYPE (type1) && TP_IS_CHAR_TYPE (type2))
-    {
-      /* cast arg2 to double */
-      cast_dom2 = tp_domain_resolve_default (DB_TYPE_DOUBLE);
-    }
-  /* string * number: cast string to DOUBLE, multiply as DOUBLE * number */
-  else if (TP_IS_CHAR_TYPE (type1) && TP_IS_NUMERIC_TYPE (type2))
-    {
-      /* cast arg1 to double */
-      cast_dom1 = tp_domain_resolve_default (DB_TYPE_DOUBLE);
-    }
-  /* string * string: cast both to DOUBLE, multiply as DOUBLE * DOUBLE */
-  else if (TP_IS_CHAR_TYPE (type1) && TP_IS_CHAR_TYPE (type2))
-    {
-      /* cast number to DOUBLE */
-      cast_dom1 = tp_domain_resolve_default (DB_TYPE_DOUBLE);
-      cast_dom2 = tp_domain_resolve_default (DB_TYPE_DOUBLE);
-    }
-
-  if (cast_dom2 != NULL)
-    {
-      dom_status = tp_value_auto_cast (dbval2_p, &cast_value2, cast_dom2);
-      if (dom_status != DOMAIN_COMPATIBLE)
-	{
-	  error = tp_domain_status_er_set (dom_status, ARG_FILE_LINE, dbval2_p, cast_dom2);
-	  return error;
-	}
-      dbval2_p = &cast_value2;
-    }
-
-  if (cast_dom1 != NULL)
-    {
-      dom_status = tp_value_auto_cast (dbval1_p, &cast_value1, cast_dom1);
-      if (dom_status != DOMAIN_COMPATIBLE)
-	{
-	  error = tp_domain_status_er_set (dom_status, ARG_FILE_LINE, dbval1_p, cast_dom1);
-	  return error;
-	}
-      dbval1_p = &cast_value1;
-    }
-
-  type1 = DB_VALUE_DOMAIN_TYPE (dbval1_p);
-  type2 = DB_VALUE_DOMAIN_TYPE (dbval2_p);
-
-  if (DB_IS_NULL (dbval1_p) || DB_IS_NULL (dbval2_p))
-    {
-      return NO_ERROR;
-    }
 
   switch (type1)
     {
@@ -6110,90 +6039,32 @@ qdata_divide_monetary_to_dbval (DB_VALUE * monetary_val_p, DB_VALUE * dbval_p, D
  *     overflow but is still being checked in case we are on a
  *     platform where DBL_EPSILON approaches the value of FLT_MIN.
  */
+/*
+ * [리뷰] qdata_divide_dbval — 두 DB_VALUE 를 나눠 result_p 에 넣는 산술 커널 — fetch·집계·분석함수가 행마다 부른다.
+ * develop: 문자열이 낀 조합은 DOUBLE 로 캐스트했고, oracle_compat_number_behavior 가 켜져 있고 양쪽이 정수 계열이면 둘 다 NUMERIC 으로 캐스트했다 —
+ * 그 파라미터를 행마다 prm_get_bool_value 로 읽었다.
+ * 이 PR: 캐스트도 파라미터 조회도 사라지고 디버그에서 qdata_assert_operands_coerced (T_DIV, …) 만 돈다. 주석에 "문자열은 DOUBLE,
+ * oracle_compat_number_behavior 면 정수 둘은 NUMERIC" 이 플랜 쪽 규칙으로 적혔다.
+ * 바뀐 것: 148줄 → 82줄(약 -66줄). 세션 파라미터 의존이 행 경로에서 게이트로 옮겨간 자리다. 시그니처 동일.
+ */
 int
 qdata_divide_dbval (DB_VALUE * dbval1_p, DB_VALUE * dbval2_p, DB_VALUE * result_p, tp_domain * domain_p)
 {
   DB_TYPE type1;
-  DB_TYPE type2;
   int error = NO_ERROR;
-  DB_VALUE cast_value1;
-  DB_VALUE cast_value2;
-  TP_DOMAIN *cast_dom1 = NULL;
-  TP_DOMAIN *cast_dom2 = NULL;
-  TP_DOMAIN_STATUS dom_status;
-
-  /* it should not be static because the parameter could be changed without broker restart */
-  bool oracle_compat_number = prm_get_bool_value (PRM_ID_ORACLE_COMPAT_NUMBER_BEHAVIOR);
 
   if ((domain_p != NULL && TP_DOMAIN_TYPE (domain_p) == DB_TYPE_NULL) || DB_IS_NULL (dbval1_p) || DB_IS_NULL (dbval2_p))
     {
       return NO_ERROR;
     }
 
+  /* The operands come in the types their operand coercion gave them, resolved before any row
+   * (qdata_coerce_arith_operands): a string as DOUBLE, two discrete numbers as NUMERIC under
+   * oracle_compat_number_behavior. */
+#if !defined (NDEBUG)
+  qdata_assert_operands_coerced (T_DIV, dbval1_p, dbval2_p);
+#endif
   type1 = DB_VALUE_DOMAIN_TYPE (dbval1_p);
-  type2 = DB_VALUE_DOMAIN_TYPE (dbval2_p);
-
-  db_make_null (&cast_value1);
-  db_make_null (&cast_value2);
-
-  /* number / string : cast string to DOUBLE, divide as number / DOUBLE */
-  if (TP_IS_NUMERIC_TYPE (type1) && TP_IS_CHAR_TYPE (type2))
-    {
-      /* cast arg2 to double */
-      cast_dom2 = tp_domain_resolve_default (DB_TYPE_DOUBLE);
-    }
-  /* string / number: cast string to DOUBLE, divide as DOUBLE / number */
-  else if (TP_IS_CHAR_TYPE (type1) && TP_IS_NUMERIC_TYPE (type2))
-    {
-      /* cast arg1 to double */
-      cast_dom1 = tp_domain_resolve_default (DB_TYPE_DOUBLE);
-    }
-  /* string / string: cast both to DOUBLE, divide as DOUBLE / DOUBLE */
-  else if (TP_IS_CHAR_TYPE (type1) && TP_IS_CHAR_TYPE (type2))
-    {
-      /* cast number to DOUBLE */
-      cast_dom1 = tp_domain_resolve_default (DB_TYPE_DOUBLE);
-      cast_dom2 = tp_domain_resolve_default (DB_TYPE_DOUBLE);
-    }
-  else if (oracle_compat_number)
-    {
-      if (TP_IS_DISCRETE_NUMBER_TYPE (type1) && TP_IS_DISCRETE_NUMBER_TYPE (type2))
-	{
-	  /* cast number to NUMERIC */
-	  cast_dom1 = tp_domain_resolve_default (DB_TYPE_NUMERIC);
-	  cast_dom2 = tp_domain_resolve_default (DB_TYPE_NUMERIC);
-	}
-    }
-
-  if (cast_dom2 != NULL)
-    {
-      dom_status = tp_value_auto_cast (dbval2_p, &cast_value2, cast_dom2);
-      if (dom_status != DOMAIN_COMPATIBLE)
-	{
-	  error = tp_domain_status_er_set (dom_status, ARG_FILE_LINE, dbval2_p, cast_dom2);
-	  return error;
-	}
-      dbval2_p = &cast_value2;
-    }
-
-  if (cast_dom1 != NULL)
-    {
-      dom_status = tp_value_auto_cast (dbval1_p, &cast_value1, cast_dom1);
-      if (dom_status != DOMAIN_COMPATIBLE)
-	{
-	  error = tp_domain_status_er_set (dom_status, ARG_FILE_LINE, dbval1_p, cast_dom1);
-	  return error;
-	}
-      dbval1_p = &cast_value1;
-    }
-
-  type1 = DB_VALUE_DOMAIN_TYPE (dbval1_p);
-  type2 = DB_VALUE_DOMAIN_TYPE (dbval2_p);
-
-  if (DB_IS_NULL (dbval1_p) || DB_IS_NULL (dbval2_p))
-    {
-      return NO_ERROR;
-    }
 
   if (qdata_is_divided_zero (dbval2_p))
     {
@@ -6697,10 +6568,24 @@ qdata_get_single_tuple_from_list_id (THREAD_ENTRY * thread_p, qfile_list_id * li
  * type list.  Regu variables that are hidden columns are not
  * entered as part of the type list because they are not entered
  * in the list file.
+ *
+ * A column the compiler left variable takes the plan's domain for this execution: the list holds that domain
+ * from its first tuple on, a column over a session variable read too. A variable column without one fails the
+ * unresolved-domain check (execution).
+ */
+/*
+ * [리뷰] qdata_get_valptr_type_list — 리스트 파일을 열기 전에 출력 컬럼들의 도메인 배열(type_list.domp)을 만들어 주는 함수 — qexec 의 리스트 생성
+ * 경로가 부르고 NO_ERROR / 에러 코드를 돌려준다. 이 PR 에서 리스트 레이아웃이 행 이전에 확정된다는 전제를 세우는 자리다.
+ * develop: 인자가 3개였고, 보이는 컬럼마다 reg_var_p->value.domain(컴파일 도메인)을 그대로 domp[i] 에 넣었다 — 컬럼 도메인이 변수 도메인이면 그대로 변수인
+ * 채로 리스트가 열렸다.
+ * 이 PR: const VAL_DESCR * vd 인자가 붙었고, 컬럼마다 qexec_get_node_domain 으로 실행 도메인을 집은 뒤 qexec_consumer_domain 으로 소비자
+ * 도메인을 구한다. NULL 이면 domp 를 db_private_free_and_init 하고 qexec_domain_unresolved 로 ER_QPROC_DOMAIN_UNRESOLVED 를
+ * 낸다.
+ * 바뀐 것: 시그니처 +1 인자, 대입 1줄 → 도메인 2단 해석 + 미해결 에러 분기(+8줄).
  */
 int
 qdata_get_valptr_type_list (THREAD_ENTRY * thread_p, valptr_list_node * valptr_list_p,
-			    qfile_tuple_value_type_list * type_list_p)
+			    qfile_tuple_value_type_list * type_list_p, const VAL_DESCR * vd)
 {
   REGU_VARIABLE_LIST reg_var_p;
   int i, count;
@@ -6741,7 +6626,15 @@ qdata_get_valptr_type_list (THREAD_ENTRY * thread_p, valptr_list_node * valptr_l
     {
       if (!REGU_VARIABLE_IS_FLAGED (&reg_var_p->value, REGU_VARIABLE_HIDDEN_COLUMN))
 	{
-	  type_list_p->domp[i++] = reg_var_p->value.domain;
+	  /* the column regu's domain now: its execution domain once this execution gave it one */
+	  TP_DOMAIN *now = qexec_get_node_domain (vd, reg_var_p->value.domain, reg_var_p->value.plan_item);
+	  const TP_DOMAIN *domain = qexec_consumer_domain (vd, now, reg_var_p->value.plan_item);
+	  if (domain == NULL)
+	    {
+	      db_private_free_and_init (thread_p, type_list_p->domp);
+	      return qexec_domain_unresolved (vd, reg_var_p->value.plan_item, reg_var_p->value.domain);
+	    }
+	  type_list_p->domp[i++] = (TP_DOMAIN *) domain;
 	}
 
       reg_var_p = reg_var_p->next;
@@ -6798,6 +6691,15 @@ qdata_get_val_list_type_list (THREAD_ENTRY * thread_p, VAL_LIST * val_list, qfil
  *
  * Note: Regulator variable should point to only constant values.
  */
+/*
+ * [리뷰] qdata_get_dbval_from_constant_regu_variable — 튜플 적재와 상수 regu 평가에서 regu 하나의 값을 꺼내 그 regu 의 도메인에 맞춰 돌려주는
+ * 함수 — qdata_collect_tuple_values 가 컬럼마다 부른다(실패 시 NULL).
+ * develop: TP_DOMAIN_TYPE (regu_var_p->domain) 즉 컴파일 도메인으로 값 타입·NUMERIC 정밀도/스케일을 비교하고, 어긋나면 그 도메인으로
+ * tp_value_auto_cast 했으며 에러 보고도 그 도메인으로 했다.
+ * 이 PR: 먼저 qexec_get_node_domain (val_desc_p, regu_var_p->domain, regu_var_p->plan_item) 으로 이번 실행의 도메인을 지역 변수에
+ * 집고, 이후 비교·캐스트·tp_domain_status_er_set 이 모두 그 도메인을 쓴다.
+ * 바뀐 것: 지역 변수 도입 + 4곳 치환(약 +4/-3줄). 분기 구조 동일.
+ */
 static DB_VALUE *
 qdata_get_dbval_from_constant_regu_variable (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var_p,
 					     VAL_DESCR * val_desc_p)
@@ -6827,7 +6729,9 @@ qdata_get_dbval_from_constant_regu_variable (THREAD_ENTRY * thread_p, REGU_VARIA
       val_type = DB_VALUE_TYPE (peek_value_p);
       assert (val_type != DB_TYPE_NULL);
 
-      dom_type = TP_DOMAIN_TYPE (regu_var_p->domain);
+      /* the column's domain in this execution: the one its fetch took, or its compiled one */
+      TP_DOMAIN *domain = qexec_get_node_domain (val_desc_p, regu_var_p->domain, regu_var_p->plan_item);
+      dom_type = TP_DOMAIN_TYPE (domain);
       if (dom_type != DB_TYPE_NULL)
 	{
 	  assert (dom_type != DB_TYPE_NULL);
@@ -6838,8 +6742,8 @@ qdata_get_dbval_from_constant_regu_variable (THREAD_ENTRY * thread_p, REGU_VARIA
 	    }
 	  else if (val_type != dom_type
 		   || (val_type == DB_TYPE_NUMERIC
-		       && (peek_value_p->domain.numeric_info.precision != regu_var_p->domain->precision
-			   || peek_value_p->domain.numeric_info.scale != regu_var_p->domain->scale)))
+		       && (peek_value_p->domain.numeric_info.precision != domain->precision
+			   || peek_value_p->domain.numeric_info.scale != domain->scale)))
 	    {
 	      if (REGU_VARIABLE_IS_FLAGED (regu_var_p, REGU_VARIABLE_ANALYTIC_WINDOW))
 		{
@@ -6853,7 +6757,7 @@ qdata_get_dbval_from_constant_regu_variable (THREAD_ENTRY * thread_p, REGU_VARIA
 		      save_heapid = db_change_private_heap (thread_p, 0);
 		    }
 
-		  dom_status = tp_value_auto_cast (peek_value_p, peek_value_p, regu_var_p->domain);
+		  dom_status = tp_value_auto_cast (peek_value_p, peek_value_p, domain);
 		  if (save_heapid != 0)
 		    {
 		      (void) db_change_private_heap (thread_p, save_heapid);
@@ -6861,7 +6765,7 @@ qdata_get_dbval_from_constant_regu_variable (THREAD_ENTRY * thread_p, REGU_VARIA
 		    }
 		  if (dom_status != DOMAIN_COMPATIBLE)
 		    {
-		      result = tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_value_p, regu_var_p->domain);
+		      result = tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_value_p, domain);
 		      return NULL;
 		    }
 		  assert (dom_type == DB_VALUE_TYPE (peek_value_p)
@@ -6885,6 +6789,15 @@ qdata_get_dbval_from_constant_regu_variable (THREAD_ENTRY * thread_p, REGU_VARIA
  *
  * Note: Convert a list of vars into a sequence and return a pointer to it.
  */
+/*
+ * [리뷰] qdata_convert_dbvals_to_set — SET/MULTISET/SEQUENCE 생성 함수의 피연산자들을 하나씩 fetch 해 컬렉션 값으로 모으는 함수 —
+ * qdata_evaluate_function 경로가 부르고 NO_ERROR / ER_FAILED 를 돌려준다.
+ * develop: 마지막 인자가 raw QFILE_TUPLE tuple 이었고 fetch_copy_dbval 에 그 포인터를 그대로 넘겼다. 결과 컬렉션 도메인은
+ * regu_func_p->domain(컴파일 도메인)이었다.
+ * 이 PR: 인자가 QFILE_TUPLE_RECORD * tplrec 로 바뀌어 레이아웃이 묶인 슬롯을 fetch 에 그대로 넘기고, 도메인은 qexec_get_node_domain
+ * (val_desc_p, regu_func_p->domain, regu_func_p->plan_item) 으로 실행 도메인을 읽는다.
+ * 바뀐 것: 시그니처 1개 교체 + 도메인 1줄 교체(약 ±4줄).
+ */
 static int
 qdata_convert_dbvals_to_set (THREAD_ENTRY * thread_p, DB_TYPE stype, REGU_VARIABLE * regu_func_p,
 			     VAL_DESCR * val_desc_p, OID * obj_oid_p, QFILE_TUPLE_RECORD * tplrec)
@@ -6899,7 +6812,7 @@ qdata_convert_dbvals_to_set (THREAD_ENTRY * thread_p, DB_TYPE stype, REGU_VARIAB
 
   result_p = regu_func_p->value.funcp->value;
   operand = regu_func_p->value.funcp->operand;
-  domain_p = regu_func_p->domain;
+  domain_p = qexec_get_node_domain (val_desc_p, regu_func_p->domain, regu_func_p->plan_item);
   db_make_null (&dbval);
 
   if (stype == DB_TYPE_SET)
@@ -7253,6 +7166,15 @@ qdata_evaluate_function (THREAD_ENTRY * thread_p, regu_variable_node * function_
  *
  * Note: Convert a list file into a set/sequence and return a pointer to it.
  */
+/*
+ * [리뷰] qdata_convert_table_to_set — 서브쿼리 리스트 파일 전체를 스캔해 컬렉션 값으로 바꾸는 함수(테이블→SET) — qdata_evaluate_function 경로가
+ * 부른다.
+ * develop: tuple_record 를 { NULL, 0 } 로 초기화하고, 컬럼마다 qfile_locate_tuple_value 로 위치·길이를 찾아 OR_BUF 를 만든 뒤
+ * pr_type_p->data_readval 로 읽었다. V_BOUND 가 아니면 조용히 건너뛰었다(지역 ptr·val_size·OR_BUF 필요).
+ * 이 PR: QFILE_TUPLE_RECORD_INITIALIZER 로 초기화하고, 레이아웃을 아는 qfile_slot_read_column_value (&tuple_record, i,
+ * list_id_p->type_list.domp[i], &dbval, true, &is_null) 한 번으로 읽는다. 실패하면 스캔을 닫고 ER_FAILED.
+ * 바뀐 것: 지역 OR_BUF/ptr/val_size 삭제, 읽기 경로를 헬퍼 한 호출로 축약(약 -12/+6줄). 언바운드 여부는 is_null 로 받는다.
+ */
 static int
 qdata_convert_table_to_set (THREAD_ENTRY * thread_p, DB_TYPE stype, REGU_VARIABLE * function_p, VAL_DESCR * val_desc_p)
 {
@@ -7282,7 +7204,7 @@ qdata_convert_table_to_set (THREAD_ENTRY * thread_p, DB_TYPE stype, REGU_VARIABL
       return ER_FAILED;
     }
 
-  domain_p = function_p->domain;
+  domain_p = qexec_get_node_domain (val_desc_p, function_p->domain, function_p->plan_item);
   list_id_p = operand->value.value.srlist_id->list_id;
   db_make_null (&dbval);
 
@@ -7388,6 +7310,16 @@ qdata_convert_table_to_set (THREAD_ENTRY * thread_p, DB_TYPE stype, REGU_VARIABL
  *  result_val_p(in/out):
  *  vd(in):
  */
+/*
+ * [리뷰] qdata_evaluate_connect_by_root — CONNECT_BY_ROOT 식을 평가하는 함수 — 현재 튜플에서 부모 위치를 따라 루트 튜플까지 거슬러 올라가 지정 컬럼
+ * 값을 result_val_p 에 담고 true/false 를 돌려준다.
+ * develop: tuple_rec 를 { (QFILE_TUPLE) NULL, 0 } 로 두고 tuple_rec.tpl = tpl 로 포인터만 갈아끼웠으며, 컬럼 읽기는
+ * qexec_get_tuple_column_value (tuple_rec.tpl, …, regu_p->domain) 처럼 raw 튜플 포인터와 컴파일 도메인을 넘겼다.
+ * 이 PR: 레코드를 qfile_slot_set_tuple_ptr_and_layout (&tuple_rec, tpl, 0, &s_id.list_id.type_list) 로 리스트 레이아웃에
+ * 묶고(size 0 = 페이지를 PEEK 한다는 표시), 컬럼 읽기는 레코드 자체와 qexec_get_node_domain (vd, regu_p->domain, regu_p->plan_item)
+ * 을 넘긴다.
+ * 바뀐 것: 초기화 1 + 바인딩 1 + 호출 2곳 교체(약 ±6줄). 행이 컬럼을 찾을 때 쓰는 레이아웃이 튜플과 함께 다니게 된 자리다.
+ */
 bool
 qdata_evaluate_connect_by_root (THREAD_ENTRY * thread_p, void *xasl_p, regu_variable_node * regu_p,
 				DB_VALUE * result_val_p, val_descr * vd)
@@ -7482,7 +7414,8 @@ qdata_evaluate_connect_by_root (THREAD_ENTRY * thread_p, void *xasl_p, regu_vari
 
   if (i < xptr->val_list->val_cnt)
     {
-      if (qexec_get_tuple_column_value (&tuple_rec, i, result_val_p, regu_p->domain) != NO_ERROR)
+      if (qexec_get_tuple_column_value (&tuple_rec, i, result_val_p,
+					qexec_get_node_domain (vd, regu_p->domain, regu_p->plan_item)) != NO_ERROR)
 	{
 	  qfile_close_scan (thread_p, &s_id);
 	  return false;
@@ -7638,6 +7571,16 @@ qdata_evaluate_qprior (THREAD_ENTRY * thread_p, void *xasl_p, regu_variable_node
  *  regu_p1(in): column
  *  regu_p2(in): character
  *  result_val_p(in/out):
+ */
+/*
+ * [리뷰] qdata_evaluate_sys_connect_by_path — SYS_CONNECT_BY_PATH 를 평가하는 함수 — 루트까지 거슬러 올라가며 각 단계의 인자 값을 구분자와 함께
+ * 이어 붙인 문자열을 만들어 돌려준다.
+ * develop: tuple_rec 를 { (QFILE_TUPLE) NULL, 0 } 로 두고 tuple_rec.tpl = tpl 로만 갱신한 뒤,
+ * fetch_val_list(2곳)·fetch_peek_dbval·qexec_get_tuple_column_value(2곳) 에 raw 튜플 포인터를 넘겼고 컬럼 도메인은
+ * regu_p->domain(컴파일 도메인)이었다.
+ * 이 PR: QFILE_TUPLE_RECORD_INITIALIZER + qfile_slot_set_tuple_ptr_and_layout 으로 레코드를 리스트 레이아웃에 묶고, 다섯 호출이 모두
+ * &tuple_rec 를 받는다. 컬럼 도메인은 qexec_get_node_domain 으로 읽는다.
+ * 바뀐 것: 초기화 1 + 바인딩 1 + 호출 5곳 교체(약 ±10줄). 경로 문자열 조립 로직 자체는 그대로.
  */
 bool
 qdata_evaluate_sys_connect_by_path (THREAD_ENTRY * thread_p, void *xasl_p, regu_variable_node * regu_p,
@@ -7801,7 +7744,9 @@ qdata_evaluate_sys_connect_by_path (THREAD_ENTRY * thread_p, void *xasl_p, regu_
 	  /* get the required column */
 	  if (i < xptr->val_list->val_cnt)
 	    {
-	      if (qexec_get_tuple_column_value (&tuple_rec, i, arg_dbval_p, regu_p->domain) != NO_ERROR)
+	      if (qexec_get_tuple_column_value (&tuple_rec, i, arg_dbval_p,
+						qexec_get_node_domain (vd, regu_p->domain,
+								       regu_p->plan_item)) != NO_ERROR)
 		{
 		  goto error;
 		}
@@ -8751,6 +8696,14 @@ error_exit:
 //
 // qdata_benchmark () - "benchmark" function execution; repeatedly run nested operation
 //
+/*
+ * [리뷰] qdata_benchmark — benchmark() 내장 함수의 구현 — 대상 식을 count 번 반복 평가해 걸린 시간을 돌려주는 측정용 경로다.
+ * develop: 마지막 인자가 raw QFILE_TUPLE 이었고, 반복마다 fetch_force_not_const_recursive (*target_reguvar) 로 중첩 regu 의 상수
+ * 플래그를 지워 "상수라서 한 번만 계산" 되는 것을 행 시점에 강제로 풀었다.
+ * 이 PR: 인자가 QFILE_TUPLE_RECORD * tplrec 로 바뀌었고, 상수 플래그 해제 호출이 사라졌다 — 로드가 대상 식의 노드를 행 피연산자로 표시해 두어
+ * 게이트(resolve_domains)의 상수식 단계가 애초에 그 식을 미리 계산하지 않는다는 것이 주석으로 적혔다.
+ * 바뀐 것: 시그니처 1개 교체 + 반복 루프에서 호출 1개 삭제(-1/+2줄, 주석 교체).
+ */
 static int
 qdata_benchmark (THREAD_ENTRY * thread_p, FUNCTION_TYPE * function_p, VAL_DESCR * val_desc_p, OID * obj_oid_p,
 		 QFILE_TUPLE_RECORD * tplrec)
@@ -8819,11 +8772,10 @@ qdata_benchmark (THREAD_ENTRY * thread_p, FUNCTION_TYPE * function_p, VAL_DESCR 
   for (INT64 step = 0; step < count; step++)
     {
       // we're trying to benchmark the expression in target reguvar by running it many times. even if all operands are
-      // constant, we still have to repeat the operations. for that, we need to make sure nested regu variables are not
-      // flagged as constants
+      // constant, we still have to repeat the operations: the load marks the target's nodes as row operands, so the
+      // resolve_domains never evaluates them once
       //
       // node that they still may be other optimizations that are not so easily disabled
-      fetch_force_not_const_recursive (*target_reguvar);
       error = fetch_peek_dbval (thread_p, target_reguvar, val_desc_p, NULL, obj_oid_p, tplrec, &target_value);
       if (error != NO_ERROR)
 	{

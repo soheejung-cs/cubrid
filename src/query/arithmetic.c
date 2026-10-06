@@ -6585,11 +6585,34 @@ db_evaluate_json_get_all_paths (DB_VALUE * result, DB_VALUE * const *arg, int co
 int
 db_least_or_greatest (DB_VALUE * arg1, DB_VALUE * arg2, DB_VALUE * result, bool least)
 {
-  int error_code = NO_ERROR;
   bool can_compare = false;
   DB_VALUE_COMPARE_RESULT cmp_result = DB_UNK;
 
   cmp_result = tp_value_compare_with_error (arg1, arg2, 1, 0, &can_compare);
+
+  return db_least_or_greatest_by (arg1, arg2, cmp_result, can_compare, result, least);
+}
+
+/*
+ * db_least_or_greatest_by () - LEAST or GREATEST of two values, once they are compared
+ *   return: NO_ERROR, or ER_FAILED where they do not compare
+ *   cmp_result(in), can_compare(in): the comparison of arg1 with arg2 (the server's is resolved)
+ */
+/*
+ * [리뷰] db_least_or_greatest_by — LEAST/GREATEST 의 두 인자 비교 결과(cmp_result, can_compare)를 받아 둘 중 하나를 result 에
+ * 복제하거나 NULL 을 만든다. 비교 자체는 하지 않고 호출자(db_least_or_greatest, 서버 실행 경로)가 넘긴 판정만 소비해 NO_ERROR/ER_FAILED 를 돌려준다.
+ * develop: develop 에는 이 함수가 없다. db_least_or_greatest() 하나가 tp_value_compare_with_error() 로 직접 비교하고 그 자리에서 분기까지
+ * 다 했다(src/query/arithmetic.c:6586).
+ * 이 PR: 비교(tp_value_compare_with_error)와 선택이 분리됐다. db_least_or_greatest() 는 비교만 해서 이 함수에 넘기고, 서버 실행 경로는 게이트가
+ * 확정한 비교(DOMAIN_COMPARE_PLAN)로 얻은 cmp_result 를 가지고 이 함수를 직접 부를 수 있다.
+ * 바뀐 것: 기존 함수 몸통을 그대로 떼어낸 추출 리팩터링 + 새 공개 시그니처(cmp_result, can_compare 를 인자로). 분기 로직은 한 줄도 바뀌지 않았고
+ * db_least_or_greatest() 는 3줄로 줄었다(약 +45/-40).
+ */
+int
+db_least_or_greatest_by (DB_VALUE * arg1, DB_VALUE * arg2, DB_VALUE_COMPARE_RESULT cmp_result, bool can_compare,
+			 DB_VALUE * result, bool least)
+{
+  int error_code = NO_ERROR;
 
   if (cmp_result == DB_EQ)
     {

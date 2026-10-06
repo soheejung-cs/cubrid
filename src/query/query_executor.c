@@ -32,6 +32,7 @@
 #include <sys/timeb.h>
 
 #include "query_executor.h"
+#include "domain_resolve.h"
 #include "qfile_tuple_layout.h"
 
 #include "binaryheap.h"
@@ -47,6 +48,7 @@
 #include "dbtype.h"
 #include "object_primitive.h"
 #include "object_representation.h"
+#include "set_object.h"
 #include "list_file.h"
 #include "extendible_hash.h"
 #include "xasl_cache.h"
@@ -269,6 +271,7 @@ typedef struct analytic_function_state ANALYTIC_FUNCTION_STATE;
 struct analytic_function_state
 {
   ANALYTIC_TYPE *func_p;
+  const VAL_DESCR *vd;		/* the execution's: its execution domains hold the domains the function takes */
   RECDES current_key;
 
   /* result list files */
@@ -428,8 +431,6 @@ static int qexec_clear_regu_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, R
 static int qexec_clear_regu_value_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, REGU_VALUE_LIST * list,
 					bool is_final, bool for_parallel_aptr);
 static void qexec_clear_db_val_list (QPROC_DB_VALUE_LIST list);
-static void qexec_clear_sort_list (XASL_NODE * xasl_p, SORT_LIST * list, bool is_final);
-static void qexec_clear_pos_desc (XASL_NODE * xasl_p, QFILE_TUPLE_VALUE_POSITION * position_descr, bool is_final);
 static int qexec_clear_pred (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, PRED_EXPR * pr, bool is_final,
 			     bool for_parallel_aptr);
 static int qexec_clear_access_spec_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, ACCESS_SPEC_TYPE * list,
@@ -486,9 +487,12 @@ static int qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE 
 static int qexec_groupby_index (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
 				QFILE_TUPLE_RECORD * tplrec);
 static int qdata_setup_analytic_eval_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state);
+static TP_DOMAIN *qexec_analytic_value_domain (const VAL_DESCR * vd, const ANALYTIC_TYPE * func_p);
 static int qexec_initialize_analytic_function_state (THREAD_ENTRY * thread_p, ANALYTIC_FUNCTION_STATE * func_state,
 						     ANALYTIC_TYPE * func_p, XASL_STATE * xasl_state,
 						     bool is_skip_sort);
+static void qexec_plan_interpolation_sort_key (ANALYTIC_STATE * analytic_state, ANALYTIC_TYPE * a_func_list,
+					       const VAL_DESCR * vd);
 static ANALYTIC_STATE *qexec_initialize_analytic_state (THREAD_ENTRY * thread_p, ANALYTIC_STATE * analytic_state,
 							ANALYTIC_TYPE * a_func_list, SORT_LIST * sort_list,
 							REGU_VARIABLE_LIST a_regu_list, VAL_LIST * a_val_list,
@@ -514,7 +518,7 @@ static int qexec_analytic_evaluate_ntile_function (THREAD_ENTRY * thread_p, ANAL
 static int qexec_analytic_evaluate_offset_function (THREAD_ENTRY * thread_p, ANALYTIC_FUNCTION_STATE * func_state,
 						    ANALYTIC_STATE * analytic_state);
 static int qexec_analytic_evaluate_interpolation_function (THREAD_ENTRY * thread_p,
-							   ANALYTIC_FUNCTION_STATE * func_state);
+							   ANALYTIC_FUNCTION_STATE * func_state, VAL_DESCR * vd);
 static int qexec_analytic_group_header_load (ANALYTIC_FUNCTION_STATE * func_state);
 static int qexec_analytic_sort_key_header_load (ANALYTIC_FUNCTION_STATE * func_state, bool load_value);
 static int qexec_analytic_value_advance (THREAD_ENTRY * thread_p, ANALYTIC_FUNCTION_STATE * func_state, int amount,
@@ -524,15 +528,19 @@ static int qexec_analytic_value_lookup (THREAD_ENTRY * thread_p, ANALYTIC_FUNCTI
 static int qexec_analytic_group_header_next (THREAD_ENTRY * thread_p, ANALYTIC_FUNCTION_STATE * func_state);
 static int qexec_analytic_update_group_result (THREAD_ENTRY * thread_p, ANALYTIC_STATE * analytic_state);
 static int qexec_collection_has_null (DB_VALUE * colval);
-static DB_VALUE_COMPARE_RESULT qexec_cmp_tpl_vals_merge (QFILE_TUPLE_RECORD * left, int *left_ind,
-							 TP_DOMAIN ** left_dom, QFILE_TUPLE_RECORD * rght,
-							 int *rght_ind, TP_DOMAIN ** rght_dom, int tval_cnt);
+static DB_VALUE_COMPARE_RESULT qexec_cmp_tpl_vals_merge (THREAD_ENTRY * thread_p, QFILE_TUPLE_RECORD * left,
+							 int *left_ind, TP_DOMAIN ** left_dom,
+							 QFILE_TUPLE_RECORD * rght, int *rght_ind,
+							 TP_DOMAIN ** rght_dom, int tval_cnt,
+							 const DOMAIN_COMPARE_PLAN * const *compares,
+							 const VAL_DESCR * vd);
 static QFILE_LIST_ID *qexec_merge_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * outer_list_idp,
 					QFILE_LIST_ID * inner_list_idp, QFILE_LIST_MERGE_INFO * merge_infop,
-					int ls_flag);
+					int ls_flag, const DOMAIN_COMPARE_PLAN * const *compares, const VAL_DESCR * vd);
 static QFILE_LIST_ID *qexec_merge_list_outer (THREAD_ENTRY * thread_p, SCAN_ID * outer_sid, SCAN_ID * inner_sid,
 					      QFILE_LIST_MERGE_INFO * merge_infop, PRED_EXPR * other_outer_join_pred,
-					      XASL_STATE * xasl_state, int ls_flag);
+					      XASL_STATE * xasl_state, int ls_flag,
+					      const DOMAIN_COMPARE_PLAN * const *compares);
 static int qexec_merge_listfiles (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state);
 static int qexec_add_intint_tuple (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id, int v1, int v2);
 static int qexec_add_intval_tuple (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id, int v1, DB_VALUE * v2);
@@ -591,7 +599,6 @@ static int qexec_execute_selupd_list_find_class (THREAD_ENTRY * thread_p, XASL_N
 static int qexec_start_connect_by_lists (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state);
 static int qexec_update_connect_by_lists (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
 					  QFILE_TUPLE_RECORD * tplrec);
-static void qexec_sync_start_with_type_list (CONNECTBY_PROC_NODE * connect_by);
 static void qexec_end_connect_by_lists (THREAD_ENTRY * thread_p, XASL_NODE * xasl);
 static void qexec_clear_connect_by_lists (THREAD_ENTRY * thread_p, XASL_NODE * xasl);
 static int qexec_execute_connect_by (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
@@ -621,8 +628,6 @@ static int qexec_process_unique_stats (THREAD_ENTRY * thread_p, const OID * clas
 				       UPDDEL_CLASS_INFO_INTERNAL * class_);
 static SCAN_CODE qexec_init_next_partition (THREAD_ENTRY * thread_p, ACCESS_SPEC_TYPE * spec, XASL_NODE * xasl);
 
-static int qexec_check_limit_clause (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
-				     bool * empty_result);
 static int qexec_execute_mainblock_internal (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
 					     UPDDEL_CLASS_INSTANCE_LOCK_INFO * p_class_instance_lock_info);
 static DEL_LOB_INFO *qexec_create_delete_lob_info (THREAD_ENTRY * thread_p, XASL_STATE * xasl_state,
@@ -680,11 +685,6 @@ static DB_VALUE_COMPARE_RESULT bf2df_str_cmpdisk (void *mem1, void *mem2, TP_DOM
 						  int total_order, int *start_colp);
 static DB_VALUE_COMPARE_RESULT bf2df_str_cmpval (DB_VALUE * value1, DB_VALUE * value2, int do_coercion, int total_order,
 						 int *start_colp, int collation);
-static void qexec_resolve_domains_on_sort_list (SORT_LIST * order_list, REGU_VARIABLE_LIST reference_regu_list);
-static void qexec_resolve_domains_for_group_by (BUILDLIST_PROC_NODE * buildlist, OUTPTR_LIST * reference_out_list);
-static int qexec_resolve_domains_for_aggregation (THREAD_ENTRY * thread_p, AGGREGATE_TYPE * agg_p,
-						  VAL_DESCR * vd, QFILE_TUPLE_RECORD * tplrec,
-						  REGU_VARIABLE_LIST regu_list, int *resolved);
 static int query_multi_range_opt_check_set_sort_col (THREAD_ENTRY * thread_p, XASL_NODE * xasl);
 static ACCESS_SPEC_TYPE *query_multi_range_opt_check_specs (THREAD_ENTRY * thread_p, XASL_NODE * xasl);
 static int qexec_init_instnum_val (XASL_NODE * xasl, THREAD_ENTRY * thread_p, XASL_STATE * xasl_state);
@@ -722,7 +722,9 @@ static int qexec_evaluate_partition_aggregates (THREAD_ENTRY * thread_p, ACCESS_
 						AGGREGATE_TYPE * agg_list, bool * is_scan_needed);
 
 static BH_CMP_RESULT qexec_topn_compare (const void *left, const void *right, BH_CMP_ARG arg);
-static BH_CMP_RESULT qexec_topn_cmpval (DB_VALUE * left, DB_VALUE * right, SORT_LIST * sort_spec);
+static void qexec_topn_sort_domains (const VAL_DESCR * vd, SORT_LIST * sort_items, const TP_DOMAIN ** domains);
+static BH_CMP_RESULT qexec_topn_cmpval (DB_VALUE * left, DB_VALUE * right, SORT_LIST * sort_spec,
+					const TP_DOMAIN * domain);
 static void qexec_clear_topn_tuple (THREAD_ENTRY * thread_p, TOPN_TUPLE * tuple, int count);
 static int qexec_get_orderbynum_upper_bound (THREAD_ENTRY * tread_p, PRED_EXPR * pred, VAL_DESCR * vd,
 					     DB_VALUE * ubound);
@@ -1115,6 +1117,18 @@ exit_on_error:
  *
  * Note: Processing to be accomplished when a candidate row has been qualified.
  */
+/*
+ * [리뷰] qexec_end_one_iteration — 스캔 루프(qexec_intprt_fnc/qexec_execute_scan)가 조건을 통과한 행마다 부르는 지점으로, 그 행을
+ * BUILDLIST 의 결과 리스트파일·topn 힙에 쓰거나 BUILDVALUE 의 누산기에 넣고 NO_ERROR/에러를 돌려준다.
+ * develop: 행마다 qexec_resolve_domains_for_aggregation() 을 불러 집계 도메인이 미해결이면 그 행의 값에서 도메인을 추론했고, BUILDVALUE 쪽은 매
+ * 행 끝에 outptr_list 를 순회하며 DB_VALUE 포인터가 같은 집계 노드를 찾아 out_list_val->value.domain 을 덮어썼다.
+ * 이 PR: 같은 자리를 qexec_aggregate_first_values() 가 맡는다 — 첫 값에서 아직 받아야 할 것만 받고, 해결이 끝나면 곧바로
+ * qdata_link_shared_accumulators() 로 누산기 공유를 연결한다. outptr_list 순회 덮어쓰기는 사라지고 '출력 컬럼 도메인은 첫 행 전에
+ * qexec_type_accumulator_outputs 가 이미 정했다'는 주석만 남는다.
+ * 바뀐 것: 함수 교체(resolve_domains_for_aggregation→aggregate_first_values) + 공유 누산기 연결 호출 2곳 추가 + BUILDVALUE 의 행별
+ * 도메인 덮어쓰기 루프 약 -26줄 삭제. qdata_copy_valptr_list_to_tuple 에 &xasl->list_id->type_list 인자 추가(행이 쓸 레이아웃을 호출자가
+ * 넘김).
+ */
 static int
 qexec_end_one_iteration (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
 			 QFILE_TUPLE_RECORD * tplrec)
@@ -1191,13 +1205,13 @@ qexec_end_one_iteration (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE *
 	  GOTO_EXIT_ON_ERROR;
 	}
 
-      /* update aggregation domains */
+      /* what the aggregates still take from their first values (qexec_aggregate_first_values) */
       if (xasl->type == BUILDLIST_PROC && xasl->proc.buildlist.g_agg_list != NULL
 	  && !xasl->proc.buildlist.g_agg_domains_resolved)
 	{
-	  if (qexec_resolve_domains_for_aggregation (thread_p, xasl->proc.buildlist.g_agg_list, &xasl_state->vd, tplrec,
-						     xasl->proc.buildlist.g_scan_regu_list,
-						     &xasl->proc.buildlist.g_agg_domains_resolved) != NO_ERROR)
+	  if (qexec_aggregate_first_values (thread_p, xasl->proc.buildlist.g_agg_list, &xasl_state->vd, tplrec,
+					    xasl->proc.buildlist.g_scan_regu_list,
+					    &xasl->proc.buildlist.g_agg_domains_resolved) != NO_ERROR)
 	    {
 	      GOTO_EXIT_ON_ERROR;
 	    }
@@ -1305,12 +1319,9 @@ qexec_end_one_iteration (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE *
     {
       if (xasl->proc.buildvalue.agg_list != NULL)
 	{
-	  AGGREGATE_TYPE *agg_node = NULL;
-	  REGU_VARIABLE_LIST out_list_val = NULL;
-
 	  if (xasl->proc.buildvalue.agg_list != NULL && !xasl->proc.buildvalue.agg_domains_resolved)
 	    {
-	      if (qexec_resolve_domains_for_aggregation
+	      if (qexec_aggregate_first_values
 		  (thread_p, xasl->proc.buildvalue.agg_list, &xasl_state->vd, tplrec, NULL,
 		   &xasl->proc.buildvalue.agg_domains_resolved) != NO_ERROR)
 		{
@@ -1332,32 +1343,8 @@ qexec_end_one_iteration (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE *
 	      GOTO_EXIT_ON_ERROR;
 	    }
 
-	  /* resolve domains for aggregates */
-	  for (out_list_val = xasl->outptr_list->valptrp; out_list_val != NULL; out_list_val = out_list_val->next)
-	    {
-	      assert (out_list_val->value.domain != NULL);
-
-	      /* aggregates corresponds to CONSTANT regu vars in outptr_list */
-	      if (out_list_val->value.type != TYPE_CONSTANT
-		  || (TP_DOMAIN_TYPE (out_list_val->value.domain) != DB_TYPE_VARIABLE
-		      && TP_DOMAIN_COLLATION_FLAG (out_list_val->value.domain) == TP_DOMAIN_COLL_NORMAL))
-		{
-		  continue;
-		}
-
-	      /* search in aggregate list by comparing DB_VALUE pointers */
-	      for (agg_node = xasl->proc.buildvalue.agg_list; agg_node != NULL; agg_node = agg_node->next)
-		{
-		  if (out_list_val->value.value.dbvalptr == agg_node->accumulator.value
-		      && TP_DOMAIN_TYPE (agg_node->domain) != DB_TYPE_NULL)
-		    {
-		      assert (agg_node->domain != NULL);
-		      assert (TP_DOMAIN_COLLATION_FLAG (agg_node->domain) == TP_DOMAIN_COLL_NORMAL);
-		      out_list_val->value.domain = agg_node->domain;
-		    }
-		}
-
-	    }
+	  /* the output columns over an accumulator took their domains before the first row
+	   * (qexec_type_accumulator_outputs), not after each row */
 	}
     }
 
@@ -1460,8 +1447,6 @@ qexec_clear_arith_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, ARITH_TYPE 
       return NO_ERROR;
     }
 
-  /* restore the original domain, in order to avoid coerce when the XASL clones will be used again */
-  list->domain = list->original_domain;
   pr_clear_value (list->value);
   pg_cnt += qexec_clear_regu_var (thread_p, xasl_p, list->leftptr, is_final, for_parallel_aptr);
   pg_cnt += qexec_clear_regu_var (thread_p, xasl_p, list->rightptr, is_final, for_parallel_aptr);
@@ -1476,12 +1461,65 @@ qexec_clear_arith_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, ARITH_TYPE 
   return pg_cnt;
 }
 
+/* A function's cached evaluation state: a regular expression's compiled pattern. */
+/*
+ * [리뷰] qexec_clear_function_tmp_obj — FUNCTION_TYPE 노드가 실행 중 만든 임시 객체(현재는 컴파일된 정규식)를 지우는 소유자로,
+ * qexec_clear_regu_var 와 domain_resolve.c 의 두 정리 경로가 공유해서 부른다. 반환 없음.
+ * develop: develop 에 없음 — 이 PR 이 신설. 같은 코드가 qexec_clear_regu_var 의 TYPE_FUNC 분기 안에 인라인으로 있었다.
+ * 이 PR: 같은 내용을 독립 함수로 떼어내고 query_executor.h 에 extern 으로 내보냈다. 도메인 계획 경로(domain_resolve.c:1799, 2392)가 regu 전체
+ * 정리 없이 함수 노드 하나만 비울 수 있게 됐다.
+ * 바뀐 것: 신설(+31줄, 로직 동일) + 헤더 공개. 호출처 3곳(query_executor.c 1곳, domain_resolve.c 2곳).
+ */
+void
+qexec_clear_function_tmp_obj (FUNCTION_TYPE * funcp)
+{
+  if (funcp->tmp_obj == NULL)
+    {
+      return;
+    }
+  switch (funcp->ftype)
+    {
+    case F_REGEXP_COUNT:
+    case F_REGEXP_INSTR:
+    case F_REGEXP_LIKE:
+    case F_REGEXP_REPLACE:
+    case F_REGEXP_SUBSTR:
+      {
+	if (funcp->tmp_obj->compiled_regex)
+	  {
+	    delete funcp->tmp_obj->compiled_regex;
+	    funcp->tmp_obj->compiled_regex = NULL;
+	  }
+      }
+      break;
+    default:
+      // any member of union func_tmp_obj may have been erased
+      assert (false);
+      break;
+    }
+
+  delete funcp->tmp_obj;
+  funcp->tmp_obj = NULL;
+}
+
 /*
  * qexec_clear_regu_var () - clear the db_values in the regu_variable
  *   return:
  *   xasl_p(in) :
  *   regu_var(in) :      :
  *   final(in)  :
+ */
+/*
+ * [리뷰] qexec_clear_regu_var — 질의 종료나 XASL 클론 디캐시 때 regu 변수 한 개의 실행 중 상태(값·캐시 포인터·임시 객체)를 되돌리는 재귀 정리기로, 해제한 페이지
+ * 수를 누적해 돌려준다.
+ * develop: 맨 앞에서 regu_var->domain = regu_var->original_domain 으로 도메인을 되돌리고
+ * REGU_VARIABLE_FETCH_ALL_CONST/FETCH_NOT_CONST/FAST_PEEK 플래그를 지웠다. TYPE_FUNC 에서 tmp_obj 를 인라인으로 지웠고,
+ * TYPE_POSITION 에서 qexec_clear_pos_desc() 로 pos_descr->dom 을 original_domain 으로 되돌렸다.
+ * 이 PR: 도메인 복원과 플래그 리셋이 통째로 없어졌다 — 이 PR 에서는 실행이 XASL 의 domain 필드를 제자리에서 바꾸지 않고(도메인은 DOMAIN_PLAN/실행 소유 저장소에서
+ * 온다) FAST_PEEK 는 적재 시점(stream_to_xasl·domain_plan)에 확정되므로 되돌릴 것이 없다. tmp_obj 정리는
+ * qexec_clear_function_tmp_obj() 호출로, TYPE_POSITION 분기는 삭제(qexec_clear_pos_desc 자체가 PR 에서 제거).
+ * 바뀐 것: 선두 복원·플래그 블록 -20줄, TYPE_FUNC 인라인 -28줄→호출 1줄, TYPE_POSITION 분기 -3줄. TYPE_ATTR_ID 계열에 cache_slot = NULL
+ * 추가(cache_dbvalp 와 보조 맞춤).
  */
 static int
 qexec_clear_regu_var (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, REGU_VARIABLE * regu_var, bool is_final,
@@ -1494,26 +1532,6 @@ qexec_clear_regu_var (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, REGU_VARIABLE
     {
       return pg_cnt;
     }
-
-  /* restore the original domain, in order to avoid coerce when the XASL clones will be used again */
-  regu_var->domain = regu_var->original_domain;
-
-#if !defined(NDEBUG)
-  if (REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST))
-    {
-      assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_NOT_CONST));
-    }
-  if (REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_NOT_CONST))
-    {
-      assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST));
-    }
-#endif
-
-  /* clear run-time setting info */
-  REGU_VARIABLE_CLEAR_FLAG (regu_var, REGU_VARIABLE_FETCH_ALL_CONST);
-  REGU_VARIABLE_CLEAR_FLAG (regu_var, REGU_VARIABLE_FETCH_NOT_CONST);
-  /* pair with FETCH_*_CONST: clear so a reused (pooled) XASL clone rebuilds it via the slow path next time */
-  REGU_VARIABLE_CLEAR_FLAG (regu_var, REGU_VARIABLE_FAST_PEEK);
 
   switch (regu_var->type)
     {
@@ -1595,34 +1613,7 @@ qexec_clear_regu_var (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, REGU_VARIABLE
     case TYPE_FUNC:
       pr_clear_value (regu_var->value.funcp->value);
       pg_cnt += qexec_clear_regu_list (thread_p, xasl_p, regu_var->value.funcp->operand, is_final, for_parallel_aptr);
-
-      if (regu_var->value.funcp->tmp_obj != NULL)
-	{
-	  switch (regu_var->value.funcp->ftype)
-	    {
-	    case F_REGEXP_COUNT:
-	    case F_REGEXP_INSTR:
-	    case F_REGEXP_LIKE:
-	    case F_REGEXP_REPLACE:
-	    case F_REGEXP_SUBSTR:
-	      {
-		if (regu_var->value.funcp->tmp_obj->compiled_regex)
-		  {
-		    delete regu_var->value.funcp->tmp_obj->compiled_regex;
-		    regu_var->value.funcp->tmp_obj->compiled_regex = NULL;
-		  }
-	      }
-	      break;
-	    default:
-	      // any member of union func_tmp_obj may have been erased
-	      assert (false);
-	      break;
-	    }
-
-	  delete regu_var->value.funcp->tmp_obj;
-	  regu_var->value.funcp->tmp_obj = NULL;
-	}
-
+      qexec_clear_function_tmp_obj (regu_var->value.funcp);
       break;
     case TYPE_REGUVAL_LIST:
       pg_cnt +=
@@ -1661,9 +1652,6 @@ qexec_clear_regu_var (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, REGU_VARIABLE
 #if 0				/* TODO - */
     case TYPE_LIST_ID:
 #endif
-    case TYPE_POSITION:
-      qexec_clear_pos_desc (xasl_p, &regu_var->value.pos_descr, is_final);
-      break;
     default:
       break;
     }
@@ -1737,38 +1725,6 @@ qexec_clear_db_val_list (QPROC_DB_VALUE_LIST list)
   for (p = list; p; p = p->next)
     {
       pr_clear_value (p->val);
-    }
-}
-
-/*
- * qexec_clear_sort_list () - clear position desc
- *   return: void
- *   xasl_p(in) : xasl
- *   position_descr(in)   : position desc
- *   is_final(in)  : true, if finalize needed
- */
-static void
-qexec_clear_pos_desc (XASL_NODE * xasl_p, QFILE_TUPLE_VALUE_POSITION * position_descr, bool is_final)
-{
-  position_descr->dom = position_descr->original_domain;
-}
-
-/*
- * qexec_clear_sort_list () - clear the sort list
- *   return: void
- *   xasl_p(in) : xasl
- *   list(in)   : the sort list
- *   is_final(in)  : true, if finalize needed
- */
-static void
-qexec_clear_sort_list (XASL_NODE * xasl_p, SORT_LIST * list, bool is_final)
-{
-  SORT_LIST *p;
-
-  for (p = list; p; p = p->next)
-    {
-      /* restores the original domain */
-      qexec_clear_pos_desc (xasl_p, &p->pos_descr, is_final);
     }
 }
 
@@ -1862,6 +1818,16 @@ qexec_clear_pred (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, PRED_EXPR * pr, b
  *   xasl_p(in) :
  *   list(in)   :
  *   is_final(in)  :
+ */
+/*
+ * [리뷰] qexec_clear_access_spec_list — XASL 노드가 가진 ACCESS_SPEC 사슬을 돌며 스캔별 캐시·술어 regu·열린 자원을 해제하는 정리기로, 해제한 페이지
+ * 수를 돌려준다.
+ * develop: S_INDX_SCAN 에서 isidp->prebuilt_midxkey_domains 배열을 직접 돌며 tp_domain_free 후 배열을 해제했고,
+ * S_PARALLEL_INDEX_SCAN 은 코디네이터 쪽 키 저장소를 건드리지 않았다. 해시 리스트 스캔 분기도 hlsid 해제를 하지 않았다.
+ * 이 PR: 키 도메인 해제를 scan_close_index_key_plan() 한 번으로 대체하고(인덱스 키 계획 저장소의 소유권이 scan_manager 로 감),
+ * S_PARALLEL_INDEX_SCAN 에도 같은 호출을 추가, 해시 리스트 스캔에는 scan_free_hash_list_scan() 방어 호출을 넣었다.
+ * 바뀐 것: 인라인 해제 루프 -12줄 → 호출 2줄, 방어 해제 호출 2개 추가. 주의: 현재 develop 이 가진 p->s_id.partition_stats = NULL(캐시된 XASL
+ * 클론의 스테일 포인터 수정)이 이 브랜치에는 없다 — 분기 이후 develop 에 들어온 수정이라 머지 때 합류시켜야 한다.
  */
 static int
 qexec_clear_access_spec_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, ACCESS_SPEC_TYPE * list, bool is_final,
@@ -2038,18 +2004,8 @@ qexec_clear_access_spec_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, ACCES
 	      heap_attrinfo_end (thread_p, isidp->rest_attrs.attr_cache);
 	      isidp->caches_inited = false;
 	    }
-	  if (isidp->prebuilt_midxkey_domains)
-	    {
-	      for (int i = 0; i < isidp->indx_info->key_info.key_cnt; i++)
-		{
-		  if (isidp->prebuilt_midxkey_domains[i])
-		    {
-		      tp_domain_free (isidp->prebuilt_midxkey_domains[i]);
-		      isidp->prebuilt_midxkey_domains[i] = NULL;
-		    }
-		}
-	      db_private_free_and_init (thread_p, isidp->prebuilt_midxkey_domains);
-	    }
+	  /* a scan torn down without scan_close_scan still lets its key plan storage go */
+	  scan_close_index_key_plan (thread_p, isidp);
 	  break;
 	case S_PARALLEL_INDEX_SCAN:
 #if SERVER_MODE
@@ -2068,6 +2024,8 @@ qexec_clear_access_spec_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, ACCES
 		}
 	    }
 #endif
+	  /* the coordinator's key plan storage; pisid mirrors isid */
+	  scan_close_index_key_plan (thread_p, &p->s_id.s.isid);
 	  break;
 	case S_INDX_KEY_INFO_SCAN:
 	  isidp = &p->s_id.s.isid;
@@ -2278,8 +2236,6 @@ qexec_clear_analytic_function_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p,
 	  (void) pr_clear_value (p->value);
 	  (void) pr_clear_value (p->value2);
 	  (void) pr_clear_value (&p->part_value);
-	  p->domain = p->original_domain;
-	  p->opr_dbtype = p->original_opr_dbtype;
 	  pg_cnt += qexec_clear_regu_var (thread_p, xasl_p, &p->operand, is_final, for_parallel_aptr);
 	  p->init ();
 	}
@@ -2333,8 +2289,6 @@ qexec_clear_agg_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, AGGREGATE_TYP
 	}
 
       pg_cnt += qexec_clear_regu_variable_list (thread_p, xasl_p, p->operands, is_final, for_parallel_aptr);
-      p->domain = p->original_domain;
-      p->opr_dbtype = p->original_opr_dbtype;
     }
 
   return pg_cnt;
@@ -2521,14 +2475,6 @@ qexec_clear_xasl (THREAD_ENTRY * thread_p, xasl_node * xasl, bool is_final, bool
 	    pg_cnt += qexec_clear_xasl (thread_p, xasl_p, is_final, false);
 	  }
 
-	if (buildlist->groupby_list)
-	  {
-	    qexec_clear_sort_list (xasl, buildlist->groupby_list, is_final);
-	  }
-	if (buildlist->after_groupby_list)
-	  {
-	    qexec_clear_sort_list (xasl, buildlist->after_groupby_list, is_final);
-	  }
 
 	if (xasl->curr_spec)
 	  {
@@ -2811,15 +2757,6 @@ qexec_clear_xasl (THREAD_ENTRY * thread_p, xasl_node * xasl, bool is_final, bool
 	  pr_clear_value (xasl->ordbynum_val);
 	}
 
-      if (xasl->after_iscan_list)
-	{
-	  qexec_clear_sort_list (xasl, xasl->after_iscan_list, is_final);
-	}
-
-      if (xasl->orderby_list)
-	{
-	  qexec_clear_sort_list (xasl, xasl->orderby_list, is_final);
-	}
       pg_cnt += qexec_clear_pred (thread_p, xasl, xasl->ordbynum_pred, is_final, false);
 
       if (xasl->orderby_limit)
@@ -3036,15 +2973,6 @@ qexec_clear_xasl_for_parallel_aptr (THREAD_ENTRY * thread_p, XASL_NODE * xasl, b
 	  pr_clear_value (xasl->ordbynum_val);
 	}
 
-      if (xasl->after_iscan_list)
-	{
-	  qexec_clear_sort_list (xasl, xasl->after_iscan_list, is_final);
-	}
-
-      if (xasl->orderby_list)
-	{
-	  qexec_clear_sort_list (xasl, xasl->orderby_list, is_final);
-	}
       pg_cnt += qexec_clear_pred (thread_p, xasl, xasl->ordbynum_pred, is_final, true);
 
       if (xasl->orderby_limit)
@@ -3142,14 +3070,6 @@ qexec_clear_xasl_for_parallel_aptr (THREAD_ENTRY * thread_p, XASL_NODE * xasl, b
 	    pg_cnt += qexec_clear_xasl_for_parallel_aptr (thread_p, buildlist->eptr_list, is_final);
 	  }
 
-	if (buildlist->groupby_list)
-	  {
-	    qexec_clear_sort_list (xasl, buildlist->groupby_list, is_final);
-	  }
-	if (buildlist->after_groupby_list)
-	  {
-	    qexec_clear_sort_list (xasl, buildlist->after_groupby_list, is_final);
-	  }
 
 	if (xasl->curr_spec)
 	  {
@@ -3689,16 +3609,47 @@ qexec_get_xasl_list_id (xasl_node * xasl)
   return list_id;
 }
 
+/*
+ * qexec_deep_copy_xasl_state () - the one way a PX clone inherits a resolved
+ *   execution state.
+ *   return: the copy, owned by thread_p and allocated on its private heap; NULL on failure
+ *
+ * Every reference value (secondary references included) is cloned, resolve_domains
+ * table is copied by value (its domains are borrowed from the cache/arena), and
+ * the const input, plan and seal are carried over; the execution domain state
+ * (domain_execution) is the worker's own. The copy never resolves again
+ * and only thread_p may free it with qexec_free_xasl_state.
+ *
+ * own_load(in): the worker runs its own load of the stream (an XASL clone or its own unpack), whose nodes start with
+ *		 their compiled domains; otherwise it runs nodes the leader's execution also runs (spawned copies, a
+ *		 parallel subquery), which hold what that execution gave them so far: its execution domains
+ */
+/*
+ * [리뷰] qexec_deep_copy_xasl_state — PX(병렬) 워커가 리더의 XASL_STATE 를 자기 것으로 복제할 때 쓰는 유일한 통로로, 새 xasl_state* 또는 NULL
+ * 을 돌려준다.
+ * develop: vd.dbval_ptr 배열을 db_private_alloc 로 따로 잡고 바인드 값 dbval_cnt 개를 pr_clone_value 로 하나씩 복제했다.
+ * 이 PR: own_load 파라미터가 붙었고, 값 복제 대신 qexec_copy_resolved_domains() 가 '해결된 도메인 + 값 배열'을 통째로 복사한다. vd.dbval_ptr 는
+ * 그 복사본의 resolved_domain.vals 를 가리키게 된다. 진입부에 assert(frozen), 복사 전제에 assert(dbval_ptr ==
+ * resolved_domain.vals).
+ * 바뀐 것: 시그니처에 bool own_load 추가, 값 복제 루프·배열 할당 -22줄 → qexec_copy_resolved_domains 호출 1개. 실패 시 new_xasl_state 해제
+ * 후 NULL.
+ */
 extern xasl_state *
-qexec_deep_copy_xasl_state (THREAD_ENTRY * thread_p, xasl_state * xasl_state_p)
+qexec_deep_copy_xasl_state (THREAD_ENTRY * thread_p, xasl_state * xasl_state_p, bool own_load)
 {
   if (!thread_p || !xasl_state_p)
     {
       return NULL;
     }
+  assert (xasl_state_p->resolved_domain.frozen);
   xasl_state *new_xasl_state = (xasl_state *) db_private_alloc (thread_p, sizeof (xasl_state));
   if (new_xasl_state == NULL)
     {
+      return NULL;
+    }
+  if (qexec_copy_resolved_domains (thread_p, xasl_state_p, new_xasl_state, own_load) != NO_ERROR)
+    {
+      db_private_free (thread_p, new_xasl_state);
       return NULL;
     }
   new_xasl_state->qp_xasl_line = xasl_state_p->qp_xasl_line;
@@ -3709,28 +3660,21 @@ qexec_deep_copy_xasl_state (THREAD_ENTRY * thread_p, xasl_state * xasl_state_p)
   new_xasl_state->vd.lrand = xasl_state_p->vd.lrand;
   new_xasl_state->vd.sys_datetime = xasl_state_p->vd.sys_datetime;
   new_xasl_state->vd.sys_epochtime = xasl_state_p->vd.sys_epochtime;
-  if (new_xasl_state->vd.dbval_cnt > 0)
-    {
-      new_xasl_state->vd.dbval_ptr =
-	(DB_VALUE *) db_private_alloc (thread_p, sizeof (DB_VALUE) * xasl_state_p->vd.dbval_cnt);
-      if (new_xasl_state->vd.dbval_ptr == NULL)
-	{
-	  db_private_free (thread_p, new_xasl_state);
-	  return NULL;
-	}
-    }
-  else
-    {
-      new_xasl_state->vd.dbval_ptr = NULL;
-    }
-
-  for (int i = 0; i < xasl_state_p->vd.dbval_cnt; i++)
-    {
-      pr_clone_value (&xasl_state_p->vd.dbval_ptr[i], &new_xasl_state->vd.dbval_ptr[i]);
-    }
+  /* resolve_domains points vd at its values; the first dbval_cnt of them are the val_pos values. */
+  assert (xasl_state_p->vd.dbval_cnt == 0 || xasl_state_p->vd.dbval_ptr == xasl_state_p->resolved_domain.vals);
+  new_xasl_state->vd.dbval_ptr = new_xasl_state->resolved_domain.vals;
   return new_xasl_state;
 }
 
+/* Frees a qexec_deep_copy_xasl_state copy: its values (secondary references
+ * included), its resolved domain table and the state itself, on the heap that made them. */
+/*
+ * [리뷰] qexec_free_xasl_state — qexec_deep_copy_xasl_state 가 만든 워커 복사본을 그 워커 스레드가 되돌려주는 짝 함수.
+ * develop: vd.dbval_cnt 만큼 pr_clear_value 한 뒤 dbval_ptr 배열과 상태 구조체를 해제했다.
+ * 이 PR: assert(resolved_domain.owner == thread_p) 로 소유 스레드를 확인하고 qexec_clear_resolved_domains() 에 값 해제를 맡긴 뒤
+ * 구조체만 해제한다.
+ * 바뀐 것: 값 해제 루프 -8줄 → 호출 1줄 + 소유자 assert 1줄. 게이트(해결된 도메인 저장소)가 값의 수명을 갖게 된 데 따른 짝 변경.
+ */
 extern void
 qexec_free_xasl_state (THREAD_ENTRY * thread_p, xasl_state * xasl_state)
 {
@@ -3738,14 +3682,8 @@ qexec_free_xasl_state (THREAD_ENTRY * thread_p, xasl_state * xasl_state)
     {
       return;
     }
-  for (int i = 0; i < xasl_state->vd.dbval_cnt; i++)
-    {
-      pr_clear_value (&xasl_state->vd.dbval_ptr[i]);
-    }
-  if (xasl_state->vd.dbval_ptr)
-    {
-      db_private_free (thread_p, xasl_state->vd.dbval_ptr);
-    }
+  assert (xasl_state->resolved_domain.owner == thread_p);
+  qexec_clear_resolved_domains (thread_p, xasl_state);
   db_private_free (thread_p, xasl_state);
 }
 
@@ -4020,10 +3958,19 @@ qexec_ordby_put_next (THREAD_ENTRY * thread_p, const RECDES * recdes, void *arg)
  *         runtime. This is the function's purpose: get an integer from
  *         the XASL to represent the upper bound for the sorted results.
  */
+/*
+ * [리뷰] qexec_fill_sort_limit — ORDER BY ... LIMIT 의 상한을 XASL 의 limit regu 에서 읽어 INTEGER 로 만들어 *limit_ptr 에 넣는다
+ * — qexec_orderby_distinct_by_sorting 이 topn/sort 한계를 정할 때 부른다.
+ * develop: 가져온 DB_VALUE 포인터 dbvalp 를 tp_value_coerce (dbvalp, dbvalp, domainp) 로 제자리에서 INTEGER 로 변환했다.
+ * 이 PR: 지역 DB_VALUE limit_value 를 만들어 그쪽으로 변환하고 dbvalp 를 그 지역 값으로 바꾼다 — LIMIT 은 다른 읽는 쪽과 공유하는 바인드
+ * 값(resolve_domains 의 값 배열)이므로 제자리 변환이 남의 값을 바꾼다는 이유.
+ * 바뀐 것: 지역 값 1개 추가 + 변환 대상 교체(+4줄). 공유 값 배열이 생긴 이 PR 의 전제에 맞춘 짝 수정.
+ */
 static int
 qexec_fill_sort_limit (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state, int *limit_ptr)
 {
   DB_VALUE *dbvalp = NULL;
+  DB_VALUE limit_value;
   TP_DOMAIN *domainp = tp_domain_resolve_default (DB_TYPE_INTEGER);
   DB_TYPE orig_type;
   int error = NO_ERROR;
@@ -4053,7 +4000,9 @@ qexec_fill_sort_limit (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * x
     {
       TP_DOMAIN_STATUS dom_status;
 
-      dom_status = tp_value_coerce (dbvalp, dbvalp, domainp);
+      /* into a value of its own: the limit is a bind value other readers share (resolve_domains' value array) */
+      db_make_null (&limit_value);
+      dom_status = tp_value_coerce (dbvalp, &limit_value, domainp);
       if (dom_status != DOMAIN_COMPATIBLE)
 	{
 	  if (dom_status == DOMAIN_OVERFLOW)
@@ -4070,6 +4019,7 @@ qexec_fill_sort_limit (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * x
 	      return error;
 	    }
 	}
+      dbvalp = &limit_value;
 
       if (DB_VALUE_DOMAIN_TYPE (dbvalp) != DB_TYPE_INTEGER)
 	{
@@ -4160,6 +4110,15 @@ qexec_orderby_distinct (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QUERY_OPTIONS
  * file is sorted on all columns and then duplications are
  * eliminated on the fly, thus causing and ordered-distinct list file output.
  */
+/*
+ * [리뷰] qexec_orderby_distinct_by_sorting — 블록의 결과 리스트파일을 ORDER BY/DISTINCT 기준으로 정렬·중복제거해 xasl->list_id 를 바꿔
+ * 끼운다. qexec_orderby_distinct 가 부르고 에러코드를 돌려준다.
+ * develop: outptr_list 가 있으면 qexec_resolve_domains_on_sort_list(order_list, outptr_list->valptrp) 로 XASL 의
+ * orderby_list 를 제자리에서 고쳐 정렬키 도메인을 늦게 바인딩했다(반환값 없음).
+ * 이 PR: qexec_plan_sort_list_domains() 가 계획의 도메인으로 '실행이 소유하는 사본' order_list 를 만들어 준다(에러면 즉시 return). 정렬이 끝나면
+ * order_list != xasl->orderby_list 일 때 그 사본을 qfile_free_sort_list 로 해제한다.
+ * 바뀐 것: 제자리 해결 1줄 → 사본 생성 + 에러 반환(+4줄), 정리부에 사본 해제 블록 +5줄. XASL 을 건드리지 않는 쪽으로 성격이 바뀌었다.
+ */
 static int
 qexec_orderby_distinct_by_sorting (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QUERY_OPTIONS option,
 				   XASL_STATE * xasl_state)
@@ -4203,10 +4162,11 @@ qexec_orderby_distinct_by_sorting (THREAD_ENTRY * thread_p, XASL_NODE * xasl, QU
       outptr_list = xasl->outptr_list;
     }
 
-  /* late binding : resolve sort list */
-  if (outptr_list != NULL)
+  /* the sort keys the compiler left variable: the plan's domains, in a copy the execution owns */
+  error = qexec_plan_sort_list_domains (thread_p, &xasl_state->vd, xasl->orderby_list, &order_list);
+  if (error != NO_ERROR)
     {
-      qexec_resolve_domains_on_sort_list (order_list, outptr_list->valptrp);
+      return error;
     }
 
   if (order_list == NULL && option != Q_DISTINCT)
@@ -4367,6 +4327,11 @@ exit_on_error:
   if (orderby_alloc == true)
     {
       qfile_free_sort_list (thread_p, orderby_list);
+    }
+  if (order_list != xasl->orderby_list)
+    {
+      /* the execution's copy of the ORDER BY list (qexec_plan_sort_list_domains) */
+      qfile_free_sort_list (thread_p, order_list);
     }
 
   return error;
@@ -5035,6 +5000,14 @@ qexec_hash_gby_get_next (THREAD_ENTRY * thread_p, RECDES * recdes, void *arg)
  *   recdes(in): record descriptor
  *   arg(in): hash context
  */
+/*
+ * [리뷰] qexec_hash_gby_put_next — 해시 집계가 흘려보낸 부분결과 리스트를 정렬한 뒤 sort_listfile 이 키 순서대로 부르는 출력 콜백으로, 같은 키의 누산기들을
+ * 합쳐 최종 그룹을 만든다.
+ * develop: 누산기 병합 때 agg_list->domain 을 그대로 qdata_aggregate_accumulator_to_accumulator 에 넘겼다.
+ * 이 PR: agg_list->domain 대신 qexec_get_node_domain (&state->xasl_state->vd, agg_list->domain,
+ * agg_list->plan_item) 가 돌려주는 '이 실행이 확정한 도메인'을 넘긴다.
+ * 바뀐 것: 인자 1개를 조회 호출로 교체(+3줄). 집계 노드의 도메인을 XASL 에서 읽던 것을 실행 상태(DOMAIN_PLAN 슬롯)에서 읽는 것으로 바꾼 전형적인 전환.
+ */
 static int
 qexec_hash_gby_put_next (THREAD_ENTRY * thread_p, const RECDES * recdes, void *arg)
 {
@@ -5143,7 +5116,9 @@ qexec_hash_gby_put_next (THREAD_ENTRY * thread_p, const RECDES * recdes, void *a
 	      rc =
 		qdata_aggregate_accumulator_to_accumulator (thread_p, &context->curr_part_value->accumulators[i],
 							    &agg_list->accumulator_domain, agg_list->function,
-							    agg_list->domain,
+							    qexec_get_node_domain (&state->xasl_state->vd,
+										   agg_list->domain,
+										   agg_list->plan_item),
 							    &context->temp_part_value->accumulators[i]);
 	      if (rc != NO_ERROR)
 		{
@@ -5208,6 +5183,15 @@ qexec_gby_get_next (THREAD_ENTRY * thread_p, RECDES * recdes, void *arg)
  *   return:
  *   recdes(in) :
  *   arg(in)    :
+ */
+/*
+ * [리뷰] qexec_gby_put_next — GROUP BY 정렬의 출력 콜백 — sort_listfile 이 정렬된 입력 튜플을 키 순서로 넘겨주면 그룹 경계를 보고 누산·마무리한다.
+ * GROUPBY_STATE 의 state 를 돌려준다.
+ * develop: 롤업 차원의 누산기 병합에서 ru_agg_list->domain 을 그대로 넘겼다.
+ * 이 PR: qexec_get_node_domain (&info->xasl_state->vd, ru_agg_list->domain, ru_agg_list->plan_item) 로 얻은 실행 확정
+ * 도메인을 지역 ru_domain 에 받아 넘긴다.
+ * 바뀐 것: 지역 변수 1개 + 인자 교체(+3줄). (PEEK 페이지 고정·data_slot 도입 같은 큰 변경은 이미 develop 에 있다 — develop 대비 이 PR 의 델타는 도메인
+ * 조회 한 곳뿐이다.)
  */
 static int
 qexec_gby_put_next (THREAD_ENTRY * thread_p, const RECDES * recdes, void *arg)
@@ -5430,10 +5414,12 @@ qexec_gby_put_next (THREAD_ENTRY * thread_p, const RECDES * recdes, void *arg)
 
 			  while (ru_agg_list)
 			    {
+			      TP_DOMAIN *ru_domain = qexec_get_node_domain (&info->xasl_state->vd, ru_agg_list->domain,
+									    ru_agg_list->plan_item);
 			      if (qdata_aggregate_accumulator_to_accumulator (thread_p, &ru_agg_list->accumulator,
 									      &ru_agg_list->accumulator_domain,
-									      ru_agg_list->function,
-									      ru_agg_list->domain, &acc[j]) != NO_ERROR)
+									      ru_agg_list->function, ru_domain,
+									      &acc[j]) != NO_ERROR)
 				{
 				  goto exit_on_error;
 				}
@@ -5505,11 +5491,28 @@ exit_on_error:
  * Note: Apply the group_by clause to the given list file to group it
  * using the specified group_by parameters.
  */
+/*
+ * [리뷰] qexec_groupby — BUILDLIST 블록의 GROUP BY 전체를 모는 함수 — 입력 리스트파일을 정렬하거나 해시 집계 부분결과를 합쳐 그룹 결과 리스트파일을 만들고
+ * xasl->list_id 에 바꿔 끼운다. NO_ERROR/ER_FAILED 를 돌려준다.
+ * develop: outptr_list 가 있으면 qexec_resolve_domains_for_group_by(buildlist, xasl->outptr_list) 로 buildlist 의
+ * groupby_list·regu 리스트 도메인을 제자리에서 늦게 바인딩했다(실패 경로 자체가 없었다). 그 뒤 buildlist->groupby_list 로 바로
+ * qexec_initialize_groupby_state 를 불렀고, qdata_get_valptr_type_list 는 vd 인자가 없었다.
+ * 이 PR: qexec_plan_group_by_domains() 가 계획 도메인으로 실행 소유의 groupby_list 사본을 만들고(실패하면 GOTO_EXIT_ON_ERROR),
+ * qexec_finish_group_by_domains() 가 NULL 만 본 누산기와 해시 집계 리스트 도메인을 마감한다. 상태 초기화는 그 사본으로 하고, key_info 가 도메인을 복사해
+ * 간 직후 사본을 해제한다. qdata_get_valptr_type_list 에 &xasl_state->vd 를 넘긴다.
+ * 바뀐 것: 제자리 해결 1줄 → 사본 생성 + 마감 + 조건부 해제(+16줄), initialize 결과를 지역 initialized 로 받도록 호출 재배치. 새
+ * GOTO_EXIT_ON_ERROR 가 gbstate 초기화 전에 놓였다 — exit_on_error 는 wrapup 으로 떨어지고 wrapup 은
+ * qexec_clear_groupby_state(&gbstate) 를 부르는데, 이 경로에서는 gbstate 가 아직 초기화되지 않은 스택
+ * 변수다(g_dim_levels·current_key.data·output_file·input_scan 이 전부 쓰레기값으로 읽히고 해제된다).
+ * [지적 C1-01]
+ */
 static int
 qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state, QFILE_TUPLE_RECORD * tplrec)
 {
   QFILE_LIST_ID *list_id = xasl->list_id;
   BUILDLIST_PROC_NODE *buildlist = &xasl->proc.buildlist;
+  SORT_LIST *groupby_list = buildlist->groupby_list;	/* the sort list the GROUP BY runs with */
+  GROUPBY_STATE *initialized;
   GROUPBY_STATE gbstate;
   QFILE_LIST_SCAN_ID input_scan_id;
   int ls_flag = 0;
@@ -5539,19 +5542,29 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
       db_make_bigint (buildlist->g_grbynum_val, 0);
     }
 
-  /* late binding : resolve group_by (buildlist) */
+  /* the GROUP BY reads the plan's domains; its aggregates were set up before the scan */
   if (xasl->outptr_list != NULL)
     {
-      qexec_resolve_domains_for_group_by (buildlist, xasl->outptr_list);
+      if (qexec_plan_group_by_domains (thread_p, &xasl_state->vd, buildlist, &groupby_list) != NO_ERROR)
+	{
+	  GOTO_EXIT_ON_ERROR;
+	}
+      qexec_finish_group_by_domains (&xasl_state->vd, buildlist);
     }
 
-  if (qexec_initialize_groupby_state (&gbstate, buildlist->groupby_list, buildlist->g_having_pred,
-				      buildlist->g_grbynum_pred, buildlist->g_grbynum_val, buildlist->g_grbynum_flag,
-				      buildlist->eptr_list, buildlist->g_agg_list, buildlist->g_regu_list,
-				      buildlist->g_val_list, buildlist->g_outptr_list, buildlist->g_hk_sort_regu_list,
-				      buildlist->g_with_rollup != 0, buildlist->g_hash_eligible,
-				      buildlist->agg_hash_context, xasl, xasl_state, &list_id->type_list,
-				      tplrec) == NULL)
+  initialized =
+    qexec_initialize_groupby_state (&gbstate, groupby_list, buildlist->g_having_pred, buildlist->g_grbynum_pred,
+				    buildlist->g_grbynum_val, buildlist->g_grbynum_flag, buildlist->eptr_list,
+				    buildlist->g_agg_list, buildlist->g_regu_list, buildlist->g_val_list,
+				    buildlist->g_outptr_list, buildlist->g_hk_sort_regu_list,
+				    buildlist->g_with_rollup != 0, buildlist->g_hash_eligible,
+				    buildlist->agg_hash_context, xasl, xasl_state, &list_id->type_list, tplrec);
+  /* the state's key information holds the keys' domains from here on */
+  if (groupby_list != buildlist->groupby_list)
+    {
+      qfile_free_sort_list (thread_p, groupby_list);
+    }
+  if (initialized == NULL)
     {
       GOTO_EXIT_ON_ERROR;
     }
@@ -5563,7 +5576,7 @@ qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_stat
     QFILE_TUPLE_VALUE_TYPE_LIST output_type_list;
     QFILE_LIST_ID *output_list_id;
 
-    if (qdata_get_valptr_type_list (thread_p, buildlist->g_outptr_list, &output_type_list) != NO_ERROR)
+    if (qdata_get_valptr_type_list (thread_p, buildlist->g_outptr_list, &output_type_list, &xasl_state->vd) != NO_ERROR)
       {
 	GOTO_EXIT_ON_ERROR;
       }
@@ -5944,6 +5957,8 @@ qexec_collection_has_null (DB_VALUE * colval)
  *   rght(in)           : right tuple slot; rght_ind: its merge columns
  *   rght_dom(in)       : Domains of the right merge columns
  *   tval_cnt(in)       : tuple values count
+ *   compares(in)       : [tval_cnt] each column pair's comparison, as the load or resolve_domains resolved it
+ *   vd(in)             : value descriptor of the execution
  *
  * Note: This routine checks if two tuple values are equal. Coercion
  * is done if necessary. This must give a totally
@@ -5958,9 +5973,19 @@ qexec_collection_has_null (DB_VALUE * colval)
  * as the lessor side, that tuple will be discarded,
  * then the next comparison will discard the other side.
  */
+/*
+ * [리뷰] qexec_cmp_tpl_vals_merge — 머지 조인에서 바깥/안쪽 튜플의 머지 컬럼들을 왼쪽→오른쪽으로 비교해 DB_LT/EQ/GT/UNK 를 돌려준다 —
+ * qexec_merge_list(_outer) 의 전진 판단이 전적으로 이 값에 달려 있다.
+ * develop: 비null 인 두 값을 tp_value_compare (left, right, 1, 0) 으로 비교했다 — 비교할 때마다 도메인·콜레이션을 그 자리에서 맞췄다.
+ * 이 PR: thread_p·compares(DOMAIN_COMPARE_PLAN 배열)·vd 를 받아, 컬럼 쌍마다 적재/해결 단계가 미리 정해 둔 비교 계획으로
+ * eval_compare_values_resolved() 를 부른다. compares 가 NULL 이면 계획 없이 같은 의미로 동작한다.
+ * 바뀐 것: 시그니처에 thread_p·compares·vd 3개 추가, 비교 호출 1곳 교체. 말미의 'LT/GT 아니면 UNK' 정규화 블록 -10줄 삭제(앞에서 EQ 는 continue
+ * 하므로 결과가 같은 제거).
+ */
 static DB_VALUE_COMPARE_RESULT
-qexec_cmp_tpl_vals_merge (QFILE_TUPLE_RECORD * left, int *left_ind, TP_DOMAIN ** left_dom, QFILE_TUPLE_RECORD * rght,
-			  int *rght_ind, TP_DOMAIN ** rght_dom, int tval_cnt)
+qexec_cmp_tpl_vals_merge (THREAD_ENTRY * thread_p, QFILE_TUPLE_RECORD * left, int *left_ind, TP_DOMAIN ** left_dom,
+			  QFILE_TUPLE_RECORD * rght, int *rght_ind, TP_DOMAIN ** rght_dom, int tval_cnt,
+			  const DOMAIN_COMPARE_PLAN * const *compares, const VAL_DESCR * vd)
 {
   DB_VALUE left_dbval, right_dbval;
   int i, cmp;
@@ -6003,8 +6028,11 @@ qexec_cmp_tpl_vals_merge (QFILE_TUPLE_RECORD * left, int *left_ind, TP_DOMAIN **
 	  goto clear;
 	}
 
-      /* both left_dbval, right_dbval is non-null */
-      cmp = tp_value_compare (&left_dbval, &right_dbval, 1, 0);
+      /* both left_dbval, right_dbval is non-null: the comparison the load or resolve_domains resolved for the column
+       * pair, as tp_value_compare asks it */
+      cmp =
+	eval_compare_values_resolved (thread_p, compares != NULL ? compares[i] : NULL, vd, &left_dbval, &right_dbval, 0,
+				      NULL);
 
       if (left_is_set && cmp == DB_UNK && qexec_collection_has_null (&left_dbval))
 	{
@@ -6151,9 +6179,19 @@ qexec_cmp_tpl_vals_merge (QFILE_TUPLE_RECORD * left, int *left_ind, TP_DOMAIN **
  * Note: The routine assumes that the join column data types for both list
  * files are same.
  */
+/*
+ * [리뷰] qexec_merge_list — 정렬된 두 리스트파일을 받아 INNER 머지 조인 결과 리스트파일을 만들어 돌려준다(실패 시 NULL). qexec_merge_listfiles 가
+ * JOIN_INNER 일 때 부른다.
+ * develop: (thread_p, outer_list_idp, inner_list_idp, merge_infop, ls_flag) 5인자. 비교는 qexec_cmp_tpl_vals_merge
+ * 에 도메인만 넘겨 불렀다.
+ * 이 PR: compares(const DOMAIN_COMPARE_PLAN * const *) 와 vd 두 인자를 더 받아 5곳의 비교 호출 모두에 그대로 전달한다. 비교 계획은 호출자가
+ * xasl->proc.mergelist.merge_compares 로 넘긴다.
+ * 바뀐 것: 시그니처 +2 인자, 비교 호출 5곳의 전달 인자 추가. 함수 자체의 제어흐름은 그대로.
+ */
 static QFILE_LIST_ID *
 qexec_merge_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * outer_list_idp, QFILE_LIST_ID * inner_list_idp,
-		  QFILE_LIST_MERGE_INFO * merge_infop, int ls_flag)
+		  QFILE_LIST_MERGE_INFO * merge_infop, int ls_flag, const DOMAIN_COMPARE_PLAN * const *compares,
+		  const VAL_DESCR * vd)
 {
   /* outer -> left scan, inner -> right scan */
 
@@ -6326,8 +6364,8 @@ qexec_merge_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * outer_list_idp, QFILE
       if (!already_compared)
 	{
 	  val_cmp =
-	    qexec_cmp_tpl_vals_merge (&outer_tplrec, outer_indp, outer_domp, &inner_tplrec, inner_indp, inner_domp,
-				      nvals);
+	    qexec_cmp_tpl_vals_merge (thread_p, &outer_tplrec, outer_indp, outer_domp, &inner_tplrec, inner_indp,
+				      inner_domp, nvals, compares, vd);
 	  if (val_cmp == DB_UNK)
 	    {			/* is error */
 	      goto exit_on_error;
@@ -6387,8 +6425,8 @@ qexec_merge_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * outer_list_idp, QFILE
 
 		  /* and compare */
 		  val_cmp =
-		    qexec_cmp_tpl_vals_merge (&outer_tplrec, outer_indp, outer_domp, &inner_tplrec, inner_indp,
-					      inner_domp, nvals);
+		    qexec_cmp_tpl_vals_merge (thread_p, &outer_tplrec, outer_indp, outer_domp, &inner_tplrec,
+					      inner_indp, inner_domp, nvals, compares, vd);
 		  if (val_cmp != DB_EQ)
 		    {
 		      if (val_cmp == DB_UNK)
@@ -6433,8 +6471,8 @@ qexec_merge_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * outer_list_idp, QFILE
 		{
 		  /* and compare */
 		  val_cmp =
-		    qexec_cmp_tpl_vals_merge (&outer_tplrec, outer_indp, outer_domp, &inner_tplrec, inner_indp,
-					      inner_domp, nvals);
+		    qexec_cmp_tpl_vals_merge (thread_p, &outer_tplrec, outer_indp, outer_domp, &inner_tplrec,
+					      inner_indp, inner_domp, nvals, compares, vd);
 		  if (val_cmp == DB_UNK)
 		    {		/* is error */
 		      goto exit_on_error;
@@ -6447,8 +6485,8 @@ qexec_merge_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * outer_list_idp, QFILE
 
 		      /* and compare */
 		      val_cmp =
-			qexec_cmp_tpl_vals_merge (&outer_tplrec, outer_indp, outer_domp, &inner_tplrec, inner_indp,
-						  inner_domp, nvals);
+			qexec_cmp_tpl_vals_merge (thread_p, &outer_tplrec, outer_indp, outer_domp, &inner_tplrec,
+						  inner_indp, inner_domp, nvals, compares, vd);
 		      if (val_cmp == DB_UNK)
 			{	/* is error */
 			  goto exit_on_error;
@@ -6514,8 +6552,8 @@ qexec_merge_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * outer_list_idp, QFILE
 
 	  /* and compare */
 	  val_cmp =
-	    qexec_cmp_tpl_vals_merge (&outer_tplrec, outer_indp, outer_domp, &inner_tplrec, inner_indp, inner_domp,
-				      nvals);
+	    qexec_cmp_tpl_vals_merge (thread_p, &outer_tplrec, outer_indp, outer_domp, &inner_tplrec, inner_indp,
+				      inner_domp, nvals, compares, vd);
 	  if (val_cmp == DB_UNK)
 	    {			/* is error */
 	      goto exit_on_error;
@@ -6614,11 +6652,18 @@ exit_on_error:
  *   xasl_state(in)     :
  *   ls_flag(in)        :
  */
+/*
+ * [리뷰] qexec_merge_list_outer — 두 스캔을 직접 돌리며 LEFT/RIGHT/FULL OUTER 머지 조인 결과 리스트파일을 만들어 돌려준다(실패 시 NULL).
+ * develop: (… xasl_state, ls_flag) 로 끝나는 7인자. 비교는 qexec_cmp_tpl_vals_merge 에 도메인만 넘겼다.
+ * 이 PR: compares 인자가 붙고, 함수 선두에서 const VAL_DESCR *vd = &xasl_state->vd 를 꺼내 5곳의 비교 호출에 compares·vd 를 함께 넘긴다.
+ * 바뀐 것: 시그니처 +1 인자, 지역 vd 1줄, 비교 호출 5곳의 전달 인자 추가. qexec_merge_list 와 같은 성격의 짝 변경.
+ */
 static QFILE_LIST_ID *
 qexec_merge_list_outer (THREAD_ENTRY * thread_p, SCAN_ID * outer_sid, SCAN_ID * inner_sid,
 			QFILE_LIST_MERGE_INFO * merge_infop, PRED_EXPR * other_outer_join_pred, XASL_STATE * xasl_state,
-			int ls_flag)
+			int ls_flag, const DOMAIN_COMPARE_PLAN * const *compares)
 {
+  const VAL_DESCR *vd = &xasl_state->vd;
   /* outer -> left scan, inner -> right scan */
 
   /* pre-defined vars: */
@@ -6828,8 +6873,8 @@ qexec_merge_list_outer (THREAD_ENTRY * thread_p, SCAN_ID * outer_sid, SCAN_ID * 
       if (!already_compared)
 	{
 	  val_cmp =
-	    qexec_cmp_tpl_vals_merge (&outer_tplrec, outer_indp, outer_domp, &inner_tplrec, inner_indp, inner_domp,
-				      nvals);
+	    qexec_cmp_tpl_vals_merge (thread_p, &outer_tplrec, outer_indp, outer_domp, &inner_tplrec, inner_indp,
+				      inner_domp, nvals, compares, vd);
 	  if (val_cmp == DB_UNK)
 	    {			/* is error */
 	      goto exit_on_error;
@@ -6959,8 +7004,8 @@ qexec_merge_list_outer (THREAD_ENTRY * thread_p, SCAN_ID * outer_sid, SCAN_ID * 
 
 		  /* and compare */
 		  val_cmp =
-		    qexec_cmp_tpl_vals_merge (&outer_tplrec, outer_indp, outer_domp, &inner_tplrec, inner_indp,
-					      inner_domp, nvals);
+		    qexec_cmp_tpl_vals_merge (thread_p, &outer_tplrec, outer_indp, outer_domp, &inner_tplrec,
+					      inner_indp, inner_domp, nvals, compares, vd);
 		  if (val_cmp != DB_EQ)
 		    {
 		      if (val_cmp == DB_UNK)
@@ -7026,8 +7071,8 @@ qexec_merge_list_outer (THREAD_ENTRY * thread_p, SCAN_ID * outer_sid, SCAN_ID * 
 		{
 		  /* and compare */
 		  val_cmp =
-		    qexec_cmp_tpl_vals_merge (&outer_tplrec, outer_indp, outer_domp, &inner_tplrec, inner_indp,
-					      inner_domp, nvals);
+		    qexec_cmp_tpl_vals_merge (thread_p, &outer_tplrec, outer_indp, outer_domp, &inner_tplrec,
+					      inner_indp, inner_domp, nvals, compares, vd);
 		  if (val_cmp == DB_UNK)
 		    {		/* is error */
 		      goto exit_on_error;
@@ -7040,8 +7085,8 @@ qexec_merge_list_outer (THREAD_ENTRY * thread_p, SCAN_ID * outer_sid, SCAN_ID * 
 
 		      /* and compare */
 		      val_cmp =
-			qexec_cmp_tpl_vals_merge (&outer_tplrec, outer_indp, outer_domp, &inner_tplrec, inner_indp,
-						  inner_domp, nvals);
+			qexec_cmp_tpl_vals_merge (thread_p, &outer_tplrec, outer_indp, outer_domp, &inner_tplrec,
+						  inner_indp, inner_domp, nvals, compares, vd);
 		      if (val_cmp == DB_UNK)
 			{	/* is error */
 			  goto exit_on_error;
@@ -7134,8 +7179,8 @@ qexec_merge_list_outer (THREAD_ENTRY * thread_p, SCAN_ID * outer_sid, SCAN_ID * 
 
 	  /* and compare */
 	  val_cmp =
-	    qexec_cmp_tpl_vals_merge (&outer_tplrec, outer_indp, outer_domp, &inner_tplrec, inner_indp, inner_domp,
-				      nvals);
+	    qexec_cmp_tpl_vals_merge (thread_p, &outer_tplrec, outer_indp, outer_domp, &inner_tplrec, inner_indp,
+				      inner_domp, nvals, compares, vd);
 	  if (val_cmp == DB_UNK)
 	    {			/* is error */
 	      goto exit_on_error;
@@ -7290,6 +7335,14 @@ exit_on_error:
  * Note: For a direct list file merge, currently the outer and inner columns
  * should have the same data type.
  */
+/*
+ * [리뷰] qexec_merge_listfiles — MERGELIST_PROC 블록의 진입점 — 조인 타입을 보고 inner/outer 머지 루틴을 골라 결과 리스트파일을
+ * xasl->list_id 로 붙인다.
+ * develop: qexec_merge_list(…, ls_flag) / qexec_merge_list_outer(…, ls_flag) 를 비교 계획 없이 불렀다.
+ * 이 PR: 두 호출 모두에 xasl->proc.mergelist.merge_compares 를 넘기고, inner 쪽에는 &xasl_state->vd 도 넘긴다 — 머지 컬럼의 비교 방식을 실행
+ * 전에 확정해 둔 계획에서 가져오는 자리다.
+ * 바뀐 것: 호출 2곳의 인자 추가(+3줄). 이 함수가 '게이트가 정한 비교 계획'을 머지 루틴에 전달하는 통로가 된다.
+ */
 static int
 qexec_merge_listfiles (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state)
 {
@@ -7338,7 +7391,8 @@ qexec_merge_listfiles (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * x
   if (merge_infop->join_type == JOIN_INNER)
     {
       /* call list file merge routine */
-      list_id = qexec_merge_list (thread_p, outer_xasl->list_id, inner_xasl->list_id, merge_infop, ls_flag);
+      list_id = qexec_merge_list (thread_p, outer_xasl->list_id, inner_xasl->list_id, merge_infop, ls_flag,
+				  xasl->proc.mergelist.merge_compares, &xasl_state->vd);
     }
   else
     {
@@ -7363,7 +7417,7 @@ qexec_merge_listfiles (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * x
       /* call outer join merge routine */
       list_id =
 	qexec_merge_list_outer (thread_p, &outer_spec->s_id, &inner_spec->s_id, merge_infop, xasl->during_join_pred,
-				xasl_state, ls_flag);
+				xasl_state, ls_flag, xasl->proc.mergelist.merge_compares);
 
       qexec_close_scan (thread_p, outer_spec);
       outer_spec = NULL;
@@ -12920,12 +12974,48 @@ exit_on_error:
 }
 
 /*
+ * qexec_default_format_domain () - the result domain TO_CHAR takes from a default expression's format
+ *
+ * The format is the literal the schema keeps, made by db_make_string: a VARCHAR in the system codeset and collation.
+ * Its type gives the domain whatever its content, as the load types any literal; no row value resolves it.
+ */
+/*
+ * [리뷰] qexec_default_format_domain — 컬럼 DEFAULT 식의 TO_CHAR 포맷 상수가 가져야 할 결과 도메인(시스템 콜레이션의 최대 길이 VARCHAR)을 돌려주는
+ * 헬퍼로, qexec_generate_row_default_expr 과 qexec_execute_insert 이 쓴다.
+ * develop: develop 에 없음 — 이 PR 이 신설. 두 호출처 모두 tp_domain_resolve_value (&format_val, NULL) 로 값에서 도메인을 역산했다.
+ * 이 PR: tp_domain_resolve (DB_TYPE_VARCHAR, NULL, DB_MAX_VARCHAR_PRECISION, 0, NULL, LANG_SYS_COLLATION) 로
+ * 도메인을 못 박고, 디버그 빌드에서는 값에서 역산한 도메인과 타입·정밀도·코드셋·콜레이션이 모두 같은지 assert 한다.
+ * 바뀐 것: 신설(+14줄). '값을 보고 도메인을 정한다'를 '도메인은 미리 정해져 있고 값이 그에 맞는지만 확인한다'로 뒤집은, 이 PR 의 방향을 그대로 보여주는 함수.
+ */
+static TP_DOMAIN *
+qexec_default_format_domain (const DB_VALUE * format_val)
+{
+  TP_DOMAIN *domain = tp_domain_resolve (DB_TYPE_VARCHAR, NULL, DB_MAX_VARCHAR_PRECISION, 0, NULL, LANG_SYS_COLLATION);
+#if !defined (NDEBUG)
+  const TP_DOMAIN *from_value = tp_domain_resolve_value (format_val, NULL);
+  assert (domain != NULL && from_value != NULL && TP_DOMAIN_TYPE (from_value) == TP_DOMAIN_TYPE (domain)
+	  && from_value->precision == domain->precision && from_value->codeset == domain->codeset
+	  && from_value->collation_id == domain->collation_id);
+#else
+  (void) format_val;
+#endif
+  return domain;
+}
+
+/*
  * qexec_generate_row_default_expr () - Generate a row-level default expression value
  *   return: NO_ERROR or ER_code
  *   attr(in): attribute metadata
  *   xasl_state(in): XASL state containing value descriptor
  *   uuid_state(in): UUID generation state
  *   out_val(out): generated value
+ */
+/*
+ * [리뷰] qexec_generate_row_default_expr — INSERT 때 컬럼의 DEFAULT 식(NOW·UUID·TO_CHAR 등)을 평가해 그 행에 넣을 DB_VALUE 를
+ * 만든다.
+ * develop: TO_CHAR 의 포맷 인자가 주어졌을 때 result_domain 을 tp_domain_resolve_value (&format_val, NULL) 로 값에서 역산했다.
+ * 이 PR: 같은 자리에서 qexec_default_format_domain (&format_val) 을 불러 미리 정해진 VARCHAR 도메인을 쓴다.
+ * 바뀐 것: 1줄 교체. 나머지 로직 변화 없음.
  */
 static int
 qexec_generate_row_default_expr (OR_ATTRIBUTE * attr, XASL_STATE * xasl_state, UUID_STATE * uuid_state,
@@ -13013,7 +13103,7 @@ qexec_generate_row_default_expr (OR_ATTRIBUTE * attr, XASL_STATE * xasl_state, U
 	    }
 	  else
 	    {
-	      result_domain = tp_domain_resolve_value (&format_val, NULL);
+	      result_domain = qexec_default_format_domain (&format_val);
 	    }
 	}
       else
@@ -13162,6 +13252,15 @@ qexec_execute_remote_delete_subquery (THREAD_ENTRY * thread_p, XASL_NODE * xasl,
  *   return: NO_ERROR or ER_code
  *   xasl(in)   : XASL Tree block
  *   xasl_state(in)     :
+ */
+/*
+ * [리뷰] qexec_execute_insert — INSERT_PROC XASL 을 실제로 수행한다 — 클래스 락을 잡고 행을 만들어 heap 에 넣고, RETURNING/생성키 요구가 있으면
+ * xasl->list_id 에 결과 튜플을 쌓는다.
+ * develop: TO_CHAR 기본값 포맷의 결과 도메인을 tp_domain_resolve_value (&format_val, NULL) 로 값에서 역산했다. (dblink 원격 DML 분기와
+ * qfile_add_values_tuple_to_list 전환은 이미 develop 에 들어와 있다.)
+ * 이 PR: 그 한 곳을 qexec_default_format_domain (&format_val) 호출로 바꿨다 — 도메인이 실행 전에 정해져 있고 값은 그에 맞을 뿐이라는 계약을 INSERT
+ * 경로에도 적용한 것.
+ * 바뀐 것: develop 대비 1줄 교체. 그 외 이 함수의 로직은 그대로.
  */
 static int
 qexec_execute_insert (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state, bool skip_aptr)
@@ -13545,7 +13644,7 @@ qexec_execute_insert (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xa
 		}
 	      else
 		{
-		  result_domain = tp_domain_resolve_value (&format_val, NULL);
+		  result_domain = qexec_default_format_domain (&format_val);
 		}
 	    }
 	  else
@@ -15233,6 +15332,14 @@ exit_on_error:
  * be of type BUILDLIST_PROC, BUILDVALUE, UNION_PROC,
  * DIFFERENCE_PROC and INTERSECTION_PROC.
  */
+/*
+ * [리뷰] qexec_start_mainblock_iterations — 스캔이 돌기 전에 블록 종류별 준비를 한다 — outptr_list 에서 출력 타입 리스트를 만들어
+ * xasl->list_id 를 열고, BUILDVALUE 면 집계 리스트를 초기화한다. qexec_execute_mainblock_internal 이 부른다.
+ * develop: qdata_get_valptr_type_list (thread_p, xasl->outptr_list, &type_list) 3인자,
+ * qdata_initialize_aggregate_list (thread_p, agg_list, query_id) 3인자로 불렀다 — 출력 도메인을 regu 의 domain 필드에서 직접 읽었다.
+ * 이 PR: 네 호출 모두 &xasl_state->vd 를 더 넘긴다. 결과 리스트파일의 타입 리스트와 누산기 초기 도메인이 '이 실행이 확정한 도메인'에서 나오게 됐다.
+ * 바뀐 것: 호출 4곳에 vd 인자 추가(+4줄). 블록의 출력 레이아웃을 게이트 결과에서 받는 자리로 바뀌었다.
+ */
 int
 qexec_start_mainblock_iterations (THREAD_ENTRY * thread_p, xasl_node * xasl, xasl_state * xasl_state)
 {
@@ -15245,7 +15352,7 @@ qexec_start_mainblock_iterations (THREAD_ENTRY * thread_p, xasl_node * xasl, xas
       {
 	if (xasl->list_id->type_list.type_cnt == 0)
 	  {
-	    if (qdata_get_valptr_type_list (thread_p, xasl->outptr_list, &type_list) != NO_ERROR)
+	    if (qdata_get_valptr_type_list (thread_p, xasl->outptr_list, &type_list, &xasl_state->vd) != NO_ERROR)
 	      {
 		if (type_list.domp)
 		  {
@@ -15298,7 +15405,7 @@ qexec_start_mainblock_iterations (THREAD_ENTRY * thread_p, xasl_node * xasl, xas
 
 	if (xasl->list_id->type_list.type_cnt == 0)
 	  {
-	    if (qdata_get_valptr_type_list (thread_p, xasl->outptr_list, &type_list) != NO_ERROR)
+	    if (qdata_get_valptr_type_list (thread_p, xasl->outptr_list, &type_list, &xasl_state->vd) != NO_ERROR)
 	      {
 		if (type_list.domp)
 		  {
@@ -15349,7 +15456,7 @@ qexec_start_mainblock_iterations (THREAD_ENTRY * thread_p, xasl_node * xasl, xas
       {
 	if (xasl->list_id->type_list.type_cnt == 0)
 	  {
-	    if (qdata_get_valptr_type_list (thread_p, xasl->outptr_list, &type_list) != NO_ERROR)
+	    if (qdata_get_valptr_type_list (thread_p, xasl->outptr_list, &type_list, &xasl_state->vd) != NO_ERROR)
 	      {
 		if (type_list.domp)
 		  {
@@ -15390,7 +15497,8 @@ qexec_start_mainblock_iterations (THREAD_ENTRY * thread_p, xasl_node * xasl, xas
 	  }
 
 	/* initialize aggregation list */
-	if (qdata_initialize_aggregate_list (thread_p, buildvalue->agg_list, xasl_state->query_id) != NO_ERROR)
+	if (qdata_initialize_aggregate_list (thread_p, buildvalue->agg_list, xasl_state->query_id, &xasl_state->vd)
+	    != NO_ERROR)
 	  {
 	    GOTO_EXIT_ON_ERROR;
 	  }
@@ -15467,6 +15575,15 @@ exit_on_error:
  * Note: This routines performs the finish-up operations for BUILDVALUE
  * block iteration.
  */
+/*
+ * [리뷰] qexec_end_buildvalueblock_iterations — BUILDVALUE 블록의 스캔이 끝난 뒤 집계를 마감하고 HAVING 을 평가해 한 행짜리 결과 리스트파일을
+ * 만든다.
+ * develop: qdata_finalize_aggregate_list (thread_p, agg_list, false) 3인자로 마감했고, 마감 뒤 출력 컬럼 도메인을 손보는 단계가 없었다.
+ * qdata_get_valptr_type_list 도 vd 없이 불렀다.
+ * 이 PR: 마감에 &xasl_state->vd 를 넘기고, 마감 직후 qexec_type_accumulator_outputs (&xasl_state->vd, xasl) 를 불러 보간
+ * 집계(qdata_aggregate_interpolation)가 마감 중에 쓴 도메인을 출력 컬럼에 반영한다. qdata_get_valptr_type_list 에도 vd 를 넘긴다.
+ * 바뀐 것: 호출 2곳에 vd 인자 추가, 출력 컬럼 타입 재확정 블록 +6줄. '첫 행 전에 전부 확정' 원칙에서 유일하게 빠지는 예외(보간 집계)를 마감 시점 한 번으로 모은 자리다.
+ */
 static int
 qexec_end_buildvalueblock_iterations (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
 				      QFILE_TUPLE_RECORD * tplrec)
@@ -15490,9 +15607,17 @@ qexec_end_buildvalueblock_iterations (THREAD_ENTRY * thread_p, XASL_NODE * xasl,
       qdata_link_shared_accumulators (buildvalue->agg_list);
     }
 
-  if (buildvalue->agg_list && qdata_finalize_aggregate_list (thread_p, buildvalue->agg_list, false) != NO_ERROR)
+  if (buildvalue->agg_list
+      && qdata_finalize_aggregate_list (thread_p, buildvalue->agg_list, false, &xasl_state->vd) != NO_ERROR)
     {
       GOTO_EXIT_ON_ERROR;
+    }
+
+  /* the output columns over an accumulator took their function's domain before the first row; here they
+   * take the one an interpolation function's finalization writes (qdata_aggregate_interpolation) */
+  if (buildvalue->agg_list != NULL)
+    {
+      qexec_type_accumulator_outputs (&xasl_state->vd, xasl);
     }
 
   /* evaluate having predicate */
@@ -15517,7 +15642,7 @@ qexec_end_buildvalueblock_iterations (THREAD_ENTRY * thread_p, XASL_NODE * xasl,
   else
     {
       /* a list of one tuple with a single value needs to be produced */
-      if (qdata_get_valptr_type_list (thread_p, xasl->outptr_list, &type_list) != NO_ERROR)
+      if (qdata_get_valptr_type_list (thread_p, xasl->outptr_list, &type_list, &xasl_state->vd) != NO_ERROR)
 	{
 	  GOTO_EXIT_ON_ERROR;
 	}
@@ -15947,7 +16072,15 @@ qexec_execute_mainblock (THREAD_ENTRY * thread_p, xasl_node * xasl, xasl_state *
  *   empty_result(out): true if no result will be generated
  *
  */
-static int
+/*
+ * [리뷰] qexec_check_limit_clause — 최상위 XASL 의 LIMIT 행 수가 유효한지(0 이하면 빈 결과) 검사해 *empty_result 를 채운다. 실행을 시작할지 말지를
+ * 가르는 게이트 앞 검사다.
+ * develop: 파일 내부 static 함수였고, LIMIT 값과 0 의 비교를 tp_value_compare (limit_valp, &zero_val, 1, 0) 으로 그 자리에서 했다.
+ * 이 PR: extern(int)으로 공개돼 domain_resolve.c:2508 의 해결 경로도 부를 수 있고, 비교는 적재/해결이 미리 정한 xasl->limit_compare 계획으로
+ * eval_compare_values_resolved() 를 통해 한다.
+ * 바뀐 것: static 제거 + query_executor.h:116 선언 추가, 비교 호출 1곳 교체(+3줄). 호출처가 2곳(실행 전 게이트, 도메인 해결 경로)으로 늘었다.
+ */
+int
 qexec_check_limit_clause (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state, bool * empty_result)
 {
   DB_VALUE *limit_valp;
@@ -15993,7 +16126,9 @@ qexec_check_limit_clause (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE 
 	  return ER_FAILED;
 	}
 
-      cmp_with_zero = tp_value_compare (limit_valp, &zero_val, 1, 0);
+      /* the comparison the load or resolve_domains resolved, as tp_value_compare asks it */
+      cmp_with_zero =
+	eval_compare_values_resolved (thread_p, xasl->limit_compare, &xasl_state->vd, limit_valp, &zero_val, 0, NULL);
       if (cmp_with_zero == DB_GT)
 	{
 	  /* validated */
@@ -16036,6 +16171,23 @@ qexec_execute_dblink_query (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STAT
  *   p_class_instance_lock_info(in/out): class instance lock info
  *
  */
+/*
+ * [리뷰] qexec_execute_mainblock_internal — XASL 블록 하나의 실행 본체 — 하위 블록·스펙을 열고 스캔 함수 벡터를 꾸려 루프를 돌리고 결과 리스트파일을
+ * 완성한다. qexec_execute_mainblock 이 부르고 NO_ERROR/에러를 돌려준다.
+ * develop: 진입부에 도메인 스코프 개념이 없었다. BUILDLIST/BUILDVALUE 준비에서 agg_domains_resolved=0 으로 리셋한 뒤
+ * qexec_mark_aggregate_operand_expressions(xasl) 만 부르고, 실제 도메인 해결과 누산기 공유는 첫 행 뒤 qexec_end_one_iteration 으로
+ * 미뤘다. 메모이즈는 new_memoize_storage (thread_p, xptr, XASL_IS_NL_SEMI_OR_ANTI(xptr)) 로 semi/anti 를 match-only 로
+ * 캐싱했다.
+ * 이 PR: 진입부에서 qexec_enter_temporary_scope (&xasl_state->vd, xasl->val_list) 로 상관 서브쿼리의 외부 값 변환 세대를 올린다(바깥 행마다
+ * 새로 변환). 두 집계 준비 분기는 스캔 전에 qexec_setup_aggregate_domains() 로 도메인을 확정하고(실패 시 GOTO_EXIT_ON_ERROR), BUILDLIST 는
+ * qexec_setup_hash_aggregate_lists(), BUILDVALUE 는 qexec_type_accumulator_outputs() 를 부른 뒤 해결됐으면
+ * qdata_link_shared_accumulators() 로 공유를 건다. 메모이즈는 scan_ptr 사슬에 semi/anti 가 하나라도 있으면 건너뛰고 new_memoize_storage
+ * 는 2인자다.
+ * 바뀐 것: 스코프 진입 +4줄, 집계 준비 두 분기 각각 mark 호출 1개 → 확정 블록 +16줄, 메모이즈 조건에 사슬 순회(sa_in_chain) +14줄. 이 PR 의 '실행 전 게이트가
+ * 한 번에 결정'이 가장 또렷하게 드러나는 자리. 다만 메모이즈 쪽은 현재 develop 이 match-only 메모이즈(3인자)로 같은 문제를 다르게 풀어 놓아서 머지 때 둘 중 하나를 골라야
+ * 한다.
+ * [지적 X1-02]
+ */
 static int
 qexec_execute_mainblock_internal (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
 				  UPDDEL_CLASS_INSTANCE_LOCK_INFO * p_class_instance_lock_info)
@@ -16062,6 +16214,10 @@ qexec_execute_mainblock_internal (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XAS
   bool instant_lock_mode_started = false;
   bool mvcc_select_lock_needed;
   bool old_no_logging;
+
+  /* a correlated subquery runs for an outer row - the outer values the block reads converted are
+   * converted anew, its LIMIT's included */
+  qexec_enter_temporary_scope (&xasl_state->vd, xasl->val_list);
 
   /*
    * Pre_processing
@@ -16346,12 +16502,22 @@ qexec_execute_mainblock_internal (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XAS
 	  /* domains not resolved */
 	  xasl->proc.buildlist.g_agg_domains_resolved = 0;
 
-	  /* Mark aggregate-only output expressions for agg-expr evaluation before
-	   * the scan starts. Parallel workers mark their own XASL copies the same way.
-	   *
-	   * Accumulator sharing is deferred until the domains are resolved in
-	   * qexec_end_one_iteration (): the domains were just reset above. */
-	  qexec_mark_aggregate_operand_expressions (xasl);
+	  /* the plan sets the aggregates up before the scan; the accumulators are shared once they
+	   * are set. The aggregate-only operand expressions are marked at load (domain_mark_aggregate_operands). */
+	  if (xasl->proc.buildlist.g_agg_list != NULL)
+	    {
+	      if (qexec_setup_aggregate_domains (xasl->proc.buildlist.g_agg_list, &xasl_state->vd,
+						 &xasl->proc.buildlist.g_agg_domains_resolved) != NO_ERROR)
+		{
+		  GOTO_EXIT_ON_ERROR;
+		}
+	      /* the hash aggregation writes partial results during the scan: its lists take their domains now */
+	      qexec_setup_hash_aggregate_lists (&xasl_state->vd, &xasl->proc.buildlist);
+	      if (xasl->proc.buildlist.g_agg_domains_resolved)
+		{
+		  qdata_link_shared_accumulators (xasl->proc.buildlist.g_agg_list);
+		}
+	    }
 
 	  if (xasl->proc.buildlist.a_eval_list)
 	    {
@@ -16375,12 +16541,22 @@ qexec_execute_mainblock_internal (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XAS
 	  /* domains not resolved */
 	  xasl->proc.buildvalue.agg_domains_resolved = 0;
 
-	  /* Mark aggregate operand expressions for agg-expr evaluation before
-	   * the scan starts. Parallel workers mark their own XASL copies the same way.
-	   *
-	   * Accumulator sharing is deferred until the domains are resolved in
-	   * qexec_end_one_iteration (): the domains were just reset above. */
-	  qexec_mark_aggregate_operand_expressions (xasl);
+	  /* the plan sets the aggregates up before the scan; the accumulators are shared once they
+	   * are set. The aggregate operand expressions are marked at load (domain_mark_aggregate_operands). */
+	  if (xasl->proc.buildvalue.agg_list != NULL)
+	    {
+	      if (qexec_setup_aggregate_domains (xasl->proc.buildvalue.agg_list, &xasl_state->vd,
+						 &xasl->proc.buildvalue.agg_domains_resolved) != NO_ERROR)
+		{
+		  GOTO_EXIT_ON_ERROR;
+		}
+	      /* the output columns over an accumulator take the plan's resolution before the first row */
+	      qexec_type_accumulator_outputs (&xasl_state->vd, xasl);
+	      if (xasl->proc.buildvalue.agg_domains_resolved)
+		{
+		  qdata_link_shared_accumulators (xasl->proc.buildvalue.agg_list);
+		}
+	    }
 	}
 
       multi_upddel = QEXEC_IS_MULTI_TABLE_UPDATE_DELETE (xasl);
@@ -17343,6 +17519,15 @@ qexec_clear_a_eval_values (THREAD_ENTRY * thread_p, ANALYTIC_EVAL_TYPE * a_eval_
 #define QP_MAX_RE_EXECUTES_UNDER_DEADLOCKS 10
 #endif
 
+/*
+ * [리뷰] qexec_execute_query — query_manager(xqmgr_execute_query → qmgr_process_query)가 부르는 서버측 질의 실행 진입점 —
+ * XASL_STATE 를 만들어 메인블록을 돌리고 결과 QFILE_LIST_ID 를 돌려준다.
+ * develop: xasl_state 에 바인드 값·시각·난수·스냅샷만 채우고 바로 qexec_execute_mainblock 을 불렀다. 도메인·collation 은 실행 중 행을 읽으면서 하위
+ * 43곳에서 각자 정해졌다.
+ * 이 PR: xasl_state.resolved_domain·domain_execution 을 memset 으로 비우고, 메인블록 직전에 qexec_resolve_domains 로 이 실행의
+ * 도메인을 한 번에 정한다. 실패하면 query_error 로 가고, end: 라벨에서 qexec_clear_resolved_domains 로 해제한다.
+ * 바뀐 것: 실행 전 게이트 호출 + 해제 1쌍과 memset 2줄 추가(분기 추가, +12줄). 이 PR 이 말하는 '실행 전 게이트'가 걸리는 바로 그 자리다.
+ */
 qfile_list_id *
 qexec_execute_query (THREAD_ENTRY * thread_p, xasl_node * xasl, int dbval_cnt, const DB_VALUE * dbval_ptr,
 		     QUERY_ID query_id)
@@ -17468,6 +17653,8 @@ qexec_execute_query (THREAD_ENTRY * thread_p, xasl_node * xasl, int dbval_cnt, c
   /* form the value descriptor to represent positional values */
   xasl_state.vd.dbval_cnt = dbval_cnt;
   xasl_state.vd.dbval_ptr = (DB_VALUE *) dbval_ptr;
+  memset (&xasl_state.resolved_domain, 0, sizeof (xasl_state.resolved_domain));
+  memset (&xasl_state.domain_execution, 0, sizeof (xasl_state.domain_execution));
 
   /* save the query_id into the XASL state struct */
   xasl_state.query_id = query_id;
@@ -17510,6 +17697,15 @@ qexec_execute_query (THREAD_ENTRY * thread_p, xasl_node * xasl, int dbval_cnt, c
       /* We need to be sure we have a snapshot. Insert ... values execution might not get any snapshot. Then next
        * select may obtain weird results (since things that changed after executing insert will be visible). */
       (void) logtb_get_mvcc_snapshot (thread_p);
+    }
+
+  /* resolve_domains: own the bind values and resolve resolve_domains domains once, before the main block and its
+   * aptr/PX clones. */
+  stat = qexec_resolve_domains (thread_p, xasl, &xasl_state);
+  if (stat != NO_ERROR)
+    {
+      qexec_failure_line (__LINE__, &xasl_state);
+      goto query_error;
     }
 
   /* execute the query set the query in progress flag so that qmgr_clear_trans_wakeup() will not remove our XASL
@@ -17614,6 +17810,7 @@ query_error:
 #endif /* CUBRID_DEBUG */
 
 end:
+  qexec_clear_resolved_domains (thread_p, &xasl_state);
 
 #if defined (SERVER_MODE)
   if (prm_get_bool_value (PRM_ID_LOG_QUERY_LISTS))
@@ -17780,6 +17977,15 @@ replace_null_dbval (REGU_VARIABLE * regu_var, DB_VALUE * set_dbval)
  *  xasl(in):
  *  xasl_state(in):
  */
+/*
+ * [리뷰] qexec_execute_connect_by — qexec_execute_mainblock_internal 이 START WITH … CONNECT BY 플랜을 만나면 부르는 계층 질의
+ * 실행기 — input/start_with/result 리스트 파일을 만들어 레벨별로 확장하고 NO_ERROR/ER_FAILED 를 돌려준다.
+ * develop: 해시 리스트 스캔의 probe regu 도메인이 NUMERIC 기본 정밀도일 때, rest_regu_list 에서 고정 정밀도 NUMERIC 항목을 찾아
+ * tp_domain_copy 로 복사본을 만들고 precision/scale 을 덮어써 실행 중에 probe 도메인을 바꿔 끼웠다(약 47줄).
+ * 이 PR: 그 보정 블록이 통째로 사라지고 'probe 도메인은 로드 때 domain_fix_connect_by_probe 가 확정한다'는 주석만 남았다.
+ * qdata_get_valptr_type_list 에는 &xasl_state->vd 를 넘겨 게이트가 정한 도메인으로 리스트 컬럼 타입을 만든다.
+ * 바뀐 것: 실행 중 도메인 교체 블록 삭제(-47줄, 결정 지점이 로드(DOMAIN_PLAN)로 이동), 타입리스트 호출 1곳 인자 추가.
+ */
 static int
 qexec_execute_connect_by (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
 			  QFILE_TUPLE_RECORD * tplrec)
@@ -17855,60 +18061,13 @@ qexec_execute_connect_by (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE 
   if (xasl->spec_list->type == TARGET_LIST && xasl->spec_list->s.list_node.list_regu_list_probe)
     {
       regu_list = xasl->spec_list->s.list_node.list_regu_list_probe;
-      REGU_VARIABLE_LIST probe_regu = regu_list;	/* Save first probe item before loop */
 
       while (regu_list)
 	{
 	  qexec_replace_prior_regu_vars (thread_p, &regu_list->value, xasl);
 	  regu_list = regu_list->next;
 	}
-
-      /* Adjust probe domain precision/scale from rest_regu_list for hash list scan */
-      if (probe_regu && xasl->spec_list->s.list_node.list_regu_list_rest)
-	{
-	  REGU_VARIABLE_LIST rest_regu_numeric = NULL;
-
-	  /* Find first numeric item in rest_regu_list with fixed precision */
-	  for (REGU_VARIABLE_LIST rest_iter = xasl->spec_list->s.list_node.list_regu_list_rest;
-	       rest_iter != NULL; rest_iter = rest_iter->next)
-	    {
-	      if (TP_DOMAIN_TYPE (rest_iter->value.domain) == DB_TYPE_NUMERIC &&
-		  rest_iter->value.domain->precision != DB_DEFAULT_NUMERIC_PRECISION)
-		{
-		  rest_regu_numeric = rest_iter;
-		  break;
-		}
-	    }
-
-	  /* Adjust first numeric probe item if found */
-	  if (rest_regu_numeric)
-	    {
-	      DB_TYPE vtype1 = REGU_VARIABLE_GET_TYPE (&probe_regu->value);
-
-	      if (vtype1 == DB_TYPE_NUMERIC &&
-		  probe_regu->value.domain && probe_regu->value.domain->precision == DB_DEFAULT_NUMERIC_PRECISION)
-		{
-		  /* in START WITH ... CONNECT BY, join and expression evaluation may widen
-		   * probe_regu_list domain to float numeric.
-		   *
-		   * since tp_value_coerce() always casts values to the probe domain,
-		   * the cast behavior depends on probe_regu_list->value.domain (vtype1's domain).
-		   * when the probe domain is float numeric, integer values are not scaled,
-		   * which can produce different hash keys from fixed numeric columns.
-		   *
-		   * to avoid this mismatch, restore precision/scale from rest_regu_list
-		   * when it represents a fixed numeric domain.
-		   */
-		  TP_DOMAIN *new_domain = tp_domain_copy (probe_regu->value.domain, false);
-		  if (new_domain != NULL)
-		    {
-		      new_domain->precision = rest_regu_numeric->value.domain->precision;
-		      new_domain->scale = rest_regu_numeric->value.domain->scale;
-		      probe_regu->value.domain = new_domain;
-		    }
-		}
-	    }
-	}
+      /* the probe domain the hash list scan coerces to was fixed at load (domain_fix_connect_by_probe) */
     }
 
   if (xasl->spec_list->access == ACCESS_METHOD_INDEX && xasl->spec_list->indexptr)
@@ -17924,7 +18083,7 @@ qexec_execute_connect_by (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE 
     }
 
   /* get the domains for the list files */
-  if (qdata_get_valptr_type_list (thread_p, xasl->outptr_list, &type_list) != NO_ERROR)
+  if (qdata_get_valptr_type_list (thread_p, xasl->outptr_list, &type_list, &xasl_state->vd) != NO_ERROR)
     {
       GOTO_EXIT_ON_ERROR;
     }
@@ -18584,6 +18743,14 @@ exit_on_error:
  *  xasl(in):
  *  xasl_state(in):
  */
+/*
+ * [리뷰] qexec_execute_cte — mainblock_internal 이 CTE 플랜에 대해 부른다 — 비재귀부를 돌리고 재귀부를 수렴할 때까지 반복해 CTE 리스트 파일을 만든다.
+ * develop: 첫 재귀 반복 뒤 qfile_unify_types(non_recursive->list_id, recursive->list_id) 로 두 리스트의 컬럼 타입을 맞췄다. 어느 쪽이
+ * 행을 냈는지는 보지 않았다.
+ * 이 PR: 세 번째 인자로 list1_empty = (non_recursive_part->list_id->tuple_cnt == 0) 을 넘긴다. 비재귀부가 행을 내지 않았으면 그 컬럼에는
+ * NULL 밖에 없으므로 재귀부 도메인을 그대로 받는다.
+ * 바뀐 것: 호출 1곳 인자 추가(+1줄). qfile_unify_types 시그니처가 bool list1_empty 를 받도록 바뀌었다(list_file.h:238).
+ */
 static int
 qexec_execute_cte (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state)
 {
@@ -18687,7 +18854,8 @@ qexec_execute_cte (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_
 	  if (first_iteration)
 	    {
 	      /* unify list_id types after the first execution of the recursive part */
-	      if (qfile_unify_types (non_recursive_part->list_id, recursive_part->list_id) != NO_ERROR)
+	      if (qfile_unify_types (non_recursive_part->list_id, recursive_part->list_id,
+				     non_recursive_part->list_id->tuple_cnt == 0) != NO_ERROR)
 		{
 		  GOTO_EXIT_ON_ERROR;
 		}
@@ -19843,6 +20011,14 @@ exit_on_error:
  *  xasl(in): CONNECT BY xasl
  *  xasl_state(in):
  */
+/*
+ * [리뷰] qexec_start_connect_by_lists — qexec_execute_connect_by 가 시작할 때 부른다 — outptr_list 의 타입 리스트로
+ * input/start_with/result 리스트 파일 세 개를 열어 CONNECTBY_PROC_NODE 에 건다.
+ * develop: qdata_get_valptr_type_list (thread_p, xasl->outptr_list, &type_list) — 컴파일 도메인만으로 컬럼 타입을 만들었다.
+ * 이 PR: &xasl_state->vd 를 추가로 넘겨, 게이트가 정한 도메인으로 세 리스트의 컬럼 타입을 만든다. 세 리스트가 같은 도메인으로 열리는 것이
+ * qexec_update_connect_by_lists 의 동기화 삭제 근거다.
+ * 바뀐 것: 인자 1개 추가(1줄).
+ */
 static int
 qexec_start_connect_by_lists (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state)
 {
@@ -19850,7 +20026,7 @@ qexec_start_connect_by_lists (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_ST
   QFILE_LIST_ID *t_list_id = NULL;
   CONNECTBY_PROC_NODE *connect_by = &xasl->proc.connect_by;
 
-  if (qdata_get_valptr_type_list (thread_p, xasl->outptr_list, &type_list) != NO_ERROR)
+  if (qdata_get_valptr_type_list (thread_p, xasl->outptr_list, &type_list, &xasl_state->vd) != NO_ERROR)
     {
       goto exit_on_error;
     }
@@ -19910,49 +20086,21 @@ exit_on_error:
 }
 
 /*
- * qexec_sync_start_with_type_list () - adopt into start_with_list_id the domains that input_list_id's descriptor resolved.
- *    return:
- *  connect_by(in): CONNECT BY proc node
- *
- * Note: qexec_update_connect_by_lists () lays the START WITH tuple out with input_list_id's descriptor and appends the
- *	same bytes to start_with_list_id. The assembler resolves a DB_TYPE_VARIABLE column (a host variable) on its first
- *	bound value and recomputes that descriptor only. start_with_list_id is an independent copy of the same initial
- *	descriptor (qexec_start_connect_by_lists) and never goes through the assembler, so it would keep the VAR/COMPOSITE
- *	layout and misread the FIXED bytes. Adopting the domain is safe here: a column still unresolved in
- *	start_with_list_id has stored only NULL so far, since a bound value would have resolved input_list_id first.
- */
-static void
-qexec_sync_start_with_type_list (CONNECTBY_PROC_NODE * connect_by)
-{
-  QFILE_TUPLE_VALUE_TYPE_LIST *dst = &connect_by->start_with_list_id->type_list;
-  const QFILE_TUPLE_VALUE_TYPE_LIST *src = &connect_by->input_list_id->type_list;
-  bool changed = false;
-  int i;
-
-  assert (dst->type_cnt == src->type_cnt);
-
-  for (i = 0; i < dst->type_cnt; i++)
-    {
-      if (TP_DOMAIN_TYPE (dst->domp[i]) == DB_TYPE_VARIABLE && TP_DOMAIN_TYPE (src->domp[i]) != DB_TYPE_VARIABLE)
-	{
-	  dst->domp[i] = src->domp[i];
-	  changed = true;
-	}
-    }
-
-  if (changed)
-    {
-      qfile_set_layout (dst);
-    }
-}
-
-/*
  * qexec_update_connect_by_lists () - updates the START WITH list file and
  *	the CONNECT BY input list file with new data
  *    return:
  *  xasl(in): CONNECT BY xasl
  *  xasl_state(in):
  *  tplrec(in):
+ */
+/*
+ * [리뷰] qexec_update_connect_by_lists — qexec_intprt_fnc 의 행 경로에서 한 튜플을 input_list_id 에(START WITH 조건을 만족하면
+ * start_with_list_id 에도) 적재한다 — 행당 호출.
+ * develop: start_with_list_id 에 튜플을 넣기 직전마다 qexec_sync_start_with_type_list(connect_by) 를 불러, input_list_id 의
+ * descriptor 가 그 사이 해석한 도메인을 start_with_list_id 쪽에 복사했다.
+ * 이 PR: 호출을 지우고 주석만 남겼다 — 두 리스트가 qexec_start_connect_by_lists 에서 같은 도메인으로 열렸고 행이 그것을 바꾸지 않으므로 동기화할 것이 없다.
+ * qexec_sync_start_with_type_list 함수 자체가 PR 에서 삭제됐다(develop 에만 남아 있다).
+ * 바뀐 것: 행마다 돌던 도메인 동기화 호출 삭제(-1줄 + 헬퍼 함수 1개 제거). '행은 읽기만 한다'는 이 PR 의 원칙이 핫패스에서 드러나는 자리다.
  */
 static int
 qexec_update_connect_by_lists (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
@@ -19989,8 +20137,8 @@ qexec_update_connect_by_lists (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_S
 	    }
 	}
 
-      /* the tuple was laid out with input_list_id's descriptor; start_with_list_id must read it the same way */
-      qexec_sync_start_with_type_list (connect_by);
+      /* the tuple was laid out with input_list_id's descriptor; start_with_list_id opened with the same domains
+       * (qexec_start_connect_by_lists), which no row changes, so it reads the tuple the same way */
 
       if (qfile_add_tuple_to_list (thread_p, connect_by->start_with_list_id, tplrec->tpl) != NO_ERROR)
 	{
@@ -20356,6 +20504,14 @@ wrapup:
  *   N(in):
  *   keep_list_file(in) : whether keep the list file for reuse
  */
+/*
+ * [리뷰] qexec_gby_finalize_group — GROUP BY 정렬 출력 경로(qexec_gby_put_next → qexec_gby_finalize_group_dim)에서 한 그룹이
+ * 끝날 때 누산기를 마감해 그룹 행을 출력 리스트에 쓴다.
+ * develop: qdata_finalize_aggregate_list (thread_p, gbstate->g_dim[N].d_agg_list, keep_list_file) — 집계 마감이 집계
+ * 노드의 컴파일 도메인만 보고 결과 타입을 정했다.
+ * 이 PR: &gbstate->xasl_state->vd 를 추가로 넘겨, 집계 마감이 게이트가 정한 실행 도메인을 읽는다.
+ * 바뀐 것: 인자 1개 추가(+1줄). 집계 쪽 시그니처 변경에 따른 호출부 반영.
+ */
 static void
 qexec_gby_finalize_group (THREAD_ENTRY * thread_p, GROUPBY_STATE * gbstate, int N, bool keep_list_file)
 {
@@ -20378,7 +20534,8 @@ qexec_gby_finalize_group (THREAD_ENTRY * thread_p, GROUPBY_STATE * gbstate, int 
 
   assert (gbstate->g_dim[N].d_flag != GROUPBY_DIM_FLAG_NONE);
 
-  error_code = qdata_finalize_aggregate_list (thread_p, gbstate->g_dim[N].d_agg_list, keep_list_file);
+  error_code =
+    qdata_finalize_aggregate_list (thread_p, gbstate->g_dim[N].d_agg_list, keep_list_file, &gbstate->xasl_state->vd);
   if (error_code != NO_ERROR)
     {
       ASSERT_ERROR ();
@@ -20624,6 +20781,12 @@ qexec_gby_start_group_dim (THREAD_ENTRY * thread_p, GROUPBY_STATE * gbstate, con
  *   recdes(in):
  *   N(in): dimension ID
  */
+/*
+ * [리뷰] qexec_gby_start_group — GROUP BY 정렬 콜백에서 새 그룹이 시작될 때 누산기 값을 비우고 집계 리스트를 초기화한다.
+ * develop: qdata_initialize_aggregate_list (thread_p, agg_list, gbstate->xasl_state->query_id).
+ * 이 PR: &gbstate->xasl_state->vd 를 추가로 넘겨, 집계 초기화가 첫 값이 아니라 게이트가 정한 도메인을 쓰게 한다.
+ * 바뀐 것: 인자 1개 추가(+1줄).
+ */
 static void
 qexec_gby_start_group (THREAD_ENTRY * thread_p, GROUPBY_STATE * gbstate, const RECDES * recdes, int N)
 {
@@ -20675,7 +20838,8 @@ qexec_gby_start_group (THREAD_ENTRY * thread_p, GROUPBY_STATE * gbstate, const R
 
   /* (Re)initialize the various accumulator variables... */
   QEXEC_CLEAR_AGG_LIST_VALUE (gbstate->g_dim[N].d_agg_list);
-  error = qdata_initialize_aggregate_list (thread_p, gbstate->g_dim[N].d_agg_list, gbstate->xasl_state->query_id);
+  error = qdata_initialize_aggregate_list (thread_p, gbstate->g_dim[N].d_agg_list, gbstate->xasl_state->query_id,
+					   &gbstate->xasl_state->vd);
   if (error != NO_ERROR)
     {
       GOTO_EXIT_ON_ERROR;
@@ -21096,766 +21260,6 @@ bf2df_str_cmpval (DB_VALUE * value1, DB_VALUE * value2, int do_coercion, int tot
 }
 
 /*
- * qexec_resolve_domains_on_sort_list () - checks if the domains in the
- *	'order_list' are all solved, and if any is still unresolved (VARIABLE)
- *	it will be replaced with the domain of corresponding element from
- *      'reference_regu_list'
- * order_list(in/out): sort list to be checked, may be empty (NULL)
- * reference_regu_list(in): reference list of regu variable with concrete
- *			    domains
- */
-static void
-qexec_resolve_domains_on_sort_list (SORT_LIST * order_list, REGU_VARIABLE_LIST reference_regu_list)
-{
-  int ref_curr_pos = 0;
-  SORT_LIST *orderby_ptr = NULL;
-  REGU_VARIABLE_LIST regu_list;
-
-  assert (reference_regu_list != NULL);
-
-  if (order_list == NULL)
-    {
-      /* nothing to check */
-      return;
-    }
-
-  for (orderby_ptr = order_list; orderby_ptr != NULL; orderby_ptr = orderby_ptr->next)
-    {
-      if (TP_DOMAIN_TYPE (orderby_ptr->pos_descr.dom) == DB_TYPE_VARIABLE
-	  || TP_DOMAIN_COLLATION_FLAG (orderby_ptr->pos_descr.dom) != TP_DOMAIN_COLL_NORMAL)
-	{
-	  ref_curr_pos = orderby_ptr->pos_descr.pos_no;
-	  regu_list = reference_regu_list;
-	  while (ref_curr_pos > 0 && regu_list)
-	    {
-	      regu_list = regu_list->next;
-	      ref_curr_pos--;
-	    }
-	  if (regu_list)
-	    {
-	      orderby_ptr->pos_descr.dom = regu_list->value.domain;
-	    }
-	}
-    }
-}
-
-/*
- * qexec_resolve_domains_for_group_by () - checks if the domains in the
- *	various lists of 'buildlist' node are all solved, and if any is still
- *	unresolved (VARIABLE), it will be replaced with the domain of
- *      corresponding element from 'reference_regu_list'
- *
- * buildlist(in/out): buildlist for GROUP BY
- * reference_out_list(in): reference output list of regu variable with
- *			   concrete domains
- *
- *  Note : this function is used for statements with GROUP BY clause
- */
-static void
-qexec_resolve_domains_for_group_by (BUILDLIST_PROC_NODE * buildlist, OUTPTR_LIST * reference_out_list)
-{
-  int ref_index = 0;
-  REGU_VARIABLE_LIST group_regu = NULL;
-  REGU_VARIABLE_LIST reference_regu_list = reference_out_list->valptrp;
-  AGGREGATE_TYPE *agg_p;
-
-  assert (buildlist != NULL && reference_regu_list != NULL);
-
-  /* domains in GROUP BY list (this is a SORT_LIST) */
-  qexec_resolve_domains_on_sort_list (buildlist->groupby_list, reference_regu_list);
-
-  /* following code aims to resolve VARIABLE domains in GROUP BY lists: g_regu_list, g_agg_list, g_outprr_list,
-   * g_hk_regu_list; pointer values are used to match the REGU VARIABLES */
-  for (group_regu = buildlist->g_regu_list; group_regu != NULL; group_regu = group_regu->next)
-    {
-      int pos_in_ref_list = 0;
-      QPROC_DB_VALUE_LIST g_val_list = NULL;
-      AGGREGATE_TYPE *group_agg = NULL;
-      bool val_in_g_val_list_found = false;
-      bool g_agg_val_found = false;
-      DB_VALUE *val_list_ref_dbvalue = NULL;
-      TP_DOMAIN *ref_domain = NULL;
-      REGU_VARIABLE_LIST ref_regu = NULL;
-      REGU_VARIABLE_LIST group_out_regu = NULL;
-      REGU_VARIABLE_LIST hk_regu = NULL;
-
-      if (group_regu->value.domain == NULL
-	  || (TP_DOMAIN_TYPE (group_regu->value.domain) != DB_TYPE_VARIABLE
-	      && TP_DOMAIN_COLLATION_FLAG (group_regu->value.domain) == TP_DOMAIN_COLL_NORMAL))
-	{
-	  continue;
-	}
-
-      pos_in_ref_list = (group_regu->value.type == TYPE_POSITION) ? group_regu->value.value.pos_descr.pos_no : -1;
-
-      if (pos_in_ref_list < 0)
-	{
-	  continue;
-	}
-
-      assert (pos_in_ref_list < reference_out_list->valptr_cnt);
-
-      /* goto position */
-      for (ref_regu = reference_regu_list, ref_index = 0; ref_regu != NULL && ref_index < pos_in_ref_list;
-	   ref_regu = ref_regu->next, ref_index++)
-	{
-	  ;
-	}
-
-      assert (ref_index == pos_in_ref_list);
-
-      ref_domain = ref_regu->value.domain;
-      if (TP_DOMAIN_TYPE (ref_domain) == DB_TYPE_VARIABLE
-	  || TP_DOMAIN_COLLATION_FLAG (ref_domain) != TP_DOMAIN_COLL_NORMAL)
-	{
-	  /* next GROUP BY item */
-	  continue;
-	}
-
-      /* update domain in g_regu_list */
-      group_regu->value.domain = ref_domain;
-
-      assert (group_regu->value.type == TYPE_POSITION);
-      group_regu->value.value.pos_descr.dom = ref_domain;
-
-      if (buildlist->g_hash_eligible)
-	{
-	  /* all reguvars in g_hk_regu_list are also in g_regu_list; match them by position and update g_hk_regu_list */
-	  for (hk_regu = buildlist->g_hk_sort_regu_list; hk_regu != NULL; hk_regu = hk_regu->next)
-	    {
-	      if (hk_regu->value.type == TYPE_POSITION && hk_regu->value.value.pos_descr.pos_no == pos_in_ref_list)
-		{
-		  hk_regu->value.value.pos_descr.dom = ref_domain;
-		  hk_regu->value.domain = ref_domain;
-		}
-	    }
-	}
-
-      /* find value in g_val_list pointed to by vfetch_to ; also find in g_agg_list (if any), the same value
-       * indentified by pointer value in operand */
-      for (g_val_list = buildlist->g_val_list->valp; g_val_list != NULL; g_val_list = g_val_list->next)
-	{
-	  if (g_val_list->val == group_regu->value.vfetch_to)
-	    {
-	      val_in_g_val_list_found = true;
-	      val_list_ref_dbvalue = g_val_list->val;
-	      break;
-	    }
-	}
-
-      /* search for corresponding aggregate, by matching the operands REGU VAR update the domains for aggregate and
-       * aggregate's operand */
-      for (group_agg = buildlist->g_agg_list; group_agg != NULL; group_agg = group_agg->next)
-	{
-	  if (group_agg->opr_dbtype != DB_TYPE_VARIABLE && !TP_TYPE_HAS_COLLATION (group_agg->opr_dbtype))
-	    {
-	      continue;
-	    }
-
-	  REGU_VARIABLE operand = group_agg->operands->value;
-
-	  assert (operand.type == TYPE_CONSTANT);
-
-	  if ((TP_DOMAIN_TYPE (operand.domain) == DB_TYPE_VARIABLE
-	       || TP_DOMAIN_COLLATION_FLAG (operand.domain) != TP_DOMAIN_COLL_NORMAL)
-	      && operand.value.dbvalptr == val_list_ref_dbvalue)
-	    {
-	      /* update domain of aggregate's operand */
-	      operand.domain = ref_domain;
-	      group_agg->opr_dbtype = TP_DOMAIN_TYPE (ref_domain);
-
-	      if (TP_DOMAIN_TYPE (group_agg->domain) == DB_TYPE_VARIABLE
-		  || TP_DOMAIN_COLLATION_FLAG (group_agg->domain) != TP_DOMAIN_COLL_NORMAL)
-		{
-		  /* set domain at run-time for MEDIAN, PERCENTILE funcs */
-		  if (QPROC_IS_INTERPOLATION_FUNC (group_agg))
-		    {
-		      continue;
-		    }
-		  else if (group_agg->function == PT_GROUP_CONCAT)
-		    {
-		      /* result of GROUP_CONCAT is always string */
-		      if (!TP_TYPE_HAS_COLLATION (TP_DOMAIN_TYPE (ref_domain)))
-			{
-			  ref_domain = tp_domain_resolve_default (DB_TYPE_VARCHAR);
-			}
-		      group_agg->domain = ref_domain;
-
-		      db_value_domain_init (group_agg->accumulator.value, TP_DOMAIN_TYPE (ref_domain),
-					    DB_DEFAULT_PRECISION, DB_DEFAULT_SCALE);
-		      db_string_put_cs_and_collation (group_agg->accumulator.value, TP_DOMAIN_CODESET (ref_domain),
-						      TP_DOMAIN_COLLATION (ref_domain));
-
-		      g_agg_val_found = true;
-		      break;
-		    }
-
-		  assert (group_agg->function == PT_MIN || group_agg->function == PT_MAX
-			  || group_agg->function == PT_SUM);
-
-		  group_agg->domain = ref_domain;
-		  db_value_domain_init (group_agg->accumulator.value, group_agg->opr_dbtype, DB_DEFAULT_PRECISION,
-					DB_DEFAULT_SCALE);
-		  if (TP_TYPE_HAS_COLLATION (DB_VALUE_TYPE (group_agg->accumulator.value)))
-		    {
-		      db_string_put_cs_and_collation (group_agg->accumulator.value, TP_DOMAIN_CODESET (ref_domain),
-						      TP_DOMAIN_COLLATION (ref_domain));
-		    }
-		}
-	      else
-		{
-		  /* these aggregates have 'group_agg->domain' and 'group_agg->value' already initialized */
-		  assert (group_agg->function == PT_GROUP_CONCAT || group_agg->function == PT_AGG_BIT_AND
-			  || group_agg->function == PT_AGG_BIT_OR || group_agg->function == PT_AGG_BIT_XOR
-			  || group_agg->function == PT_COUNT || group_agg->function == PT_AVG
-			  || group_agg->function == PT_STDDEV || group_agg->function == PT_VARIANCE
-			  || group_agg->function == PT_STDDEV_POP || group_agg->function == PT_VAR_POP
-			  || group_agg->function == PT_STDDEV_SAMP || group_agg->function == PT_VAR_SAMP
-			  || group_agg->function == PT_JSON_ARRAYAGG || group_agg->function == PT_JSON_OBJECTAGG);
-		}
-
-	      g_agg_val_found = true;
-	      break;
-	    }
-	}
-
-      if (!g_agg_val_found)
-	{
-	  continue;
-	}
-
-      /* search in g_outptr_list for the same value pointer as the value in g_agg_list->value , and update it with the
-       * same domain */
-      for (group_out_regu = buildlist->g_outptr_list->valptrp; group_out_regu != NULL;
-	   group_out_regu = group_out_regu->next)
-	{
-	  assert (group_agg != NULL);
-	  if (group_out_regu->value.type == TYPE_CONSTANT
-	      && group_out_regu->value.value.dbvalptr == group_agg->accumulator.value)
-	    {
-	      if (TP_DOMAIN_TYPE (group_out_regu->value.domain) == DB_TYPE_VARIABLE
-		  || TP_DOMAIN_COLLATION_FLAG (group_out_regu->value.domain) != TP_DOMAIN_COLL_NORMAL)
-		{
-		  group_out_regu->value.domain = ref_domain;
-		}
-	      /* aggregate found in g_outptr_list, end */
-	      break;
-	    }
-	}
-    }
-
-  /* treat case with only NULL values */
-  for (agg_p = buildlist->g_agg_list; agg_p; agg_p = agg_p->next)
-    {
-      if (agg_p->accumulator_domain.value_dom == NULL)
-	{
-	  agg_p->accumulator_domain.value_dom = &tp_Null_domain;
-	}
-
-      if (agg_p->accumulator_domain.value2_dom == NULL)
-	{
-	  agg_p->accumulator_domain.value2_dom = &tp_Null_domain;
-	}
-    }
-
-  /* update hash aggregation domains */
-  if (buildlist->g_hash_eligible)
-    {
-      AGGREGATE_HASH_CONTEXT *context = buildlist->agg_hash_context;
-      int i, index;
-
-      /* update key domains */
-      group_regu = buildlist->g_hk_sort_regu_list;
-      for (i = 0; i < buildlist->g_hkey_size && group_regu != NULL; i++, group_regu = group_regu->next)
-	{
-	  if (TP_DOMAIN_TYPE (context->key_domains[i]) == DB_TYPE_VARIABLE
-	      || TP_DOMAIN_COLLATION_FLAG (context->key_domains[i]) != TP_DOMAIN_COLL_NORMAL)
-	    {
-	      context->key_domains[i] = group_regu->value.domain;
-	    }
-	}
-
-      /* update type lists of list files */
-      for (i = 0; i < buildlist->g_hkey_size; i++)
-	{
-	  /* partial list */
-	  context->part_list_id->type_list.domp[i] = context->key_domains[i];
-
-	  /* sorted partial list */
-	  context->sorted_part_list_id->type_list.domp[i] = context->key_domains[i];
-	}
-
-      for (i = 0; i < buildlist->g_func_count; i++)
-	{
-	  index = buildlist->g_hkey_size + i * 3;
-
-	  /* partial list */
-	  context->part_list_id->type_list.domp[index] = context->accumulator_domains[i]->value_dom;
-	  context->part_list_id->type_list.domp[index + 1] = context->accumulator_domains[i]->value2_dom;
-	  context->part_list_id->type_list.domp[index + 2] = &tp_Integer_domain;
-
-	  /* sorted partial list */
-	  context->sorted_part_list_id->type_list.domp[index] = context->accumulator_domains[i]->value_dom;
-	  context->sorted_part_list_id->type_list.domp[index + 1] = context->accumulator_domains[i]->value2_dom;
-	  context->sorted_part_list_id->type_list.domp[index + 2] = &tp_Integer_domain;
-	}
-
-      /* recompute layout after mutating domp */
-      qfile_set_layout (&context->part_list_id->type_list);
-      qfile_set_layout (&context->sorted_part_list_id->type_list);
-    }
-}
-
-int
-qexec_resolve_domains_for_aggregation_for_parallel_heap_scan_g_agg (THREAD_ENTRY * thread_p, XASL_NODE * xasl, void *vd,
-								    int *resolved)
-{
-  QFILE_TUPLE_RECORD tpl = QFILE_TUPLE_RECORD_INITIALIZER;
-  VAL_DESCR *vd_p = (VAL_DESCR *) vd;
-  return qexec_resolve_domains_for_aggregation (thread_p, xasl->proc.buildlist.g_agg_list, vd_p, &tpl,
-						xasl->proc.buildlist.g_scan_regu_list, resolved);
-}
-
-int
-qexec_resolve_domains_for_aggregation_for_parallel_heap_scan_buildvalue_proc (THREAD_ENTRY * thread_p, XASL_NODE * xasl,
-									      void *vd, int *resolved)
-{
-  QFILE_TUPLE_RECORD tpl = QFILE_TUPLE_RECORD_INITIALIZER;
-  VAL_DESCR *vd_p = (VAL_DESCR *) vd;
-  return qexec_resolve_domains_for_aggregation (thread_p, xasl->proc.buildvalue.agg_list, vd_p, &tpl, NULL, resolved);
-}
-
-/*
- * qexec_resolve_domains_for_aggregation () - update domains of aggregate
- *                                            functions and accumulators
- *   returns: error code or NO_ERROR
- *   thread_p(in): current thread
- *   agg_p(in): aggregate node
- *   xasl_state(in): XASL state
- *   tplrec(in): tuple record used for fetching of value
- *   regu_list(in): regulist (NULL for none)
- *   resolved(out): true if all domains are resolved, false otherwise
- */
-static int
-qexec_resolve_domains_for_aggregation (THREAD_ENTRY * thread_p, AGGREGATE_TYPE * agg_p, VAL_DESCR * vd,
-				       QFILE_TUPLE_RECORD * tplrec, REGU_VARIABLE_LIST regu_list, int *resolved)
-{
-  TP_DOMAIN *tmp_domain_p;
-  TP_DOMAIN_STATUS status;
-  DB_VALUE *dbval;
-  int error;
-  HL_HEAPID save_heapid = 0;
-
-  /* fetch values */
-  if (regu_list != NULL)
-    {
-      if (fetch_val_list (thread_p, regu_list, vd, NULL, NULL, tplrec, true) != NO_ERROR)
-	{
-	  return ER_FAILED;
-	}
-    }
-
-  /* start off as resolved */
-  *resolved = 1;
-
-  /* iterate functions */
-  for (; agg_p != NULL; agg_p = agg_p->next)
-    {
-      if (agg_p->function == PT_CUME_DIST || agg_p->function == PT_PERCENT_RANK)
-	{
-	  /* operands for CUME_DIST and PERCENT_RANK are of no interest here */
-	  continue;
-	}
-
-      if (agg_p->function == PT_COUNT || agg_p->function == PT_COUNT_STAR)
-	{
-	  /* COUNT and COUNT(*) always have the same signature */
-	  agg_p->accumulator_domain.value_dom = &tp_Bigint_domain;
-	  agg_p->accumulator_domain.value2_dom = &tp_Null_domain;
-
-	  /* COUNT skips the distinct/sort block below, so handle count(distinct) here. Fetch the
-	   * operand even when the list file does not exist yet: fetch_peek_dbval resolves its regu
-	   * domain, which GROUP BY uses when it re-creates the list file for every group. */
-	  if (agg_p->option == Q_DISTINCT)
-	    {
-	      /* count(*) cannot take DISTINCT */
-	      assert (agg_p->function == PT_COUNT);
-	      if (fetch_peek_dbval (thread_p, &agg_p->operands->value, vd, NULL, NULL, NULL, &dbval) != NO_ERROR)
-		{
-		  return ER_FAILED;
-		}
-	      if (dbval == NULL || DB_IS_NULL (dbval))
-		{
-		  *resolved = 0;
-		}
-	      else if (agg_p->list_id != NULL && agg_p->list_id->type_list.type_cnt > 0
-		       && TP_DOMAIN_TYPE (agg_p->list_id->type_list.domp[0]) == DB_TYPE_VARIABLE)
-		{
-		  agg_p->list_id->type_list.domp[0] = tp_domain_resolve_value (dbval, NULL);
-		  qfile_set_layout (&agg_p->list_id->type_list);	/* recompute layout after mutating domp */
-		}
-	    }
-
-	  continue;
-	}
-
-      if (agg_p->function == PT_JSON_ARRAYAGG || agg_p->function == PT_JSON_OBJECTAGG)
-	{
-	  /* PT_JSON_ARRAYAGG and PT_JSON_OBJECTAGG always have the same signature */
-	  agg_p->accumulator_domain.value_dom = &tp_Json_domain;
-	  agg_p->accumulator_domain.value2_dom = &tp_Null_domain;
-	  continue;
-	}
-
-      DB_VALUE benchmark_dummy_dbval;
-      db_make_double (&benchmark_dummy_dbval, 0);
-      if (agg_p->operands->value.type == TYPE_FUNC && agg_p->operands->value.value.funcp != NULL
-	  && agg_p->operands->value.value.funcp->ftype == F_BENCHMARK)
-	{
-	  // In case we have a benchmark function we want ot avoid the usual superflous function evaluation
-	  dbval = &benchmark_dummy_dbval;
-	}
-      else
-	{
-	  /* fetch function operand */
-	  if (fetch_peek_dbval (thread_p, &agg_p->operands->value, vd, NULL, NULL, NULL, &dbval) != NO_ERROR)
-	    {
-	      return ER_FAILED;
-	    }
-	}
-
-      /* handle NULL value */
-      if (dbval == NULL || DB_IS_NULL (dbval))
-	{
-	  if (agg_p->opr_dbtype == DB_TYPE_VARIABLE || agg_p->accumulator_domain.value_dom == NULL
-	      || agg_p->accumulator_domain.value2_dom == NULL)
-	    {
-	      /* domains will not be resolved at this time */
-	      *resolved = 0;
-	    }
-
-	  /* no need to continue */
-	  continue;
-	}
-
-      /* update variable domain of function */
-      if (agg_p->opr_dbtype == DB_TYPE_VARIABLE || TP_DOMAIN_COLLATION_FLAG (agg_p->domain) != TP_DOMAIN_COLL_NORMAL)
-	{
-	  if (TP_IS_CHAR_TYPE (DB_VALUE_DOMAIN_TYPE (dbval))
-	      && (agg_p->function == PT_SUM || agg_p->function == PT_AVG))
-	    {
-	      agg_p->domain = tp_domain_resolve_default (DB_TYPE_DOUBLE);
-	    }
-	  else if (!TP_IS_CHAR_TYPE (DB_VALUE_DOMAIN_TYPE (dbval)) && agg_p->function == PT_GROUP_CONCAT)
-	    {
-	      agg_p->domain = tp_domain_resolve_default (DB_TYPE_VARCHAR);
-	    }
-	  else
-	    {
-	      agg_p->domain = tp_domain_resolve_value (dbval, NULL);
-	    }
-	  agg_p->opr_dbtype = TP_DOMAIN_TYPE (agg_p->domain);
-	}
-
-      /* set up domains of accumulator */
-      if (agg_p->domain != NULL && agg_p->opr_dbtype != DB_TYPE_VARIABLE
-	  && (agg_p->accumulator_domain.value_dom == NULL || agg_p->accumulator_domain.value2_dom == NULL))
-	{
-	  switch (agg_p->function)
-	    {
-	    case PT_AGG_BIT_AND:
-	    case PT_AGG_BIT_OR:
-	    case PT_AGG_BIT_XOR:
-	      /* qdata_bit_and/or/xor_dbval always produce a BIGINT accumulator; describe what's actually stored */
-	      agg_p->accumulator_domain.value_dom = &tp_Bigint_domain;
-	      agg_p->accumulator_domain.value2_dom = &tp_Null_domain;
-	      break;
-
-	    case PT_MIN:
-	    case PT_MAX:
-	      agg_p->accumulator_domain.value_dom = agg_p->domain;
-	      agg_p->accumulator_domain.value2_dom = &tp_Null_domain;
-	      break;
-
-	    case PT_AVG:
-	    case PT_SUM:
-	      if (TP_IS_NUMERIC_TYPE (DB_VALUE_TYPE (dbval)))
-		{
-		  if (TP_DOMAIN_TYPE (agg_p->domain) == DB_TYPE_NUMERIC || DB_VALUE_TYPE (dbval) == DB_TYPE_NUMERIC)
-		    {
-		      agg_p->accumulator_domain.value_dom =
-			tp_domain_resolve (DB_TYPE_NUMERIC, NULL, DB_DEFAULT_NUMERIC_PRECISION,
-					   DB_DEFAULT_NUMERIC_SCALE, NULL, 0);
-		    }
-		  else if (DB_VALUE_TYPE (dbval) == DB_TYPE_FLOAT)
-		    {
-		      agg_p->accumulator_domain.value_dom =
-			tp_domain_resolve (DB_TYPE_DOUBLE, NULL, DB_DOUBLE_DECIMAL_PRECISION, DB_VALUE_SCALE (dbval),
-					   NULL, 0);
-		    }
-		  else
-		    {
-		      agg_p->accumulator_domain.value_dom = tp_domain_resolve_default (DB_VALUE_TYPE (dbval));
-		    }
-		}
-	      else
-		{
-		  agg_p->accumulator_domain.value_dom = agg_p->domain;
-		}
-	      agg_p->accumulator_domain.value2_dom = &tp_Null_domain;
-	      break;
-
-	    case PT_STDDEV:
-	    case PT_STDDEV_POP:
-	    case PT_STDDEV_SAMP:
-	    case PT_VARIANCE:
-	    case PT_VAR_POP:
-	    case PT_VAR_SAMP:
-	      agg_p->accumulator_domain.value_dom = &tp_Double_domain;
-	      agg_p->accumulator_domain.value2_dom = &tp_Double_domain;
-	      break;
-
-	    case PT_GROUPBY_NUM:
-	      agg_p->accumulator_domain.value_dom = &tp_Null_domain;
-	      agg_p->accumulator_domain.value2_dom = &tp_Null_domain;
-	      break;
-
-	    case PT_GROUP_CONCAT:
-	      agg_p->accumulator_domain.value_dom = agg_p->domain;
-	      agg_p->accumulator_domain.value2_dom = &tp_Null_domain;
-	      break;
-
-	    case PT_MEDIAN:
-	    case PT_PERCENTILE_CONT:
-	    case PT_PERCENTILE_DISC:
-	      switch (agg_p->opr_dbtype)
-		{
-		case DB_TYPE_SHORT:
-		case DB_TYPE_INTEGER:
-		case DB_TYPE_BIGINT:
-		case DB_TYPE_FLOAT:
-		case DB_TYPE_DOUBLE:
-		case DB_TYPE_MONETARY:
-		case DB_TYPE_NUMERIC:
-		case DB_TYPE_DATE:
-		case DB_TYPE_DATETIME:
-		case DB_TYPE_DATETIMETZ:
-		case DB_TYPE_DATETIMELTZ:
-		case DB_TYPE_TIMESTAMP:
-		case DB_TYPE_TIMESTAMPTZ:
-		case DB_TYPE_TIMESTAMPLTZ:
-		case DB_TYPE_TIME:
-		  break;
-
-		default:
-		  assert (agg_p->operands->value.type == TYPE_CONSTANT || agg_p->operands->value.type == TYPE_DBVAL
-			  || agg_p->operands->value.type == TYPE_INARITH
-			  || agg_p->operands->value.type == TYPE_POS_VALUE);
-
-		  /* try to cast dbval to double, datetime then time */
-		  tmp_domain_p = tp_domain_resolve_default (DB_TYPE_DOUBLE);
-
-		  if (REGU_VARIABLE_IS_FLAGED (&agg_p->operands->value, REGU_VARIABLE_CLEAR_AT_CLONE_DECACHE))
-		    {
-		      save_heapid = db_change_private_heap (thread_p, 0);
-		    }
-
-		  status = tp_value_cast (dbval, dbval, tmp_domain_p, false);
-		  if (status != DOMAIN_COMPATIBLE)
-		    {
-		      /* try datetime */
-		      tmp_domain_p = tp_domain_resolve_default (DB_TYPE_DATETIME);
-
-		      status = tp_value_cast (dbval, dbval, tmp_domain_p, false);
-		    }
-
-		  /* try time */
-		  if (status != DOMAIN_COMPATIBLE)
-		    {
-		      tmp_domain_p = tp_domain_resolve_default (DB_TYPE_TIME);
-
-		      status = tp_value_cast (dbval, dbval, tmp_domain_p, false);
-		    }
-
-		  if (save_heapid != 0)
-		    {
-		      (void) db_change_private_heap (thread_p, save_heapid);
-		      save_heapid = 0;
-		    }
-		  else
-		    {
-		      if (status != DOMAIN_COMPATIBLE)
-			{
-			  pr_clear_value (dbval);
-			}
-		    }
-
-		  if (status != DOMAIN_COMPATIBLE)
-		    {
-		      error = ER_ARG_CAN_NOT_BE_CASTED_TO_DESIRED_DOMAIN;
-		      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, error, 2, fcode_get_uppercase_name (agg_p->function),
-			      "DOUBLE, DATETIME or TIME");
-
-		      return error;
-		    }
-
-		  /* clear errors from failed casts if any cast attempt succeeds. */
-		  if (er_errid () != NO_ERROR)
-		    {
-		      er_clear ();
-		    }
-
-		  /* update domain */
-		  agg_p->domain = tmp_domain_p;
-		  agg_p->accumulator_domain.value_dom = tmp_domain_p;
-		  agg_p->accumulator_domain.value2_dom = &tp_Null_domain;
-		}
-	      break;
-	    default:
-	      break;
-	    }
-
-	  /* set the distinct/sort list file domain before finalize; a *variable* readval
-	   * is a no-op and would silently drop all values. */
-	  if ((agg_p->option == Q_DISTINCT || agg_p->sort_list != NULL) && agg_p->list_id != NULL
-	      && agg_p->list_id->type_list.type_cnt > 0
-	      && TP_DOMAIN_TYPE (agg_p->list_id->type_list.domp[0]) == DB_TYPE_VARIABLE)
-	    {
-	      if (QPROC_IS_INTERPOLATION_FUNC (agg_p))
-		{
-		  /* values are written after coercion to agg_p->domain. */
-		  agg_p->list_id->type_list.domp[0] = agg_p->domain;
-		}
-	      else
-		{
-		  agg_p->list_id->type_list.domp[0] = tp_domain_resolve_value (dbval, NULL);
-		}
-	      qfile_set_layout (&agg_p->list_id->type_list);	/* recompute layout after mutating domp */
-	    }
-
-	  /* initialize accumulators */
-	  if (agg_p->accumulator.value != NULL && agg_p->accumulator_domain.value_dom != NULL
-	      && DB_VALUE_TYPE (agg_p->accumulator.value) == DB_TYPE_NULL)
-	    {
-	      if (db_value_domain_init (agg_p->accumulator.value, TP_DOMAIN_TYPE (agg_p->accumulator_domain.value_dom),
-					DB_DEFAULT_PRECISION, DB_DEFAULT_SCALE) != NO_ERROR)
-		{
-		  return ER_FAILED;
-		}
-	    }
-
-	  if (agg_p->accumulator.value2 != NULL && agg_p->accumulator_domain.value2_dom != NULL
-	      && DB_VALUE_TYPE (agg_p->accumulator.value2) == DB_TYPE_NULL)
-	    {
-	      if (db_value_domain_init (agg_p->accumulator.value2,
-					TP_DOMAIN_TYPE (agg_p->accumulator_domain.value2_dom),
-					DB_DEFAULT_PRECISION, DB_DEFAULT_SCALE) != NO_ERROR)
-		{
-		  return ER_FAILED;
-		}
-	    }
-	}
-    }
-
-  /* all ok */
-  return NO_ERROR;
-}
-
-/*
- * qexec_mark_aggregate_operand_expressions () - flag the expressions that only
- *                                               feed an aggregate
- *   xasl(in/out): BUILDLIST_PROC or BUILDVALUE_PROC whose operand expressions are marked
- *
- * BUILDLIST reaches the aggregate through a TYPE_CONSTANT operand pointing to
- * the DB_VALUE written by the expression (regu->vfetch_to). Matching these
- * pointers identifies expressions used only by the aggregate.
- *
- * BUILDVALUE has no such indirection: the aggregate operand is the expression
- * regu itself, so it is flagged directly.
- *
- * The flag is needed by parallel workers, where px_scan_result_handler fetches
- * the operand directly and fetch_peek_arith () reaches agg-expr evaluation
- * through this flag. General expressions remain on the float_numeric_db_value_*
- * path. Called once per XASL copy, before the scan starts.
- */
-void
-qexec_mark_aggregate_operand_expressions (xasl_node * xasl)
-{
-  REGU_VARIABLE_LIST regu_p;
-  AGGREGATE_TYPE *agg_list, *agg_p;
-  VALPTR_LIST *outptr_list;
-  int budget;
-
-  if (xasl == NULL)
-    {
-      return;
-    }
-
-  budget = prm_get_integer_value (PRM_ID_MAX_RECURSION_SQL_DEPTH);
-
-  if (xasl->type == BUILDVALUE_PROC)
-    {
-      for (agg_p = xasl->proc.buildvalue.agg_list; agg_p != NULL; agg_p = agg_p->next)
-	{
-	  if (agg_p->function != PT_SUM && agg_p->function != PT_AVG)
-	    {
-	      continue;
-	    }
-	  if (agg_p->option == Q_DISTINCT || agg_p->operands == NULL || agg_p->operands->value.type != TYPE_INARITH)
-	    {
-	      continue;
-	    }
-
-	  if (fetch_is_agg_expr_shape (&agg_p->operands->value, budget))
-	    {
-	      REGU_VARIABLE_SET_FLAG (&agg_p->operands->value, REGU_VARIABLE_AGG_OPERAND);
-	    }
-	}
-    }
-  else if (xasl->type == BUILDLIST_PROC)
-    {
-      /* Analytic functions are not covered: their operands are materialized
-       * into list file slots before evaluation, so there is no expression to mark. */
-      agg_list = xasl->proc.buildlist.g_agg_list;
-      outptr_list = xasl->outptr_list;
-      if (agg_list == NULL || outptr_list == NULL)
-	{
-	  return;
-	}
-
-      for (regu_p = outptr_list->valptrp; regu_p != NULL; regu_p = regu_p->next)
-	{
-	  if (regu_p->value.type != TYPE_INARITH || regu_p->value.vfetch_to == NULL)
-	    {
-	      continue;
-	    }
-
-	  for (agg_p = agg_list; agg_p != NULL; agg_p = agg_p->next)
-	    {
-	      if (agg_p->function != PT_SUM && agg_p->function != PT_AVG)
-		{
-		  continue;
-		}
-	      if (agg_p->option == Q_DISTINCT || agg_p->operands == NULL)
-		{
-		  continue;
-		}
-
-	      if (agg_p->operands->value.type == TYPE_CONSTANT
-		  && agg_p->operands->value.value.dbvalptr == regu_p->value.vfetch_to)
-		{
-		  if (fetch_is_agg_expr_shape (&regu_p->value, budget))
-		    {
-		      REGU_VARIABLE_SET_FLAG (&regu_p->value, REGU_VARIABLE_AGG_OPERAND);
-		    }
-		  break;
-		}
-	    }
-	}
-    }
-}
-
-/*
  * qexec_groupby_index() - computes group by on the fly from the index list
  *   return: NO_ERROR, or ER_code
  *   xasl(in)   :
@@ -21864,6 +21268,15 @@ qexec_mark_aggregate_operand_expressions (xasl_node * xasl)
  *
  * Note: Apply the group_by clause to the given list file to group it
  * using the specified group_by parameters.
+ */
+/*
+ * [리뷰] qexec_groupby_index — mainblock_internal 이 인덱스 스캔으로 그룹 순서가 이미 보장된 GROUP BY 를 처리할 때 부른다 — 정렬 없이 스캔하며 그룹
+ * 경계를 잡아 결과 리스트를 만든다.
+ * develop: 출력 리스트 타입을 qdata_get_valptr_type_list(…, &output_type_list) 로 만들었고, 그룹 키 비교 값을 꺼낼 때
+ * qexec_get_tuple_column_value 에 regu_list->value.domain(컴파일 도메인)을 그대로 넘겼다.
+ * 이 PR: 타입 리스트 호출에 &xasl_state->vd 를 넘기고, 컬럼 값 추출에는 qexec_get_node_domain (&xasl_state->vd,
+ * regu_list->value.domain, regu_list->value.plan_item) 으로 이 실행의 도메인을 구해 넘긴다.
+ * 바뀐 것: 인자 추가 1곳 + 도메인 조회를 plan item 경유로 교체 1곳(+3줄).
  */
 int
 qexec_groupby_index (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state, QFILE_TUPLE_RECORD * tplrec)
@@ -21925,7 +21338,7 @@ qexec_groupby_index (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xas
     QFILE_TUPLE_VALUE_TYPE_LIST output_type_list;
     QFILE_LIST_ID *output_list_id;
 
-    if (qdata_get_valptr_type_list (thread_p, buildlist->g_outptr_list, &output_type_list) != NO_ERROR)
+    if (qdata_get_valptr_type_list (thread_p, buildlist->g_outptr_list, &output_type_list, &xasl_state->vd) != NO_ERROR)
       {
 	GOTO_EXIT_ON_ERROR;
       }
@@ -22017,7 +21430,9 @@ qexec_groupby_index (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xas
 	      goto exit_on_error;
 	    }
 
-	  if (qexec_get_tuple_column_value (&tuple_rec, i, &val, regu_list->value.domain) != NO_ERROR)
+	  if (qexec_get_tuple_column_value (&tuple_rec, i, &val,
+					    qexec_get_node_domain (&xasl_state->vd, regu_list->value.domain,
+								   regu_list->value.plan_item)) != NO_ERROR)
 	    {
 	      gbstate.state = ER_FAILED;
 	      goto exit_on_error;
@@ -22349,6 +21764,18 @@ qexec_clear_analytic_stats_list (ANALYTIC_STATS ** stats_list)
  *   tplrec(out) : Tuple record descriptor to store result tuples
  *   next_func(out) : next unprocessed function
  */
+/*
+ * [리뷰] qexec_execute_analytic — mainblock_internal 이 분석 함수 평가 단계마다 부른다 — 정렬된 입력을 ANALYTIC_STATE 로 훑어 중간/최종 리스트
+ * 파일을 만들고 NO_ERROR/ER_FAILED 를 돌려준다.
+ * develop: qexec_resolve_domains_on_sort_list (analytic_eval->sort_list, buildlist->a_outptr_list_ex->valptrp)
+ * 로 플랜의 sort_list 를 제자리에서 고쳐 늦은 바인딩 도메인을 채운 뒤, 그 플랜 리스트를 그대로 qexec_initialize_analytic_state 에 넘겼다.
+ * 이 PR: qexec_plan_sort_list_domains 가 플랜 sort_list 는 그대로 두고, 해석이 필요한 키가 있을 때만 실행이 소유하는 복사본을 만든다. 그 복사본으로 상태를
+ * 초기화하고 key_info 가 만들어진 직후 qfile_free_sort_list 로 해제한다. 타입 리스트 호출 2곳에 &xasl_state->vd 추가.
+ * 바뀐 것: 플랜 노드 제자리 수정 → 실행 소유 복사본으로 교체, 지역변수 2개(sort_list·initialized)와 해제 경로 추가(+12줄). '결정은 XASL_STATE 에만 두고
+ * 플랜 노드에는 쓰지 않는다'는 원칙의 적용.
+ * [지적 X3-09]
+ * [지적 C2-01]
+ */
 static int
 qexec_execute_analytic (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
 			ANALYTIC_EVAL_TYPE * analytic_eval, QFILE_TUPLE_RECORD * tplrec, bool is_last,
@@ -22369,6 +21796,8 @@ qexec_execute_analytic (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * 
   TSCTIMEVAL tv_diff;
   bool on_trace = false;
   ANALYTIC_STATS *new_stat = NULL;
+  SORT_LIST *sort_list = analytic_eval->sort_list;	/* the sort list the functions run with */
+  ANALYTIC_STATE *initialized;
 
   on_trace = thread_is_on_trace (thread_p);
   if (on_trace)
@@ -22405,14 +21834,23 @@ qexec_execute_analytic (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * 
   /* fetch regulist and outlist */
   a_outptr_list = (is_last ? buildlist->a_outptr_list : buildlist->a_outptr_list_interm);
 
-  /* resolve late bindings in analytic sort list */
-  qexec_resolve_domains_on_sort_list (analytic_eval->sort_list, buildlist->a_outptr_list_ex->valptrp);
+  /* the analytic sort keys the compiler left variable: the plan's domains, in a copy the execution owns */
+  if (qexec_plan_sort_list_domains (thread_p, &xasl_state->vd, analytic_eval->sort_list, &sort_list) != NO_ERROR)
+    {
+      GOTO_EXIT_ON_ERROR;
+    }
 
   /* initialized analytic functions state structure */
-  if (qexec_initialize_analytic_state (thread_p, &analytic_state, analytic_eval->head, analytic_eval->sort_list,
-				       buildlist->a_regu_list, buildlist->a_val_list, a_outptr_list,
-				       buildlist->a_outptr_list_interm, is_skip_sort, is_last, xasl, xasl_state,
-				       &list_id->type_list, tplrec) == NULL)
+  initialized = qexec_initialize_analytic_state (thread_p, &analytic_state, analytic_eval->head, sort_list,
+						 buildlist->a_regu_list, buildlist->a_val_list, a_outptr_list,
+						 buildlist->a_outptr_list_interm, is_skip_sort, is_last, xasl,
+						 xasl_state, &list_id->type_list, tplrec);
+  /* the state's key information holds the keys' domains from here on */
+  if (sort_list != analytic_eval->sort_list)
+    {
+      qfile_free_sort_list (thread_p, sort_list);
+    }
+  if (initialized == NULL)
     {
       GOTO_EXIT_ON_ERROR;
     }
@@ -22445,7 +21883,8 @@ qexec_execute_analytic (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * 
     else
       {
 	/* open intermediate file */
-	if (qdata_get_valptr_type_list (thread_p, buildlist->a_outptr_list_interm, &interm_type_list) != NO_ERROR)
+	if (qdata_get_valptr_type_list (thread_p, buildlist->a_outptr_list_interm, &interm_type_list, &xasl_state->vd)
+	    != NO_ERROR)
 	  {
 	    GOTO_EXIT_ON_ERROR;
 	  }
@@ -22479,7 +21918,7 @@ qexec_execute_analytic (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * 
       }
 
     /* open output file */
-    if (qdata_get_valptr_type_list (thread_p, a_outptr_list, &output_type_list) != NO_ERROR)
+    if (qdata_get_valptr_type_list (thread_p, a_outptr_list, &output_type_list, &xasl_state->vd) != NO_ERROR)
       {
 	GOTO_EXIT_ON_ERROR;
       }
@@ -22698,6 +22137,15 @@ exit_on_error:
  *         - current_values and temp_values for storing and comparing sort key values
  *         are being initialized here.
  */
+/*
+ * [리뷰] qdata_setup_analytic_eval_list — mainblock_internal 이 분석 평가 리스트를 준비할 때 부른다 — 평가 리스트의 각 분석 함수를 초기화하고,
+ * 필요하면 함수별 order_list_id 를 연다.
+ * develop: qdata_initialize_analytic_func(…, xasl_state->query_id) 로 초기화하고, order_list_id 를 열 때 컬럼 도메인 domp[1]
+ * 에 a_func_list->domain(컴파일 도메인)을 그대로 넣었다.
+ * 이 PR: 초기화에 &xasl_state->vd 를 넘기고, domp[1] 은 qexec_analytic_value_domain (&xasl_state->vd, a_func_list) — 이
+ * 실행에서 함수가 가지는 도메인으로 리스트 컬럼을 만든다.
+ * 바뀐 것: 인자 추가 1곳 + 도메인 조회 교체 1곳(2줄).
+ */
 static int
 qdata_setup_analytic_eval_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state)
 {
@@ -22751,7 +22199,7 @@ qdata_setup_analytic_eval_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_
 
   for (a_func_list = a_eval_list->head; a_func_list; a_func_list = a_func_list->next)
     {
-      if (qdata_initialize_analytic_func (thread_p, a_func_list, xasl_state->query_id) != NO_ERROR)
+      if (qdata_initialize_analytic_func (thread_p, a_func_list, xasl_state->query_id, &xasl_state->vd) != NO_ERROR)
 	{
 	  return ER_FAILED;
 	}
@@ -22789,7 +22237,7 @@ qdata_setup_analytic_eval_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_
 	      return ER_FAILED;
 	    }
 	  value_type_list.domp[0] = &tp_Integer_domain;
-	  value_type_list.domp[1] = a_func_list->domain;
+	  value_type_list.domp[1] = qexec_analytic_value_domain (&xasl_state->vd, a_func_list);
 
 	  a_func_list->order_list_id =
 	    qfile_open_list (thread_p, &value_type_list, NULL, xasl_state->query_id, QFILE_FLAG_BACKWARD, NULL);
@@ -22806,11 +22254,43 @@ qdata_setup_analytic_eval_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_
 }
 
 /*
+ * qexec_analytic_value_domain () - the domain of the values an analytic function's finalization writes into its value
+ *   list: the function's domain in this execution, which the plan gives before any row (qexec_consumer_domain) - its
+ *   first binding (qdata_evaluate_analytic_func) takes the same one. The list's tuples are laid out by it, so no row
+ *   decides it; without a plan answer the column stays variable and takes only NULLs.
+ */
+/*
+ * [리뷰] qexec_analytic_value_domain — 분석 함수의 값 리스트 파일 컬럼 도메인을 주는 static 헬퍼 — qdata_setup_analytic_eval_list 와
+ * qexec_initialize_analytic_function_state 가 qfile_open_list 직전에 부른다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 은 두 호출부 모두 func_p->domain 을 그대로 썼다.
+ * 이 PR: qexec_get_node_domain 으로 실행 도메인(없으면 컴파일 도메인)을 구하고, 그것이 variable 이면 qexec_consumer_domain 이 주는 계획 도메인을
+ * 쓴다. 둘 다 없으면 컴파일 도메인을 돌려준다 — 행 없이 리스트 레이아웃을 정하는 자리다.
+ * 바뀐 것: 신설(+13줄 + 전방 선언 1줄).
+ */
+static TP_DOMAIN *
+qexec_analytic_value_domain (const VAL_DESCR * vd, const ANALYTIC_TYPE * func_p)
+{
+  TP_DOMAIN *compiled = qexec_get_node_domain (vd, func_p->domain, func_p->plan_item);
+  const TP_DOMAIN *domain = qexec_consumer_domain (vd, compiled, func_p->plan_item);
+  return domain != NULL ? (TP_DOMAIN *) domain : compiled;
+}
+
+/*
  * qexec_initialize_analytic_function_state () - initialize a function state
  *   returns: error code or NO_ERROR
  *   thread_p(in): thread entry
  *   func_state(in/out): function state
  *   func_p(in): function to initialize state for
+ */
+/*
+ * [리뷰] qexec_initialize_analytic_function_state — qexec_initialize_analytic_state 가 분석 함수 하나마다 부른다 —
+ * ANALYTIC_FUNCTION_STATE 를 채우고 current_key 버퍼와 값 리스트 파일을 연다.
+ * develop: func_state->func_p 만 등록했고, is_skip_sort 경로의 qdata_finalize_analytic_func(…, false) 에는 vd 가 없었으며, 값
+ * 리스트 컬럼 domp[1] 은 func_state->func_p->domain 이었다.
+ * 이 PR: func_state->vd = &xasl_state->vd 로 실행 descriptor 를 상태에 박아 둔다(이후
+ * qexec_analytic_sort_key_header_load·offset 평가가 이걸 쓴다). finalize 에 &xasl_state->vd 를 넘기고, domp[1] 은
+ * qexec_analytic_value_domain 으로 구한다.
+ * 바뀐 것: 구조체 필드 세팅 1줄 추가 + 인자 추가 1곳 + 도메인 조회 교체 1곳(+3줄). 실행 descriptor 를 함수 상태에 전달하는 통로가 생겼다.
  */
 static int
 qexec_initialize_analytic_function_state (THREAD_ENTRY * thread_p, ANALYTIC_FUNCTION_STATE * func_state,
@@ -22822,6 +22302,7 @@ qexec_initialize_analytic_function_state (THREAD_ENTRY * thread_p, ANALYTIC_FUNC
 
   /* register function */
   func_state->func_p = func_p;
+  func_state->vd = &xasl_state->vd;
 
   /* initialize function state */
   func_state->current_key.data = (char *) db_private_alloc (thread_p, DB_PAGESIZE);
@@ -22851,7 +22332,7 @@ qexec_initialize_analytic_function_state (THREAD_ENTRY * thread_p, ANALYTIC_FUNC
   if (is_skip_sort)
     {
       /* finalize function */
-      if (qdata_finalize_analytic_func (thread_p, func_p, false) != NO_ERROR)
+      if (qdata_finalize_analytic_func (thread_p, func_p, false, &xasl_state->vd) != NO_ERROR)
 	{
 	  return ER_FAILED;
 	}
@@ -22908,7 +22389,7 @@ qexec_initialize_analytic_function_state (THREAD_ENTRY * thread_p, ANALYTIC_FUNC
 	  return ER_FAILED;
 	}
       value_type_list.domp[0] = &tp_Integer_domain;
-      value_type_list.domp[1] = func_state->func_p->domain;
+      value_type_list.domp[1] = qexec_analytic_value_domain (&xasl_state->vd, func_p);
 
       func_state->value_list_id =
 	qfile_open_list (thread_p, &value_type_list, NULL, xasl_state->query_id, QFILE_FLAG_BACKWARD, NULL);
@@ -22936,6 +22417,69 @@ qexec_initialize_analytic_function_state (THREAD_ENTRY * thread_p, ANALYTIC_FUNC
 }
 
 /*
+ * qexec_plan_interpolation_sort_key () - the type the analytic sort compares the interpolation functions' string
+ *   operand in, resolved before the sort
+ *   analytic_state(in/out): the state whose sort keys it sets up
+ *   a_func_list(in): the state's functions
+ *   vd(in): the execution's value descriptor
+ *
+ * MEDIAN and PERCENTILE sort their operand after their PARTITION BY keys, one key the interpolation functions of a
+ * state share (pt_metadomains_compatible). A string operand sorts in the function's type, the type its values
+ * interpolate in: the compiled function domain (a string column or expression is DOUBLE), or the resolved domain - the
+ * type it gave a value argument, DOUBLE for a late-binding string - known before the first pair of values the sort
+ * compares (qfile_compare_with_interpolation_domain). A value argument resolve_domains could not type has no type,
+ * and the sort rejects its values as the typing of the first value does. A type over a session variable read is the
+ * one the variable's value gave when the execution started, for the whole statement: a value of another type converts
+ * to it or fails. Any other key of the state - another function's ORDER BY that shares the sort - compares in its own
+ * domain, the type its first value gives.
+ */
+/*
+ * [리뷰] qexec_plan_interpolation_sort_key — qexec_initialize_analytic_state 가 MEDIAN/PERCENTILE 이 있을 때 부르는
+ * static 헬퍼 — 보간 함수의 피연산자 정렬 키가 어느 도메인으로 비교될지 SUBKEY_INFO 에 써 둔다(반환 없음).
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 은 같은 자리에서 key_info.key 를 i=0..nkeys 로 돌며 i >=
+ * interpolation_func_sort_prefix_len 이고 col_dom 이 문자열이면 use_cmp_dom = true 만 세웠고 cmp_dom 은 건드리지 않았다.
+ * 이 PR: 보간 함수를 찾아 key[func_p->sort_prefix_size] 하나만 보고, 그 키가 문자열이면 use_cmp_dom = true, cmp_dom =
+ * tp_domain_resolve_default(해결된 도메인 타입), cmp_dom_session_read(세션변수 의존 여부)까지 채운 뒤 return 한다. 해결 도메인은 plan item
+ * 의 fixed.domain 이 비variable 이면 그것, 아니면 qexec_resolved_domain(vd, item).
+ * 바뀐 것: 신설(+34줄)로 develop 의 인라인 루프(-9줄)를 대체. 대상이 'prefix_len 이후의 모든 문자열 키' → 'prefix_size 위치의 키 하나' 로 좁아졌고
+ * cmp_dom 을 명시적으로 쓴다(PR Remarks 2 의 스펙 변경과 같은 방향).
+ */
+static void
+qexec_plan_interpolation_sort_key (ANALYTIC_STATE * analytic_state, ANALYTIC_TYPE * a_func_list, const VAL_DESCR * vd)
+{
+  for (ANALYTIC_TYPE * func_p = a_func_list; func_p != NULL; func_p = func_p->next)
+    {
+      if (!QPROC_IS_INTERPOLATION_FUNC (func_p) || func_p->sort_list_size <= func_p->sort_prefix_size)
+	{
+	  /* a constant operand is not sorted */
+	  continue;
+	}
+      if (func_p->sort_prefix_size >= analytic_state->key_info.nkeys)
+	{
+	  /* no sort keys to set up at or past nkeys */
+	  return;
+	}
+      SUBKEY_INFO *subkey = &analytic_state->key_info.key[func_p->sort_prefix_size];
+      if (!TP_IS_STRING_TYPE (TP_DOMAIN_TYPE (subkey->col_dom)))
+	{
+	  return;
+	}
+      const DOMAIN_PLAN_ITEM *item = func_p->plan_item;
+      const TP_DOMAIN *fixed = item != NULL ? item->fixed.domain : NULL;
+      const TP_DOMAIN *resolved_domain = fixed != NULL && TP_DOMAIN_TYPE (fixed) != DB_TYPE_VARIABLE
+	? fixed : qexec_resolved_domain (vd, item);
+      assert (resolved_domain == NULL || TP_IS_NUMERIC_TYPE (TP_DOMAIN_TYPE (resolved_domain))
+	      || TP_IS_DATE_OR_TIME_TYPE (TP_DOMAIN_TYPE (resolved_domain)));
+      subkey->use_cmp_dom = true;
+      subkey->cmp_dom = resolved_domain != NULL ? tp_domain_resolve_default (TP_DOMAIN_TYPE (resolved_domain)) : NULL;
+      subkey->cmp_dom_session_read = item != NULL && item->resolved_index >= 0 && vd->xasl_state != NULL
+	&& qexec_owns_resolved_index (vd->xasl_state->resolved_domain, item)
+	&& vd->xasl_state->resolved_domain.plan->resolved_session_dependent[item->resolved_index];
+      return;
+    }
+}
+
+/*
  * qexec_initialize_analytic_state () -
  *   return:
  *   analytic_state(in) :
@@ -22948,6 +22492,17 @@ qexec_initialize_analytic_function_state (THREAD_ENTRY * thread_p, ANALYTIC_FUNC
  *   type_list(in)      :
  *   tplrec(out) 	: Tuple record descriptor to store result tuples
  */
+/*
+ * [리뷰] qexec_initialize_analytic_state — qexec_execute_analytic 이 평가 단계마다 부른다 — ANALYTIC_STATE 를 채우고 정렬 키 정보를
+ * 만들며 a_regu_list 의 위치 참조 도메인을 확정하고, 성공하면 analytic_state 를 돌려준다(실패 NULL).
+ * develop: 보간 키는 함수 안의 루프로 직접 세웠고, resolve_domain: 라벨에서 a_regu_list 를 돌며 TYPE_POSITION 이면서 도메인이 VARIABLE 이거나
+ * collation flag 가 NORMAL 이 아니면 리스트 파일의 type_list->domp[pos] 를 pos_descr.dom 과 value.domain 양쪽에 써 넣었다 — 실행 중
+ * 플랜 노드 수정이다.
+ * 이 PR: 보간 키는 qexec_plan_interpolation_sort_key 에 위임한다. 위치 참조는 qexec_position_domain_is_variable 로 거른 뒤
+ * qexec_consumer_domain 으로 해석하고, 해석이 없으면 qexec_domain_unresolved(ER_QPROC_DOMAIN_UNRESOLVED, -1383)로 NULL 을
+ * 반환한다. 있으면 qexec_set_node_domain 으로 실행 도메인에만 기록하고 플랜 노드(value.domain·pos_descr.dom)는 건드리지 않는다.
+ * 바뀐 것: 지역변수 subkey 삭제, 보간 블록 위임, 위치 해석 로직 통째 교체 + 미해결 에러 경로 추가(약 -3줄, 로직은 전면 교체).
+ */
 static ANALYTIC_STATE *
 qexec_initialize_analytic_state (THREAD_ENTRY * thread_p, ANALYTIC_STATE * analytic_state, ANALYTIC_TYPE * a_func_list,
 				 SORT_LIST * sort_list, REGU_VARIABLE_LIST a_regu_list, VAL_LIST * a_val_list,
@@ -22958,7 +22513,6 @@ qexec_initialize_analytic_state (THREAD_ENTRY * thread_p, ANALYTIC_STATE * analy
   REGU_VARIABLE_LIST regu_list = NULL;
   ANALYTIC_TYPE *func_p;
   bool has_interpolation_func = false;
-  SUBKEY_INFO *subkey = NULL;
   int i;
   int interpolation_func_sort_prefix_len = 0;
 
@@ -23058,32 +22612,30 @@ qexec_initialize_analytic_state (THREAD_ENTRY * thread_p, ANALYTIC_STATE * analy
   /* set SUBKEY_INFO.cmp_dom */
   if (has_interpolation_func)
     {
-      for (i = 0, subkey = analytic_state->key_info.key; i < analytic_state->key_info.nkeys && subkey != NULL;
-	   ++i, ++subkey)
-	{
-	  if (i >= interpolation_func_sort_prefix_len && TP_IS_STRING_TYPE (TP_DOMAIN_TYPE (subkey->col_dom)))
-	    {
-	      subkey->use_cmp_dom = true;
-	    }
-	}
+      qexec_plan_interpolation_sort_key (analytic_state, a_func_list, &xasl_state->vd);
     }
 
 resolve_domain:
-  /* resolve domains in regulist */
+  /* a position the compiler left variable reads the column the plan resolved */
   for (regu_list = a_regu_list; regu_list; regu_list = regu_list->next)
     {
-      /* if it's position, resolve domain */
-      if (regu_list->value.type == TYPE_POSITION
-	  && (TP_DOMAIN_TYPE (regu_list->value.value.pos_descr.dom) == DB_TYPE_VARIABLE
-	      || TP_DOMAIN_COLLATION_FLAG (regu_list->value.value.pos_descr.dom) != TP_DOMAIN_COLL_NORMAL))
+      QFILE_TUPLE_VALUE_POSITION *pos_descr = &regu_list->value.value.pos_descr;
+      if (regu_list->value.type != TYPE_POSITION)
 	{
-	  int pos = regu_list->value.value.pos_descr.pos_no;
-	  if (pos <= type_list->type_cnt)
-	    {
-	      regu_list->value.value.pos_descr.dom = type_list->domp[pos];
-	      regu_list->value.domain = type_list->domp[pos];
-	    }
+	  continue;
 	}
+      if (!qexec_position_domain_is_variable (&xasl_state->vd, pos_descr->plan_item))
+	{
+	  continue;
+	}
+      const TP_DOMAIN *resolved = qexec_consumer_domain (&xasl_state->vd, NULL, regu_list->value.plan_item);
+      if (resolved == NULL)
+	{
+	  (void) qexec_domain_unresolved (&xasl_state->vd, regu_list->value.plan_item, pos_descr->dom);
+	  return NULL;
+	}
+      /* the position's value descriptor shares the regu's item and execution domain: one domain for both */
+      qexec_set_node_domain (&xasl_state->vd, regu_list->value.plan_item, NULL, resolved);
     }
 
   return analytic_state;
@@ -23400,6 +22952,13 @@ qexec_analytic_eval_instnum_pred (THREAD_ENTRY * thread_p, ANALYTIC_STATE * anal
  *   key(in):
  *   reinit(in):
  */
+/*
+ * [리뷰] qexec_analytic_start_group — 분석 정렬 콜백(qexec_analytic_put_next)이 새 그룹을 시작할 때 부른다 — 함수 상태를 리셋하고 누산기를
+ * 초기화한다.
+ * develop: qdata_initialize_analytic_func (thread_p, func_state->func_p, xasl_state->query_id).
+ * 이 PR: &xasl_state->vd 를 추가로 넘겨 초기화가 게이트의 도메인을 쓰게 한다.
+ * 바뀐 것: 인자 1개 추가(1줄).
+ */
 static int
 qexec_analytic_start_group (THREAD_ENTRY * thread_p, XASL_STATE * xasl_state, ANALYTIC_FUNCTION_STATE * func_state,
 			    const RECDES * key, bool reinit)
@@ -23438,7 +22997,7 @@ qexec_analytic_start_group (THREAD_ENTRY * thread_p, XASL_STATE * xasl_state, AN
   if (reinit)
     {
       /* starting a new group */
-      error = qdata_initialize_analytic_func (thread_p, func_state->func_p, xasl_state->query_id);
+      error = qdata_initialize_analytic_func (thread_p, func_state->func_p, xasl_state->query_id, &xasl_state->vd);
       if (error != NO_ERROR)
 	{
 	  GOTO_EXIT_ON_ERROR;
@@ -23498,6 +23057,12 @@ qexec_add_intval_tuple (THREAD_ENTRY * thread_p, QFILE_LIST_ID * list_id, int v1
  *   func_state(in): function state
  *   is_same_group(in): true if we're finalizing a sort key, false if a group
  */
+/*
+ * [리뷰] qexec_analytic_finalize_group — qexec_analytic_put_next 가 그룹 경계에서 부른다 — 분석 함수를 마감해 값 리스트 파일에 결과를 쓴다.
+ * develop: qdata_finalize_analytic_func (thread_p, func_state->func_p, is_same_group).
+ * 이 PR: &xasl_state->vd 를 추가로 넘긴다 — 마감 결과가 쓰이는 값 리스트의 컬럼 도메인과 같은 결정을 보게 한다.
+ * 바뀐 것: 인자 1개 추가(1줄).
+ */
 static int
 qexec_analytic_finalize_group (THREAD_ENTRY * thread_p, XASL_STATE * xasl_state, ANALYTIC_FUNCTION_STATE * func_state,
 			       bool is_same_group)
@@ -23505,7 +23070,7 @@ qexec_analytic_finalize_group (THREAD_ENTRY * thread_p, XASL_STATE * xasl_state,
   int rc = NO_ERROR;
 
   /* finalize function */
-  if (qdata_finalize_analytic_func (thread_p, func_state->func_p, is_same_group) != NO_ERROR)
+  if (qdata_finalize_analytic_func (thread_p, func_state->func_p, is_same_group, &xasl_state->vd) != NO_ERROR)
     {
       rc = ER_FAILED;
       goto cleanup;
@@ -23771,6 +23336,15 @@ qexec_analytic_evaluate_ntile_function (THREAD_ENTRY * thread_p, ANALYTIC_FUNCTI
  *   val_desc(in): value descriptor
  *   tuple_idx(in): current position of main scan in group
  */
+/*
+ * [리뷰] qexec_analytic_evaluate_offset_function — qexec_analytic_update_group_result 가 LEAD/LAG/NTH_VALUE 를 계산할
+ * 때 부른다 — 오프셋 위치의 튜플을 읽어 함수 값을 채우고 NO_ERROR/ER_FAILED 를 돌려준다.
+ * develop: 윈도 밖이라 default 값을 넣을 때 func_p->domain(컴파일 도메인)으로 tp_value_coerce 했고, 실패 시 같은 도메인으로
+ * tp_domain_status_er_set 했다.
+ * 이 PR: func_state->vd 로 qexec_get_node_domain(…, func_p->domain, func_p->plan_item) 을 구해 지역변수에 받고, coerce 와
+ * 에러 보고 모두 그 도메인을 쓴다. 늦은 바인딩 피연산자면 default 가 게이트가 정한 타입으로 변환된다.
+ * 바뀐 것: 지역 도메인 변수 도입 + 호출 2곳 교체(+2줄).
+ */
 static int
 qexec_analytic_evaluate_offset_function (THREAD_ENTRY * thread_p, ANALYTIC_FUNCTION_STATE * func_state,
 					 ANALYTIC_STATE * analytic_state)
@@ -23960,10 +23534,11 @@ qexec_analytic_evaluate_offset_function (THREAD_ENTRY * thread_p, ANALYTIC_FUNCT
   if (put_default)
     {
       /* coerce value to default domain */
-      dom_status = tp_value_coerce (default_val_p, &default_val, func_p->domain);
+      TP_DOMAIN *domain = qexec_get_node_domain (func_state->vd, func_p->domain, func_p->plan_item);
+      dom_status = tp_value_coerce (default_val_p, &default_val, domain);
       if (dom_status != DOMAIN_COMPATIBLE)
 	{
-	  error = tp_domain_status_er_set (dom_status, ARG_FILE_LINE, default_val_p, func_p->domain);
+	  error = tp_domain_status_er_set (dom_status, ARG_FILE_LINE, default_val_p, domain);
 	  if (error == NO_ERROR)
 	    {
 	      return ER_FAILED;
@@ -24031,8 +23606,19 @@ qexec_analytic_evaluate_cume_dist_percent_rank_function (THREAD_ENTRY * thread_p
  *   analytic_state(in): analytic state
  *   tuple_idx(in): current position of main scan in group
  */
+/*
+ * [리뷰] qexec_analytic_evaluate_interpolation_function — qexec_analytic_update_group_result 가
+ * MEDIAN/PERCENTILE_CONT/DISC 값을 계산할 때 부른다 — 정렬된 값 리스트에서 보간 위치의 값(들)을 읽어 함수 값을 만든다.
+ * develop: vd 매개변수가 없어 percentile 비율 reguvar 를 fetch_peek_dbval(…, NULL, …) 로 꺼냈다. 보간 결과 도메인은 &func_p->domain
+ * 을 직접 넘겨 qdata_apply_interpolation_function_coercion / qdata_interpolation_function_values 가 플랜 노드의 도메인 필드를
+ * 제자리에서 갱신했다.
+ * 이 PR: VAL_DESCR *vd 를 매개변수로 받는다. 비율 reguvar 를 vd 로 peek 해 게이트가 정한 상수 값을 읽고, 도메인은 qexec_get_node_domain 으로
+ * 지역변수에 받아 넘긴 뒤 결과를 qexec_set_node_domain 으로 실행 도메인에만 기록한다 — 플랜 노드는 그대로다.
+ * 바뀐 것: 시그니처 +1 인자, 플랜 노드 쓰기 → 실행 상태 쓰기로 교체 2곳, NULL vd peek 을 실행 descriptor peek 으로 교체(+5줄).
+ */
 static int
-qexec_analytic_evaluate_interpolation_function (THREAD_ENTRY * thread_p, ANALYTIC_FUNCTION_STATE * func_state)
+qexec_analytic_evaluate_interpolation_function (THREAD_ENTRY * thread_p, ANALYTIC_FUNCTION_STATE * func_state,
+						VAL_DESCR * vd)
 {
   ANALYTIC_TYPE *func_p = NULL;
   double f_row_num_d, c_row_num_d, row_num_d, percentile_d;
@@ -24069,8 +23655,9 @@ qexec_analytic_evaluate_interpolation_function (THREAD_ENTRY * thread_p, ANALYTI
     }
   else
     {
+      /* the execution's descriptor: a constant ratio reads resolve_domains' value */
       error =
-	fetch_peek_dbval (thread_p, func_p->info.percentile.percentile_reguvar, NULL, NULL, NULL, NULL, &peek_value_p);
+	fetch_peek_dbval (thread_p, func_p->info.percentile.percentile_reguvar, vd, NULL, NULL, NULL, &peek_value_p);
       if (error != NO_ERROR)
 	{
 	  assert (er_errid () != NO_ERROR);
@@ -24110,13 +23697,14 @@ qexec_analytic_evaluate_interpolation_function (THREAD_ENTRY * thread_p, ANALYTI
 	  return ER_FAILED;
 	}
 
-      /* coerce accordingly */
-      error =
-	qdata_apply_interpolation_function_coercion (func_p->value, &func_p->domain, func_p->value, func_p->function);
+      /* coerce accordingly: the function takes the domain the coercion gives as its execution domain */
+      TP_DOMAIN *domain = qexec_get_node_domain (vd, func_p->domain, func_p->plan_item);
+      error = qdata_apply_interpolation_function_coercion (func_p->value, &domain, func_p->value, func_p->function);
       if (error != NO_ERROR)
 	{
 	  return error;
 	}
+      qexec_set_node_domain (vd, func_p->plan_item, func_p->domain, domain);
     }
   else
     {
@@ -24143,13 +23731,15 @@ qexec_analytic_evaluate_interpolation_function (THREAD_ENTRY * thread_p, ANALYTI
 	}
 
       pr_clear_value (func_p->value);
+      TP_DOMAIN *domain = qexec_get_node_domain (vd, func_p->domain, func_p->plan_item);
       error =
-	qdata_interpolation_function_values (&f_value, &c_value, row_num_d, f_row_num_d, c_row_num_d, &func_p->domain,
+	qdata_interpolation_function_values (&f_value, &c_value, row_num_d, f_row_num_d, c_row_num_d, &domain,
 					     func_p->value, func_p->function);
       if (error != NO_ERROR)
 	{
 	  return error;
 	}
+      qexec_set_node_domain (vd, func_p->plan_item, func_p->domain, domain);
     }
 
   /* all ok */
@@ -24201,6 +23791,13 @@ qexec_analytic_group_header_load (ANALYTIC_FUNCTION_STATE * func_state)
  * NOTE: if repeated often, loading the actual value can be expensive, so make
  * sure you only set load_value when necessary.
  */
+/*
+ * [리뷰] qexec_analytic_sort_key_header_load — 분석 그룹 결과 갱신 경로에서 값 리스트 파일의 한 슬롯을 읽어 func_p->value 로 역직렬화한다 — 행당
+ * 호출.
+ * develop: qfile_slot_read_column_value (…, func_state->func_p->domain, …) — 컴파일 도메인으로 읽었다.
+ * 이 PR: func_state->vd 로 qexec_get_node_domain(…, func_p->domain, func_p->plan_item) 을 구해 그 도메인으로 읽는다.
+ * 바뀐 것: 도메인 조회 교체(+1줄, 지역변수 1개).
+ */
 static int
 qexec_analytic_sort_key_header_load (ANALYTIC_FUNCTION_STATE * func_state, bool load_value)
 {
@@ -24227,10 +23824,10 @@ qexec_analytic_sort_key_header_load (ANALYTIC_FUNCTION_STATE * func_state, bool 
   /* clear current value */
   pr_clear_value (func_state->func_p->value);
 
-  /* deserialize value */
-  rc =
-    qfile_slot_read_column_value (&func_state->value_tplrec, 1, func_state->func_p->domain, func_state->func_p->value,
-				  false, &is_null);
+  /* deserialize value: the function's domain in this execution, which its first binding took */
+  TP_DOMAIN *domain = qexec_get_node_domain (func_state->vd, func_state->func_p->domain,
+					     func_state->func_p->plan_item);
+  rc = qfile_slot_read_column_value (&func_state->value_tplrec, 1, domain, func_state->func_p->value, false, &is_null);
   if (rc != NO_ERROR)
     {
       return ER_FAILED;
@@ -24479,6 +24076,14 @@ qexec_analytic_group_header_next (THREAD_ENTRY * thread_p, ANALYTIC_FUNCTION_STA
  *   Note: Scan the last group from intermediary file and add up to date
  *         analytic result into output file
  */
+/*
+ * [리뷰] qexec_analytic_update_group_result — qexec_execute_analytic 이 한 그룹을 다 읽은 뒤 부른다 — 그룹 행들을 다시 훑어 각 튜플에 분석
+ * 함수 값을 채워 출력 리스트에 쓴다.
+ * develop: PT_MEDIAN/PT_PERCENTILE_CONT/PT_PERCENTILE_DISC 분기에서 qexec_analytic_evaluate_interpolation_function
+ * (thread_p, func_state) 를 불렀다.
+ * 이 PR: &xasl_state->vd 를 추가로 넘긴다 — 보간 평가가 실행 descriptor 를 받게 하는 호출부 반영.
+ * 바뀐 것: 인자 1개 추가(1줄).
+ */
 static int
 qexec_analytic_update_group_result (THREAD_ENTRY * thread_p, ANALYTIC_STATE * analytic_state)
 {
@@ -24692,7 +24297,7 @@ qexec_analytic_update_group_result (THREAD_ENTRY * thread_p, ANALYTIC_STATE * an
 	    case PT_MEDIAN:
 	    case PT_PERCENTILE_CONT:
 	    case PT_PERCENTILE_DISC:
-	      rc = qexec_analytic_evaluate_interpolation_function (thread_p, func_state);
+	      rc = qexec_analytic_evaluate_interpolation_function (thread_p, func_state, &xasl_state->vd);
 	      if (rc != NO_ERROR)
 		{
 		  goto cleanup;
@@ -24771,6 +24376,14 @@ cleanup:
  *   thread_p (in) : thread pointer
  *   xasl (in) : xasl tree
  *   xasl_state (in) : xasl state
+ */
+/*
+ * [리뷰] qexec_analytic_eval_in_processing — qexec_intprt_fnc / qexec_end_one_iteration 이 스캔 도중 부른다 — 정렬 없이 처리
+ * 가능한 분석 함수를 행 단위로 누적하고 그룹 경계에서 마감·재초기화한다.
+ * develop: qdata_finalize_analytic_func(…, is_same_group) 와 qdata_initialize_analytic_func(…, query_id) 를 vd
+ * 없이 불렀다.
+ * 이 PR: 두 호출 모두 &xasl_state->vd 를 추가로 넘긴다.
+ * 바뀐 것: 인자 추가 2곳(+1줄).
  */
 static int
 qexec_analytic_eval_in_processing (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state)
@@ -24852,7 +24465,7 @@ qexec_analytic_eval_in_processing (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XA
 		}
 	    }
 
-	  if (qdata_finalize_analytic_func (thread_p, a_func_list, is_same_group) != NO_ERROR)
+	  if (qdata_finalize_analytic_func (thread_p, a_func_list, is_same_group, &xasl_state->vd) != NO_ERROR)
 	    {
 	      return ER_FAILED;
 	    }
@@ -24878,7 +24491,8 @@ qexec_analytic_eval_in_processing (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XA
 		}
 
 	      pr_clear_value (a_func_list->value);
-	      if (qdata_initialize_analytic_func (thread_p, a_func_list, xasl_state->query_id) != NO_ERROR)
+	      if (qdata_initialize_analytic_func (thread_p, a_func_list, xasl_state->query_id,
+						  &xasl_state->vd) != NO_ERROR)
 		{
 		  return ER_FAILED;
 		}
@@ -27179,6 +26793,14 @@ error_return:
  * is_scan_needed (in/out) : whether or not scan is still needed after
  *			     evaluation
  */
+/*
+ * [리뷰] qexec_evaluate_partition_aggregates — qexec_evaluate_aggregates_optimize 가 파티션 테이블의 MIN/MAX/COUNT 를
+ * 인덱스로 바로 구할 수 있을 때 부른다 — 파티션 계층을 돌며 집계를 평가하고, 실패하면 agg_optimized 를 꺼 일반 경로로 되돌린다.
+ * develop: qdata_evaluate_aggregate_hierarchy (thread_p, agg_ptr, hfid, &root_btid, &helpers[i]) — vd 인자가 없었다.
+ * 이 PR: 마지막 인자로 NULL 을 넘긴다. 호출된 쪽은 qexec_get_node_domain(vd=NULL, …) 가 -1 을 돌려주어 컴파일 도메인을 쓰게 되고, 주석은 '최적화된 집계는
+ * 컬럼만 읽으므로 읽을 실행 도메인이 없다'고 적는다.
+ * 바뀐 것: 인자 1개(NULL) 추가(+2줄).
+ */
 static int
 qexec_evaluate_partition_aggregates (THREAD_ENTRY * thread_p, ACCESS_SPEC_TYPE * spec, AGGREGATE_TYPE * agg_list,
 				     bool * is_scan_needed)
@@ -27209,7 +26831,9 @@ qexec_evaluate_partition_aggregates (THREAD_ENTRY * thread_p, ACCESS_SPEC_TYPE *
 	  continue;
 	}
       BTID_COPY (&root_btid, &agg_ptr->btid);
-      error = qdata_evaluate_aggregate_hierarchy (thread_p, agg_ptr, &ACCESS_SPEC_HFID (spec), &root_btid, &helpers[i]);
+      /* an optimized aggregate reads a column: its domain is the compiled one, no execution domain to read */
+      error = qdata_evaluate_aggregate_hierarchy (thread_p, agg_ptr, &ACCESS_SPEC_HFID (spec), &root_btid, &helpers[i],
+						  NULL);
       if (error != NO_ERROR)
 	{
 	  agg_ptr->flag.agg_optimized = false;
@@ -27470,11 +27094,59 @@ qexec_evaluate_aggregates_optimize (THREAD_ENTRY * thread_p, AGGREGATE_TYPE * ag
 }
 
 /*
+ * qexec_topn_sort_domains () - the domain each top-n sort key compares in, read once before the heap is filled
+ *   vd(in): the execution's value descriptor
+ *   sort_items(in): the ORDER BY list
+ *   domains(out): one per sort item
+ *
+ * A key the compiler left variable (`ORDER BY val + ?`, a string whose collation its values give) reads the domain the
+ * resolve_domains resolved for its column; the values compare with that domain's cmpval, as a compiled key's do,
+ * a key over a session variable read too. A NULL-only column compares its NULLs before any domain is
+ * read.
+ */
+/*
+ * [리뷰] qexec_topn_sort_domains — qexec_setup_topn_proc 이 top-N 힙을 만들기 전에 한 번 부르는 static 헬퍼 — ORDER BY 키마다 비교에
+ * 쓸 도메인을 배열(domains)에 채운다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 은 이 결정을 비교 때마다(qexec_topn_cmpval 안에서) 했다.
+ * 이 PR: 키 도메인이 variable 이면 qexec_plan_domain 으로, 그것도 없으면 qexec_null_bind_domain 으로 계획의 도메인을 한 번 읽어 둔다. 끝까지 없으면
+ * NULL 로 남고, 비교는 tp_value_compare 로 떨어진다.
+ * 바뀐 것: 신설(+29줄). 행마다 하던 도메인 판정을 셋업 1회로 끌어올린 자리다.
+ */
+static void
+qexec_topn_sort_domains (const VAL_DESCR * vd, SORT_LIST * sort_items, const TP_DOMAIN ** domains)
+{
+  int i = 0;
+  for (SORT_LIST * key = sort_items; key != NULL; key = key->next, i++)
+    {
+      const TP_DOMAIN *domain = key->pos_descr.dom;
+      if (domain_is_variable (domain))
+	{
+	  domain = qexec_plan_domain (vd, key->pos_descr.plan_item);
+	  if (domain == NULL)
+	    {
+	      domain = qexec_null_bind_domain (vd, key->pos_descr.plan_item);
+	    }
+	}
+      domains[i] = domain;
+    }
+}
+
+/*
  * qexec_setup_topn_proc () - setup a top-n object
  * return : error code or NO_ERROR
  * thread_p (in) :
  * xasl (in) :
  * vd (in) :
+ */
+/*
+ * [리뷰] qexec_setup_topn_proc — ORDER BY … LIMIT 를 힙으로 처리할 수 있는지 판정하고 TOPN_TUPLES 를 할당해 xasl->topn_items 에 건다 —
+ * mainblock_internal 과 PX 스캔의 result_handler::write_initialize 가 부른다.
+ * develop: outptr_list 의 각 value.domain 을 직접 보고 NULL/집합타입/부동정밀도 판정과 메모리 추정을 했고, top_n 은 sizeof(TOPN_TUPLES)
+ * 만큼만 db_private_alloc 했다.
+ * 이 PR: 도메인을 qexec_get_node_domain (vd, value.domain, value.plan_item) 으로 구해 같은 판정을 한다. orderby_list 길이만큼
+ * TP_DOMAIN* 공간을 뒤에 붙여 한 블록으로 할당하고 top_n->sort_domains 를 그 꼬리에 가리킨 뒤 qexec_topn_sort_domains 로 채운다.
+ * top_n->sort_items = xasl->orderby_list 이므로 배열 인덱스가 키 순서와 일치한다.
+ * 바뀐 것: 도메인 조회 교체 3곳 + 가변길이 단일 할당·배열 초기화 추가(+10줄). 한 블록이라 기존 top_n 해제 경로가 도메인 배열도 같이 해제한다.
  */
 int
 qexec_setup_topn_proc (THREAD_ENTRY * thread_p, XASL_NODE * xasl, VAL_DESCR * vd)
@@ -27555,12 +27227,13 @@ qexec_setup_topn_proc (THREAD_ENTRY * thread_p, XASL_NODE * xasl, VAL_DESCR * vd
   var_list = xasl->outptr_list->valptrp;
   while (var_list)
     {
-      if (var_list->value.domain == NULL)
+      const TP_DOMAIN *var_domain = qexec_get_node_domain (vd, var_list->value.domain, var_list->value.plan_item);
+      if (var_domain == NULL)
 	{
 	  /* probably an error but just abandon top-n */
 	  return NO_ERROR;
 	}
-      if (TP_IS_SET_TYPE (TP_DOMAIN_TYPE (var_list->value.domain)))
+      if (TP_IS_SET_TYPE (TP_DOMAIN_TYPE (var_domain)))
 	{
 	  /* do not apply this to collections */
 	  return NO_ERROR;
@@ -27572,11 +27245,11 @@ qexec_setup_topn_proc (THREAD_ENTRY * thread_p, XASL_NODE * xasl, VAL_DESCR * vd
 	  continue;
 	}
 
-      if (var_list->value.domain->precision != TP_FLOATING_PRECISION_VALUE)
+      if (var_domain->precision != TP_FLOATING_PRECISION_VALUE)
 	{
 	  /* Ignore floating point precision domains for now. We will decide whether or not to continue with top-N
 	   * whenever we add/replace a tuple. */
-	  estimated_size += tp_domain_memory_size (var_list->value.domain);
+	  estimated_size += tp_domain_memory_size ((TP_DOMAIN *) var_domain);
 	}
       count++;
       var_list = var_list->next;
@@ -27599,12 +27272,21 @@ qexec_setup_topn_proc (THREAD_ENTRY * thread_p, XASL_NODE * xasl, VAL_DESCR * vd
     }
 
 
-  top_n = (TOPN_TUPLES *) db_private_alloc (thread_p, sizeof (TOPN_TUPLES));
+  int n_sort_items;
+  n_sort_items = 0;
+  for (SORT_LIST * key = xasl->orderby_list; key != NULL; key = key->next)
+    {
+      n_sort_items++;
+    }
+  /* the sort domains live in the same block, so every path that frees top_n frees them */
+  top_n = (TOPN_TUPLES *) db_private_alloc (thread_p, sizeof (TOPN_TUPLES) + n_sort_items * sizeof (TP_DOMAIN *));
   if (top_n == NULL)
     {
       error = ER_FAILED;
       goto error_return;
     }
+  top_n->sort_domains = (const TP_DOMAIN **) (top_n + 1);
+  qexec_topn_sort_domains (vd, xasl->orderby_list, top_n->sort_domains);
 
   top_n->max_size = max_size;
   top_n->total_size = 0;
@@ -27656,6 +27338,12 @@ error_return:
  * right (in) :
  * arg (in) :
  */
+/*
+ * [리뷰] qexec_topn_compare — top-N 이진 힙의 비교 콜백 — 두 TOPN_TUPLE 을 ORDER BY 키 순서로 비교해 BH_CMP_RESULT 를 돌려준다.
+ * develop: proc->sort_items 를 돌며 qexec_topn_cmpval (left, right, key) 를 불렀고, 도메인 판정은 피호출자가 했다.
+ * 이 PR: 루프에 인덱스 i 를 더해 proc->sort_domains[i] 를 같이 넘긴다 — 셋업 때 정해진 도메인을 그대로 쓴다.
+ * 바뀐 것: 인자 1개 추가 + 인덱스 변수(+1줄). 힙 비교 핫패스.
+ */
 static BH_CMP_RESULT
 qexec_topn_compare (const void *left, const void *right, BH_CMP_ARG arg)
 {
@@ -27666,10 +27354,11 @@ qexec_topn_compare (const void *left, const void *right, BH_CMP_ARG arg)
   TOPN_TUPLE *right_tuple = *((TOPN_TUPLE **) right);
   BH_CMP_RESULT cmp;
 
-  for (key = proc->sort_items; key != NULL; key = key->next)
+  int i = 0;
+  for (key = proc->sort_items; key != NULL; key = key->next, i++)
     {
       pos = key->pos_descr.pos_no;
-      cmp = qexec_topn_cmpval (&left_tuple->values[pos], &right_tuple->values[pos], key);
+      cmp = qexec_topn_cmpval (&left_tuple->values[pos], &right_tuple->values[pos], key, proc->sort_domains[i]);
       if (cmp == BH_EQ)
 	{
 	  continue;
@@ -27689,8 +27378,17 @@ qexec_topn_compare (const void *left, const void *right, BH_CMP_ARG arg)
  *
  * Note: tp_value_compare is too complex for our case
  */
+/*
+ * [리뷰] qexec_topn_cmpval — top-N 키 하나의 값 두 개를 비교해 BH_CMP_RESULT 를 돌려주는 행당 비교 함수 — qexec_topn_compare 와
+ * qexec_add_tuple_to_topn 이 부른다.
+ * develop: 비교할 때마다 sort_spec->pos_descr.dom 의 타입이 DB_TYPE_VARIABLE 인지, collation flag 가 TP_DOMAIN_COLL_NORMAL
+ * 이 아닌지 검사해 그러면 tp_value_compare, 아니면 dom->type->cmpval 로 갈라졌다.
+ * 이 PR: 도메인을 인자로 받는다. domain == NULL 이면 tp_value_compare, 아니면 domain->type->cmpval (…, domain->collation_id).
+ * 결정은 qexec_topn_sort_domains 가 미리 해 두었다.
+ * 바뀐 것: 시그니처 +1 인자, 행당 두 번의 도메인 플래그 검사를 포인터 NULL 검사 하나로 교체(-2줄).
+ */
 static BH_CMP_RESULT
-qexec_topn_cmpval (DB_VALUE * left, DB_VALUE * right, SORT_LIST * sort_spec)
+qexec_topn_cmpval (DB_VALUE * left, DB_VALUE * right, SORT_LIST * sort_spec, const TP_DOMAIN * domain)
 {
   int cmp;
   if (DB_IS_NULL (left))
@@ -27717,16 +27415,14 @@ qexec_topn_cmpval (DB_VALUE * left, DB_VALUE * right, SORT_LIST * sort_spec)
     }
   else
     {
-      if (TP_DOMAIN_TYPE (sort_spec->pos_descr.dom) == DB_TYPE_VARIABLE
-	  || TP_DOMAIN_COLLATION_FLAG (sort_spec->pos_descr.dom) != TP_DOMAIN_COLL_NORMAL)
+      if (domain == NULL)
 	{
-	  /* In cases like order by val + ?, the domain of the expression is not known at compile time */
+	  /* a key the plan gives no domain here (qexec_topn_sort_domains): its values' types resolve */
 	  cmp = tp_value_compare (left, right, 1, 1);
 	}
       else
 	{
-	  cmp =
-	    sort_spec->pos_descr.dom->type->cmpval (left, right, 1, 1, NULL, sort_spec->pos_descr.dom->collation_id);
+	  cmp = domain->type->cmpval (left, right, 1, 1, NULL, domain->collation_id);
 	}
     }
   if (sort_spec->s_order == S_DESC)
@@ -27762,6 +27458,14 @@ qexec_topn_cmpval (DB_VALUE * left, DB_VALUE * right, SORT_LIST * sort_spec)
  *
  * Note: We only add a tuple here if the top-n heap has fewer than n elements
  *  or if the new tuple can replace one of the existing tuples
+ */
+/*
+ * [리뷰] qexec_add_tuple_to_topn — 스캔이 만든 튜플을 top-N 힙에 넣을지 판정해 넣거나 버린다 — qexec_end_one_iteration 과 PX
+ * result_handler::write 가 부르는 행당 함수.
+ * develop: topn_items->sort_items 를 돌며 qexec_topn_cmpval (&heap_max->values[pos], tpldescr->f_valp[pos], key)
+ * 로 힙 최대값과 비교했다.
+ * 이 PR: 루프에 인덱스 i 를 더해 topn_items->sort_domains[i] 를 같이 넘긴다.
+ * 바뀐 것: 인자 1개 추가 + 인덱스 변수(+1줄).
  */
 TOPN_STATUS
 qexec_add_tuple_to_topn (THREAD_ENTRY * thread_p, TOPN_TUPLES * topn_items, QFILE_TUPLE_DESCRIPTOR * tpldescr)
@@ -27813,10 +27517,11 @@ qexec_add_tuple_to_topn (THREAD_ENTRY * thread_p, TOPN_TUPLES * topn_items, QFIL
     }
   assert (heap_max != NULL);
 
-  for (key = topn_items->sort_items; key != NULL; key = key->next)
+  int i = 0;
+  for (key = topn_items->sort_items; key != NULL; key = key->next, i++)
     {
       pos = key->pos_descr.pos_no;
-      res = qexec_topn_cmpval (&heap_max->values[pos], tpldescr->f_valp[pos], key);
+      res = qexec_topn_cmpval (&heap_max->values[pos], tpldescr->f_valp[pos], key, topn_items->sort_domains[i]);
       if (res == BH_EQ)
 	{
 	  continue;
@@ -28092,6 +27797,18 @@ qexec_clear_topn_tuple (THREAD_ENTRY * thread_p, TOPN_TUPLE * tuple, int count)
  * vd (in)	   : value descriptor
  * ubound (in/out) : upper bound
  */
+/*
+ * [리뷰] qexec_get_orderbynum_upper_bound — qexec_setup_topn_proc 가 TOP-N 처리를 켤지 정하려고 부르는 함수로, orderby_num
+ * 술어(AND 트리와 비교항)를 재귀로 훑어 이번 실행의 상한값을 ubound 에 담아 돌려준다.
+ * develop: AND 양쪽 상한을 재귀로 구한 뒤 tp_value_compare (&left_bound, &right_bound, 1, 1) 로 큰 쪽을 골랐고, R_LT 이면
+ * qdata_subtract_dbval (val, &one_val, ubound, rhs->domain) 로 컴파일 도메인에 맞춰 1 을 뺐다 — 뺄셈 피연산자의 타입 맞추기는
+ * qdata_subtract_dbval 안에서 행 시점에 일어났다.
+ * 이 PR: 비교는 키 쌍 표를 쓰는 domain_compare_by_type_pair (&left_bound, &right_bound, 1, 1, NULL) 로 바뀌었고, R_LT 경로는 두
+ * 피연산자 타입으로 domain_resolve_operand_coercion (T_SUB, operands, &operand_coercion) 을 한 번 돌려 얻은
+ * conv·operand_domain 을 qdata_coerce_arith_operands 에 넘긴다. 결과 도메인도 qexec_get_node_domain (vd, rhs->domain,
+ * rhs->plan_item) 으로 이번 실행이 확정한 것을 읽는다.
+ * 바뀐 것: 호출 2개 교체 + 피연산자 coercion 해석 블록 삽입(약 +12줄). 시그니처·분기 구조는 그대로.
+ */
 static int
 qexec_get_orderbynum_upper_bound (THREAD_ENTRY * thread_p, PRED_EXPR * pred, VAL_DESCR * vd, DB_VALUE * ubound)
 {
@@ -28129,7 +27846,9 @@ qexec_get_orderbynum_upper_bound (THREAD_ENTRY * thread_p, PRED_EXPR * pred, VAL
 	  goto cleanup;
 	}
 
-      cmp = tp_value_compare (&left_bound, &right_bound, 1, 1);
+      /* a bound has its term's type and an AND keeps the smaller one, so only the values know the keys: the key pair
+       * table's comparison of the two bounds */
+      cmp = domain_compare_by_type_pair (&left_bound, &right_bound, 1, 1, NULL);
       if (cmp == DB_GT)
 	{
 	  error = pr_clone_value (&left_bound, ubound);
@@ -28205,10 +27924,18 @@ qexec_get_orderbynum_upper_bound (THREAD_ENTRY * thread_p, PRED_EXPR * pred, VAL
 
       if (op == R_LT)
 	{
-	  /* add 1 so we can use R_LE */
+	  /* add 1 so we can use R_LE, after the subtraction's operand coercion for the bound's type - a string as
+	   * DOUBLE - resolved once for this execution's bound */
 	  DB_VALUE one_val;
 	  db_make_int (&one_val, 1);
-	  error = qdata_subtract_dbval (val, &one_val, ubound, rhs->domain);
+	  const DOMAIN_OPERAND operands[2] = {
+	    {NULL, DB_VALUE_DOMAIN_TYPE (val), -1, false}, {NULL, DB_TYPE_INTEGER, -1, false}
+	  };
+	  DOMAIN_OPERAND_COERCION operand_coercion;
+	  domain_resolve_operand_coercion (T_SUB, operands, &operand_coercion);
+	  error =
+	    qdata_coerce_arith_operands (T_SUB, operand_coercion.conv, operand_coercion.operand_domain, val,
+					 &one_val, ubound, qexec_get_node_domain (vd, rhs->domain, rhs->plan_item));
 	}
       else
 	{
@@ -28401,6 +28128,17 @@ qexec_alloc_agg_hash_context_buildlist_xasl (THREAD_ENTRY * thread_p, xasl_node 
  *   proc(in): buildlist
  *   xasl_state(in): XASL state
  */
+/*
+ * [리뷰] qexec_alloc_agg_hash_context — 해시 GROUP BY 를 켤 때 qexec_initialize_groupby_state 가 부르는 준비 함수 — 해시 테이블,
+ * 부분/정렬 리스트 파일, 정렬 키, 키 도메인 배열을 만들어 proc->agg_hash_context 에 채우고 NO_ERROR 를 돌려준다.
+ * develop: key_domains[i] 와 type_list.domp[] 에 regu 의 컴파일 도메인(regu_list->value.domain)을 그대로 넣었다. sort_key 는
+ * key/nkeys 두 필드를 직접 NULL/0 으로 놓았고, 두 부분 리스트의 tpl_descr.f_valp 는 malloc (sizeof (DB_VALUE) * type_cnt) 로 직접 잡고
+ * OOM 에러도 직접 set 했다(포인터 배열을 DB_VALUE 크기로 잡는 과대할당, f_len 은 없었다).
+ * 이 PR: 두 도메인 배열 모두 qexec_get_node_domain (&xasl_state->vd, …, plan_item) 으로 이번 실행이 확정한 도메인을 읽는다. 초기화·할당은 공용
+ * 헬퍼로 — qfile_init_empty_sort_key_info, qfile_tpl_descr_alloc_values (f_valp[n] + f_len[n] 을 한 블록으로),
+ * input_tuple 은 QFILE_TUPLE_RECORD_INITIALIZER.
+ * 바뀐 것: 도메인 읽기 2곳 교체 + 초기화·할당 4곳을 헬퍼로 치환(약 -14/+10줄). 시그니처 동일.
+ */
 static int
 qexec_alloc_agg_hash_context (THREAD_ENTRY * thread_p, BUILDLIST_PROC_NODE * proc, XASL_STATE * xasl_state,
 			      bool not_use_membuf)
@@ -28461,7 +28199,8 @@ qexec_alloc_agg_hash_context (THREAD_ENTRY * thread_p, BUILDLIST_PROC_NODE * pro
   for (i = 0; i < proc->g_hkey_size; i++, regu_list = regu_list->next)
     {
       assert (regu_list);
-      proc->agg_hash_context->key_domains[i] = regu_list->value.domain;
+      proc->agg_hash_context->key_domains[i] =
+	qexec_get_node_domain (&xasl_state->vd, regu_list->value.domain, regu_list->value.plan_item);
     }
 
   /*
@@ -28506,7 +28245,8 @@ qexec_alloc_agg_hash_context (THREAD_ENTRY * thread_p, BUILDLIST_PROC_NODE * pro
   value_count = 0;
   while (regu_list)
     {
-      type_list.domp[value_count++] = regu_list->value.domain;
+      type_list.domp[value_count++] =
+	qexec_get_node_domain (&xasl_state->vd, regu_list->value.domain, regu_list->value.plan_item);
       regu_list = regu_list->next;
     }
 
@@ -28861,6 +28601,16 @@ qexec_locate_agg_hentry_in_list (THREAD_ENTRY * thread_p, AGGREGATE_HASH_CONTEXT
   return (context->part_scan_code == S_ERROR ? ER_FAILED : NO_ERROR);
 }
 
+/*
+ * [리뷰] qexec_execute_subquery_for_result_cache — 결과 캐시가 걸린 서브쿼리를 실행 대신 캐시 조회로 때우는 함수 —
+ * qexec_execute_mainblock_internal 이 부르고, xcache 에서 XASL 엔트리를 찾아 호스트 변수 값으로 리스트 캐시를 조회해 xasl->list_id 에 복사한다.
+ * develop: 캐시 조회 키를 xasl_state->vd.dbval_ptr[host_var_index[i]] 에서 읽었다. dbval_p 의 malloc 실패를 검사하지 않아 OOM 이면
+ * NULL 을 역참조하고 ent 도 unfix 되지 않았다.
+ * 이 PR: 키를 xasl_state->resolved_domain.in[host_var_index[i]] 에서 읽는다 — RESOLVED_DOMAIN_TABLE.in 은 qmgr 이 복사한
+ * 클라이언트 원본 값이고 vals(= vd.dbval_ptr)는 게이트가 변환까지 끝낸 값이라, qmgr_process_query 가 캐시를 저장한 기준과 같아진다. malloc 실패 시
+ * xcache_unfix 후 ER_OUT_OF_VIRTUAL_MEMORY 를 돌려준다.
+ * 바뀐 것: 입력 출처 1줄 교체 + OOM 분기 추가(+10줄). 시그니처 동일.
+ */
 int
 qexec_execute_subquery_for_result_cache (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state)
 {
@@ -28896,7 +28646,8 @@ qexec_execute_subquery_for_result_cache (THREAD_ENTRY * thread_p, XASL_NODE * xa
 
 	  for (i = 0; i < host_var_count; i++)
 	    {
-	      dbval_p[i] = xasl_state->vd.dbval_ptr[host_var_index[i]];
+	      /* qmgr_process_query stores the cache under the original values. */
+	      dbval_p[i] = xasl_state->resolved_domain.in[host_var_index[i]];
 	    }
 	}
 

@@ -91,7 +91,8 @@ static bool fetch_agg_expr_eval_dbl (THREAD_ENTRY * thread_p, REGU_VARIABLE * re
 				     OID * obj_oid, QFILE_TUPLE_RECORD * tplrec, double *out);
 
 static bool is_argument_wrapped_with_cast_op (const REGU_VARIABLE * regu_var);
-static int fetch_peek_dbval_pos (regu_variable_list_node * regu_list, QFILE_TUPLE_RECORD * tplrec);
+static int fetch_peek_dbval_pos (regu_variable_list_node * regu_list, QFILE_TUPLE_RECORD * tplrec,
+				 const VAL_DESCR * vd);
 static int get_hour_minute_or_second (const DB_VALUE * datetime, OPERATOR_TYPE op_type, DB_VALUE * db_value);
 static int get_year_month_or_day (const DB_VALUE * src_date, OPERATOR_TYPE op, DB_VALUE * result);
 static int get_date_weekday (const DB_VALUE * src_date, OPERATOR_TYPE op, DB_VALUE * result);
@@ -631,6 +632,399 @@ fetch_agg_expr_eval_dbl (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_
 }
 
 /*
+ * fetch_session_read_value () - a session variable read's value in the type resolve_domains gave the variable for the
+ *   statement
+ *   return: NO_ERROR, or ER_QPROC_SESSION_VARIABLE_TYPE for a value of another type
+ *
+ * resolve_domains gave every variable the statement reads one type, from its value when the execution started and the
+ * values the statement assigns it (qexec_resolve_session_variables), so a value of another type comes from a writer
+ * resolve_domains does not see (a stored procedure the statement calls): the statement stops, as it stops at
+ * resolve_domains for an assignment of another type. A value is of the variable's type when it has the type's DB type,
+ * a string also its codeset and collation, whatever its length. A fixed-length string of a variable the statement
+ * assigns converts into the variable-length string resolve_domains gave it, whose longest precision holds it. A read
+ * outside an execution with resolved-domain state reads the value as it is.
+ */
+/*
+ * [리뷰] fetch_session_read_value — fetch_peek_arith 의 T_EVALUATE_VARIABLE 가지가 session_get_variable 로 읽어 온 세션 변수
+ * 값을 그 노드에 실행 전 게이트가 매긴 late-bind 도메인과 대조해 NO_ERROR 또는 타입 오류를 돌려준다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 의 T_EVALUATE_VARIABLE(fetch.c:4026-4034)은 regu 에 NOT_CONST 플래그를
+ * 세우고 session_get_variable 만 불렀을 뿐, 읽어 온 값의 타입·collation 을 검사하지 않았다.
+ * 이 PR: qexec_late_bind_domain 으로 이 실행의 해결 도메인을 얻어, 타입이 같고 (문자형이면) codeset·collation 도 같으면 통과시킨다. CHAR 값이 최대길이
+ * VARCHAR 타깃일 때만 tp_value_cast 로 맞추고, 그 밖의 불일치는 qexec_session_variable_type_error 로 거절한다.
+ * 바뀐 것: 신설 31줄. 세션 변수처럼 실행 중에 값이 바뀌는 입력이 게이트가 정한 타입을 깨면 행에서 조용히 흘려보내지 않고 오류로 만드는 자리다.
+ */
+static int
+fetch_session_read_value (const VAL_DESCR * vd, ARITH_TYPE * arithptr, const DB_VALUE * name)
+{
+  DB_VALUE *value = arithptr->value;
+  const RESOLVED_DOMAIN *resolved_domain = qexec_late_bind_domain (vd, arithptr->plan_item);
+  if (DB_IS_NULL (value) || resolved_domain == NULL)
+    {
+      return NO_ERROR;
+    }
+  const TP_DOMAIN *type = resolved_domain->domain;
+  const DB_TYPE value_type = DB_VALUE_DOMAIN_TYPE (value);
+  const bool same_collation = !TP_IS_CHAR_TYPE (value_type) || !TP_IS_CHAR_TYPE (TP_DOMAIN_TYPE (type))
+    || (db_get_string_codeset (value) == TP_DOMAIN_CODESET (type)
+	&& db_get_string_collation (value) == TP_DOMAIN_COLLATION (type));
+  if (value_type == TP_DOMAIN_TYPE (type) && same_collation)
+    {
+      return NO_ERROR;
+    }
+  const TP_DOMAIN *value_domain = tp_domain_resolve_value (value, NULL);
+  if (value_domain == NULL)
+    {
+      return er_errid () != NO_ERROR ? er_errid () : ER_FAILED;
+    }
+  if (value_type == DB_TYPE_CHAR && TP_DOMAIN_TYPE (type) == DB_TYPE_VARCHAR
+      && type->precision == DB_MAX_VARCHAR_PRECISION && same_collation
+      && tp_value_cast (value, value, type, false) == DOMAIN_COMPATIBLE)
+    {
+      return NO_ERROR;
+    }
+  return qexec_session_variable_type_error (name, type, value_domain);
+}
+
+/* How a late-binding node takes its domain at its first computation in an execution */
+enum FETCH_RESOLVED_READING
+{
+  FETCH_RESOLVED_DOMAIN,	/* the resolved domain, or a cast's compiled target */
+  FETCH_RESOLVED_NO_VALUE,	/* resolve_domains found the node takes no value: a NULL operand, a pair its operator
+				 * rejects, a collation pair that does not merge, a cast into a target left variable;
+				 * the row computes the node unbound and gives NULL or the operator's error */
+  FETCH_RESOLVED_UNRESOLVED	/* no resolution where the plan promised one: the unresolved-domain check (execution) */
+};
+
+/* The row path's readings of the resolved domains: inlined at every call in a release build. */
+STATIC_INLINE FETCH_RESOLVED_READING fetch_arith_resolved_domain (const VAL_DESCR * vd, const ARITH_TYPE * arithptr,
+								  const TP_DOMAIN ** resolved_domain)
+  __attribute__ ((ALWAYS_INLINE));
+STATIC_INLINE bool fetch_constant_evaluated (const VAL_DESCR * vd, const DOMAIN_PLAN_ITEM * item)
+  __attribute__ ((ALWAYS_INLINE));
+STATIC_INLINE int fetch_read_plan_domain (REGU_VARIABLE * regu_var, val_descr * vd, const DB_VALUE * value)
+  __attribute__ ((ALWAYS_INLINE));
+/* An arithmetic node's row: the typed operator inline, the operand coercion out of line */
+STATIC_INLINE int fetch_arith_binary (THREAD_ENTRY * thread_p, const val_descr * vd, ARITH_TYPE * arithptr,
+				      DB_VALUE * left, DB_VALUE * right, TP_DOMAIN * domain)
+  __attribute__ ((ALWAYS_INLINE));
+static int fetch_arith_binary_operand_coercion (THREAD_ENTRY * thread_p, const val_descr * vd, ARITH_TYPE * arithptr,
+						const RESOLVED_DOMAIN * plan, DB_VALUE * left, DB_VALUE * right,
+						TP_DOMAIN * domain) __attribute__ ((noinline));
+
+/*
+ * fetch_arith_resolved_domain () - how an arithmetic node whose compiled domain is variable takes its domain now
+ *   return: the reading; *resolved is set for FETCH_RESOLVED_DOMAIN
+ *
+ * resolve_domains resolved every late-binding node before the main block (qexec_resolve_domains); the row reads that
+ * resolution and never derives one from a value, except where the reading says LATE.
+ */
+/*
+ * [리뷰] fetch_arith_resolved_domain — fetch_peek_arith 가 variable 도메인 노드를 만났을 때 이 실행의 해결 도메인을
+ * FETCH_RESOLVED_DOMAIN / NO_VALUE / UNRESOLVED 세 상태로 돌려주는 판정기.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 은 노드별 해결 상태가 없어, 계산이 끝난 뒤 결과값에서 tp_domain_resolve_value 로 도메인을
+ * 역산했다(fetch_peek_arith 끝의 original_domain 복원 블록).
+ * 이 PR: CAST/CAST_WRAP/CAST_NOFAIL 은 컴파일된 타깃 도메인을 그대로 쓰고 타깃이 VARIABLE 이면 NO_VALUE 로 본다. 그 밖에는
+ * vd->xasl_state->resolved_domain 에서 DOMAIN_PLAN_LATE_BIND 플래그가 있고 소유권이 있는 item 의 resolved_index 를 읽는다. vd 나
+ * xasl_state 가 없으면 UNRESOLVED.
+ * 바뀐 것: 신설 35줄. 행이 도메인을 '정하는' 대신 게이트가 정해 둔 것을 '읽는' 구조로 넘어가는 분기점이다.
+ */
+static inline FETCH_RESOLVED_READING
+fetch_arith_resolved_domain (const VAL_DESCR * vd, const ARITH_TYPE * arithptr, const TP_DOMAIN ** resolved_domain)
+{
+  if (arithptr->opcode == T_CAST || arithptr->opcode == T_CAST_WRAP || arithptr->opcode == T_CAST_NOFAIL)
+    {
+      /* the value is cast into the compiled target, so the target is the node's domain; a target the compiler left
+       * variable casts no value: a NULL stays NULL and any other value fails (-181) */
+      if (arithptr->domain != NULL && TP_DOMAIN_TYPE (arithptr->domain) != DB_TYPE_VARIABLE)
+	{
+	  *resolved_domain = arithptr->domain;
+	  return FETCH_RESOLVED_DOMAIN;
+	}
+      return FETCH_RESOLVED_NO_VALUE;
+    }
+  /* every execution-time descriptor carries its resolved-domain state: a PX worker's and a hash join worker's inherit
+   * it through qexec_deep_copy_xasl_state. A regu fetched without one is a stream's, whose domains are all fixed, or a
+   * temporary one over a typed list: none has a variable domain */
+  const DOMAIN_PLAN_ITEM *item = arithptr->plan_item;
+  if (vd == NULL || vd->xasl_state == NULL)
+    {
+      return FETCH_RESOLVED_UNRESOLVED;
+    }
+  const RESOLVED_DOMAIN_TABLE & resolved = vd->xasl_state->resolved_domain;
+  if (item == NULL || !(item->flags & DOMAIN_PLAN_LATE_BIND) || !qexec_owns_resolved_index (resolved, item))
+    {
+      return FETCH_RESOLVED_UNRESOLVED;
+    }
+  const TP_DOMAIN *domain = resolved.domains[item->resolved_index].domain;
+  if (domain == NULL || TP_DOMAIN_TYPE (domain) == DB_TYPE_NULL)
+    {
+      return FETCH_RESOLVED_NO_VALUE;
+    }
+  *resolved_domain = domain;
+  return FETCH_RESOLVED_DOMAIN;
+}
+
+/*
+ * fetch_convert_to_branch_value () - a value a row picked among branches whose collations resolve_domains merged into
+ *   one domain (domain_resolve_branch_merge), brought into it by the converter resolve_domains chose for its string
+ *   type
+ *   return: NO_ERROR, the conversion's error, or ER_QPROC_DOMAIN_UNRESOLVED (the unresolved-domain check (execution))
+ *	     for a value of a type resolve_domains chose no converter for
+ */
+/*
+ * [리뷰] fetch_convert_to_branch_value — fetch_convert_to_resolved_branch 가 부르는 실제 변환기 — 값의 타입(VARCHAR/CHAR)에 맞는
+ * 변환 함수 포인터 resolved_domain->conv[0|1] 로 값을 해결 도메인으로 바꿔 끼우고 NO_ERROR / ER_TP_CANT_COERCE 를 돌려준다.
+ * develop: develop 에 없음 — 이 PR 이 신설.
+ * 이 PR: 타입에 맞는 conv 가 없으면 domain_unresolved_error 로 즉시 실패하고, 있으면 tp_value_convert 로 변환한 뒤 원래 값을 pr_clear_value
+ * 하고 교체한다.
+ * 바뀐 것: 신설 23줄. 변환 함수를 행마다 고르지 않고 게이트가 심어 둔 포인터를 쓴다.
+ * [지적 C6-06]
+ * [지적 C6-05]
+ */
+static int
+fetch_convert_to_branch_value (const val_descr * vd, const DOMAIN_PLAN_ITEM * item,
+			       const RESOLVED_DOMAIN * resolved_domain, DB_VALUE * value)
+{
+  const DB_TYPE type = DB_VALUE_DOMAIN_TYPE (value);
+  const TP_VALUE_CONVERTER converter = type == DB_TYPE_VARCHAR ? resolved_domain->conv[0]
+    : type == DB_TYPE_CHAR ? resolved_domain->conv[1] : NULL;
+  if (converter == NULL)
+    {
+      return domain_unresolved_error ("", qexec_item_index (vd, item), type);
+    }
+  DB_VALUE converted;
+  if (tp_value_convert (converter, resolved_domain->domain, value, &converted) != DOMAIN_COMPATIBLE)
+    {
+      pr_clear_value (&converted);
+      er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_TP_CANT_COERCE, 2, pr_type_name (type),
+	      pr_type_name (TP_DOMAIN_TYPE (resolved_domain->domain)));
+      return ER_TP_CANT_COERCE;
+    }
+  pr_clear_value (value);
+  *value = converted;
+  return NO_ERROR;
+}
+
+/* The row's test before fetch_convert_to_branch_value, inline: a collation late-binding node's resolution carries
+ * converters only for merged branches (a type-dependent node's are its operands'), so any other node costs a flag
+ * test. */
+/*
+ * [리뷰] fetch_convert_to_resolved_branch — fetch_peek_dbval_slow 이 값 하나를 돌려주기 직전에 거치는 게이트 — item 이
+ * DOMAIN_PLAN_LATE_BIND_COLLATION 이고 변환기가 있고 값이 NULL 이 아닐 때만 fetch_convert_to_branch_value 로 넘긴다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 은 collation 이 변수인 결과를 노드 도메인 재계산(regu_var->domain 덮어쓰기)으로 처리했다.
+ * 이 PR: 위 세 조건을 다 만족할 때만 변환하고, 아니면 NO_ERROR 로 지나간다.
+ * 바뀐 것: 신설 15줄. collation 확정 지점을 분기 하나로 좁혔다.
+ */
+static inline int
+fetch_convert_to_resolved_branch (const val_descr * vd, const DOMAIN_PLAN_ITEM * item, DB_VALUE * value)
+{
+  if (item == NULL || !(item->flags & DOMAIN_PLAN_LATE_BIND_COLLATION))
+    {
+      return NO_ERROR;
+    }
+  const RESOLVED_DOMAIN *resolved_domain = qexec_late_bind_domain (vd, item);
+  if (resolved_domain == NULL || (resolved_domain->conv[0] == NULL && resolved_domain->conv[1] == NULL)
+      || DB_IS_NULL (value))
+    {
+      return NO_ERROR;
+    }
+  return fetch_convert_to_branch_value (vd, item, resolved_domain, value);
+}
+
+/* The resolved comparison k an arithmetic node makes: its plan item carries them. A stream's
+ * FIELD, NULLIF, LEAST or GREATEST has a bare item for them. */
+/*
+ * [리뷰] fetch_arith_compare — ARITH 노드의 k 번째 비교 계획(DOMAIN_COMPARE_PLAN)을 꺼내 주는 접근자 — fetch_least_or_greatest 가
+ * eval_compare_values_resolved 에 넘길 계획을 여기서 얻는다.
+ * develop: develop 에 없음 — 이 PR 이 신설(DOMAIN_COMPARE_PLAN 자체가 이 PR 이 들여온 것).
+ * 이 PR: item 과 item->compares 가 있으면 compares[k], 아니면 NULL.
+ * 바뀐 것: 신설 6줄.
+ */
+static inline const DOMAIN_COMPARE_PLAN *
+fetch_arith_compare (const ARITH_TYPE * arithptr, int k)
+{
+  const DOMAIN_PLAN_ITEM *item = arithptr->plan_item;
+  return item != NULL && item->compares != NULL ? item->compares[k] : NULL;
+}
+
+/* Whether resolve_domains already evaluated this constant expression: its value is in resolve_domains' array.
+ * It replaces fetch's FETCH_ALL_CONST mark, which the first computation set on the plan. The value's index is the
+ * plan's, inside every execution's array, a PX worker's copy included: asserted, not tested at every row. */
+/*
+ * [리뷰] fetch_constant_evaluated — fetch_peek_arith 와 fetch_peek_dbval_slow(TYPE_FUNC)가 맨 앞에서 묻는 질문 — 이 노드는 실행
+ * 전 게이트(resolve_domains)가 이미 한 번 계산해 둔 상수인가. true 면 호출자는 vd->dbval_ptr[item->ref] 를 그대로 돌려준다.
+ * develop: develop 은 REGU_VARIABLE_FETCH_ALL_CONST 플래그를 첫 실행 때 regu 노드에 써 두고 다음 행부터 arithptr->value /
+ * funcp->value 를 재사용했다 — 공유 XASL 클론에 실행 중 쓰기였다.
+ * 이 PR: 플래그 대신 vd->xasl_state->resolved_domain.value_states[item->ref] == DOMAIN_VALUE_EVALUATED 를 읽는다. 값도 노드가
+ * 아니라 실행별 배열에 있다.
+ * 바뀐 것: 신설 11줄. 상수 판정의 저장소가 노드(공유) → 실행 상태(격리)로 교체됐고, 이것이 fetch_peek_arith·fetch_peek_dbval_slow 의
+ * ALL_CONST/NOT_CONST 로직 전체 삭제를 떠받친다.
+ * [지적 C6-02]
+ */
+static inline bool
+fetch_constant_evaluated (const VAL_DESCR * vd, const DOMAIN_PLAN_ITEM * item)
+{
+  if (item == NULL || item->ref < 0 || vd == NULL)
+    {
+      return false;
+    }
+  const RESOLVED_DOMAIN_TABLE & resolved = vd->xasl_state->resolved_domain;
+  assert (resolved.value_states != NULL && item->ref < resolved.n_vals);
+  return resolved.value_states[item->ref] == DOMAIN_VALUE_EVALUATED;
+}
+
+/*
+ * fetch_least_or_greatest () - LEAST or GREATEST of an arithmetic node's two operands, compared as the load or
+ *				resolve_domains resolved
+ *   return: NO_ERROR, or ER_FAILED where they do not compare
+ */
+/*
+ * [리뷰] fetch_least_or_greatest — fetch_peek_arith 의 T_LEAST/T_GREATEST 가지가 부르는 헬퍼 — 두 피연산자를 계획된 비교로 한 번 비교하고 그
+ * 결과로 작은/큰 쪽을 arithptr->value 에 쓴다.
+ * develop: develop 에 없음 — develop 은 db_least_or_greatest (peek_left, peek_right, arithptr->value, least) 가
+ * 비교까지 내부에서 했다(fetch.c:3912·3943).
+ * 이 PR: eval_compare_values_resolved (thread_p, fetch_arith_compare (arithptr, 0), vd, …) 로 비교하고, 그 결과와
+ * can_compare 를 새 db_least_or_greatest_by 에 넘긴다.
+ * 바뀐 것: 신설 10줄 + 호출부 2곳 교체. 비교 주체가 '값 두 개를 보고 그때 정하는 비교'에서 '게이트가 정해 둔 비교'로 옮겨졌다.
+ */
+static int
+fetch_least_or_greatest (THREAD_ENTRY * thread_p, ARITH_TYPE * arithptr, val_descr * vd, DB_VALUE * peek_left,
+			 DB_VALUE * peek_right, bool least)
+{
+  bool can_compare = true;
+  const DB_VALUE_COMPARE_RESULT cmp_result =
+    eval_compare_values_resolved (thread_p, fetch_arith_compare (arithptr, 0), vd, peek_left, peek_right, 0,
+				  &can_compare);
+  return db_least_or_greatest_by (peek_left, peek_right, cmp_result, can_compare, arithptr->value, least);
+}
+
+/*
+ * fetch_arith_binary () - an addition, subtraction, multiplication or division: its operands' operand coercion,
+ *   resolved before any row, then the typed operator, which casts nothing (qdata_coerce_arith_operands)
+ *   return: NO_ERROR or ER_code
+ *
+ * The plan is the resolved domain for a node whose type resolve_domains resolves, the load's for any other node - a
+ * compiled node, one whose collation alone resolve_domains resolves, a stream's node (domain_plan_operand_coercion). A
+ * NULL operand converts nothing, resolved or not: an operator answers a NULL operand before any operand coercion.
+ *
+ * Inline at every call, with the operator called directly: the operand coercion's frame - its execution temporary
+ * arrays, the stack protector they bring, the calls it makes - is fetch_arith_binary_operand_coercion's, which only a
+ * plan that converts an operand, or a missing plan, reaches.
+ */
+/*
+ * [리뷰] fetch_arith_binary — fetch_peek_arith 의 T_ADD/T_SUB/T_MUL/T_DIV 가지 전체 — 피연산자 변환이 필요 없으면 qdata_*_dbval 을
+ * 직접 부르고, 필요하면 fetch_arith_binary_operand_coercion 으로 넘긴다.
+ * develop: develop 에 없음 — develop 은 이 네 opcode 를 fetch_peek_arith 안에서 qdata_add_dbval 등으로 바로 불렀고, 피연산자 강제 변환은
+ * 각 qdata_* 가 값 타입을 보고 행마다 했다.
+ * 이 PR: item->fixed(컴파일 시 고정)을 기본으로 삼고, LATE_BIND 이면서 LATE_BIND_COLLATION 이 아니면 qexec_late_bind_domain 으로 이
+ * 실행의 RESOLVED_DOMAIN 을 고른다. conv[0]·conv[1] 이 둘 다 NULL 일 때만 타입 연산자를 직접 부른다.
+ * 바뀐 것: 신설 29줄. 변환 여부를 행이 아니라 계획이 결정한다.
+ */
+static inline int
+fetch_arith_binary (THREAD_ENTRY * thread_p, const val_descr * vd, ARITH_TYPE * arithptr, DB_VALUE * left,
+		    DB_VALUE * right, TP_DOMAIN * domain)
+{
+  const DOMAIN_PLAN_ITEM *item = arithptr->plan_item;
+  const RESOLVED_DOMAIN *plan = item != NULL ? &item->fixed : NULL;
+  if (item != NULL && (item->flags & DOMAIN_PLAN_LATE_BIND) && !(item->flags & DOMAIN_PLAN_LATE_BIND_COLLATION))
+    {
+      plan = qexec_late_bind_domain (vd, item);
+    }
+  if (plan != NULL && plan->conv[0] == NULL && plan->conv[1] == NULL)
+    {
+      /* an operand coercion that converts neither operand calls the typed operator directly; the operator's optdebug
+       * check still stops operands a plan left unconverted (qdata_assert_operands_coerced) */
+      switch (arithptr->opcode)
+	{
+	case T_ADD:
+	  return qdata_add_dbval (left, right, arithptr->value, domain);
+	case T_SUB:
+	  return qdata_subtract_dbval (left, right, arithptr->value, domain);
+	case T_MUL:
+	  return qdata_multiply_dbval (left, right, arithptr->value, domain);
+	default:
+	  assert (arithptr->opcode == T_DIV);
+	  return qdata_divide_dbval (left, right, arithptr->value, domain);
+	}
+    }
+  return fetch_arith_binary_operand_coercion (thread_p, vd, arithptr, plan, left, right, domain);
+}
+
+/* fetch_arith_binary's operand coercion: the operands the plan converts, a scope's execution temporary, or the
+ * unresolved-domain check (execution) of a node without its plan (out of line) */
+/*
+ * [리뷰] fetch_arith_binary_operand_coercion — fetch_arith_binary 이 '변환이 필요하다'고 판단했을 때의 경로 — 범위가 고정하는 피연산자는 스코프당
+ * 한 번만 변환해 두고(qexec_execution_temporary) qdata_coerce_arith_operands 로 넘긴다.
+ * develop: develop 에 없음 — 이 PR 이 신설. develop 은 매 행 qdata_* 안에서 피연산자를 다시 변환했다.
+ * 이 PR: plan 이 없는데 양쪽 피연산자가 모두 비-NULL 이면 qexec_domain_unresolved 로 '게이트가 빠뜨린 노드' 오류를 낸다. temporaries 가 있는
+ * 피연산자만 스코프 임시값으로 한 번 변환해 재사용한다.
+ * 바뀐 것: 신설 34줄.
+ */
+static int
+fetch_arith_binary_operand_coercion (THREAD_ENTRY * thread_p, const val_descr * vd, ARITH_TYPE * arithptr,
+				     const RESOLVED_DOMAIN * plan, DB_VALUE * left, DB_VALUE * right,
+				     TP_DOMAIN * domain)
+{
+  const DOMAIN_PLAN_ITEM *item = arithptr->plan_item;
+  if (plan == NULL && left != NULL && right != NULL && !DB_IS_NULL (left) && !DB_IS_NULL (right))
+    {
+      /* every node of a loaded tree or stream carries its operand coercion, and resolve_domains resolved every node
+       * whose type it resolves before the main block: the unresolved-domain check (execution) */
+      return qexec_domain_unresolved (vd, item, arithptr->domain);
+    }
+  if (plan != NULL && (item->temporaries[0] != 0 || item->temporaries[1] != 0) && left != NULL && right != NULL
+      && !DB_IS_NULL (left) && !DB_IS_NULL (right))
+    {
+      /* an operand a scope fixes - a constant for the execution, a correlated value for its
+       * outer row - is converted once per scope */
+      DB_VALUE *const operands[2] = { left, right };
+      const DB_VALUE *temporaries[2] = { NULL, NULL };
+      for (int i = 0; i < 2; i++)
+	{
+	  if (item->temporaries[i] != 0 && plan->conv[i] != NULL)
+	    {
+	      temporaries[i] =
+		qexec_execution_temporary (thread_p, vd, item->temporaries[i], plan->conv[i], plan->operand_domain[i],
+					   operands[i]);
+	    }
+	}
+      return qdata_coerce_arith_operands (arithptr->opcode, plan->conv, plan->operand_domain, left, right,
+					  arithptr->value, domain, temporaries);
+    }
+  return qdata_coerce_arith_operands (arithptr->opcode, plan != NULL ? plan->conv : NULL,
+				      plan != NULL ? plan->operand_domain : NULL, left, right, arithptr->value, domain);
+}
+
+/*
+ * fetch_cast_operand () - the cast of operand i's value into the node's domain (a CAST; the operand a NVL,
+ *   IFNULL, COALESCE or NVL2 row picks), with the converter the load found for the operand's compiled type
+ *   (domain_fixed_operand): the cast skips its per-value lookup for a value of that type
+ *   force(in): tp_value_cast_force's coercion, else tp_value_cast's
+ */
+/*
+ * [리뷰] fetch_cast_operand — CAST·NVL·IFNULL·COALESCE·NVL2 가 피연산자 i 의 값을 노드 도메인으로 캐스팅할 때 부르는 래퍼 — 계획이 그 피연산자의
+ * 컴파일 타입에 맞춰 찾아 둔 변환기가 있으면 그것으로, 없으면 기존 tp_value_cast(_force) 로 간다.
+ * develop: develop 에 없음 — develop 은 tp_value_cast / tp_value_cast_force 를 직접 불렀고 그 안에서 값마다 변환기를 찾았다.
+ * 이 PR: item->fixed.conv[i] 가 있고 item->fixed.operand_domain[i] 가 이번 타깃 domain 과 같은 포인터이며 피연산자 regu 가 도메인을 가질
+ * 때만 tp_value_cast_with_converter 로 값당 조회를 건너뛴다.
+ * 바뀐 것: 신설 14줄. 적중 판정이 TP_DOMAIN 포인터 동일성에 달려 있다.
+ */
+static inline TP_DOMAIN_STATUS
+fetch_cast_operand (const ARITH_TYPE * arithptr, int i, const DB_VALUE * value, DB_VALUE * result,
+		    const TP_DOMAIN * domain, bool force)
+{
+  const DOMAIN_PLAN_ITEM *item = arithptr->plan_item;
+  const REGU_VARIABLE *operand = i == 0 ? arithptr->leftptr : i == 1 ? arithptr->rightptr : arithptr->thirdptr;
+  if (item != NULL && item->fixed.conv[i] != NULL && item->fixed.operand_domain[i] == domain && operand != NULL
+      && operand->domain != NULL)
+    {
+      return tp_value_cast_with_converter (value, result, domain, force, TP_DOMAIN_TYPE (operand->domain),
+					   item->fixed.conv[i]);
+    }
+  return force ? tp_value_cast_force (value, result, domain, false) : tp_value_cast (value, result, domain, false);
+}
+
+/*
  * fetch_peek_arith () -
  *   return: NO_ERROR or ER_code
  *   regu_var(in/out): Regulator Variable of an ARITH node.
@@ -639,6 +1033,23 @@ fetch_agg_expr_eval_dbl (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_
  *   tplrec(in): tuple slot (record + layout descriptor)
  *   peek_dbval(out): Set to the value resulting from the fetch operation
  */
+/*
+ * [리뷰] fetch_peek_arith — REGU 가 TYPE_INARITH/TYPE_OUTARITH 일 때 산술·함수 노드 하나를 평가해 결과 DB_VALUE 포인터를 돌려주는 행당 핵심
+ * 함수. fetch_peek_dbval_slow 이 부른다.
+ * develop: develop(fetch.c:643-4613)은 세 가지를 공유 XASL 노드에 써 가며 돌았다 — ① REGU_VARIABLE_FETCH_ALL_CONST 플래그로 상수
+ * 재사용, ② regu_var->domain 이 VARIABLE 이면 original_domain 에 빼돌리고 regu_var->domain = NULL 로 만든 뒤 계산 끝에
+ * tp_domain_resolve_value 로 역산한 도메인을 regu_var->domain 과 arithptr->domain 에 써 넣기, ③ 끝에서 피연산자 플래그를 세어
+ * ALL_CONST/NOT_CONST 를 노드에 기록하기. 에러 경로에서는 original_domain 을 복원했다.
+ * 이 PR: ① 맨 앞에서 fetch_constant_evaluated 로 묻고 참이면 vd->dbval_ptr[item->ref] 를 돌려준다. ② 노드 도메인을 지역 변수 domain /
+ * arith_domain 에 qexec_get_node_domain 으로 담고, VARIABLE 이면 fetch_arith_resolved_domain 의 세 상태로 분기한다 — DOMAIN 이면
+ * qexec_set_node_domain 으로 실행별 슬롯에만 기록, NO_VALUE 면 컴파일 도메인을 no_value_domain 에 보관하고 결과가 NULL 임을 확인, UNRESOLVED
+ * 면 domain_unresolved_error 로 즉시 실패. ③ 상수 판정 블록은 통째로 없어지고 디버그 assert 는 plan_item->operand_class ==
+ * OPERAND_NON_CACHEABLE 로 바뀌었다. 에러 경로에 복원할 것이 없다.
+ * 바뀐 것: 함수 전역에서 regu_var->domain / arithptr->domain 직접 참조를 지역 domain / arith_domain 으로 치환(수십 곳), 상수 판정 약 60줄
+ * 삭제, 도메인 역산 약 25줄 삭제, 게이트 읽기 약 35줄 추가. T_LEAST/T_GREATEST 는 tp_infer_common_domain 폴백을 잃고 미해결이면
+ * qexec_domain_unresolved 로 오류가 된다.
+ * [지적 C2-03]
+ */
 static int
 fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr * vd, OID * obj_oid,
 		  QFILE_TUPLE_RECORD * tplrec, DB_VALUE ** peek_dbval)
@@ -646,19 +1057,21 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
   ARITH_TYPE *arithptr;
   DB_VALUE *peek_left, *peek_right, *peek_third, *peek_fourth;
   DB_VALUE tmp_value;
-  TP_DOMAIN *original_domain = NULL;
+  TP_DOMAIN *no_value_domain = NULL;	/* FETCH_RESOLVED_NO_VALUE: the compiled domain the node keeps */
   TP_DOMAIN_STATUS dom_status;
 
   assert (regu_var != NULL);
   arithptr = regu_var->value.arithptr;
-  if (REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST))
+  if (fetch_constant_evaluated (vd, arithptr->plan_item))
     {
-      *peek_dbval = arithptr->value;
-
+      /* a constant expression resolve_domains evaluated once */
+      *peek_dbval = vd->dbval_ptr + arithptr->plan_item->ref;
       return NO_ERROR;
     }
-
-  assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST));
+  /* The domains the node has now in this execution: its execution domains, or the compiled ones in regu_var->domain
+   * and arithptr->domain, which never change. */
+  TP_DOMAIN *domain = qexec_get_node_domain (vd, regu_var->domain, regu_var->plan_item);
+  TP_DOMAIN *arith_domain = qexec_get_node_domain (vd, arithptr->domain, arithptr->plan_item);
 
   /* An aggregate operand expression is evaluated in one register pass.
    * Unlike the general path, which materializes a DB_VALUE at each operation,
@@ -671,7 +1084,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
    * The result is written where the general path would write it, so all consumers
    * remain unchanged. NULL result domains stay on the general path. */
   if (REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_AGG_OPERAND)
-      && regu_var->domain != NULL && TP_DOMAIN_TYPE (regu_var->domain) != DB_TYPE_NULL)
+      && domain != NULL && TP_DOMAIN_TYPE (domain) != DB_TYPE_NULL)
     {
       bool fused = false;
 
@@ -695,7 +1108,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 
 	    if (fetch_agg_expr_eval_int (thread_p, regu_var, vd, obj_oid, tplrec, &int_val))
 	      {
-		switch (TP_DOMAIN_TYPE (regu_var->domain))
+		switch (TP_DOMAIN_TYPE (domain))
 		  {
 		  case DB_TYPE_SHORT:
 		    db_make_short (arithptr->value, (short) int_val);
@@ -730,13 +1143,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 
       if (fused)
 	{
-	  /* Early return skips the constness decision, but the caller expects one flag
-	   * to be set. Mark it NOT_CONST: aggregate operands read columns and must be
-	   * re-evaluated for each row, not reuse the cached arithptr->value.
-	   */
-	  REGU_VARIABLE_SET_FLAG (regu_var, REGU_VARIABLE_FETCH_NOT_CONST);
-	  assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST));
-
+	  /* aggregate operands read columns: computed for each row */
 	  *peek_dbval = arithptr->value;
 
 	  return NO_ERROR;
@@ -860,9 +1267,17 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	  if (prm_get_bool_value (PRM_ID_ORACLE_STYLE_EMPTY_STRING)
 	      && (arithptr->opcode == T_STRCAT || arithptr->opcode == T_ADD))
 	    {
-	      /* check for result type. */
-	      if (TP_DOMAIN_TYPE (regu_var->domain) == DB_TYPE_VARIABLE
-		  || QSTR_IS_ANY_CHAR_OR_BIT (TP_DOMAIN_TYPE (regu_var->domain)))
+	      /* check for result type: a variable domain is the resolved domain; a node resolve_domains resolved
+	       * nothing for reads the values' domains */
+	      const TP_DOMAIN *result_domain = domain;
+	      const TP_DOMAIN *resolved_domain = NULL;
+	      if (TP_DOMAIN_TYPE (result_domain) == DB_TYPE_VARIABLE
+		  && fetch_arith_resolved_domain (vd, arithptr, &resolved_domain) == FETCH_RESOLVED_DOMAIN)
+		{
+		  result_domain = resolved_domain;
+		}
+	      if (TP_DOMAIN_TYPE (result_domain) == DB_TYPE_VARIABLE
+		  || QSTR_IS_ANY_CHAR_OR_BIT (TP_DOMAIN_TYPE (result_domain)))
 		{
 		  if (fetch_peek_dbval (thread_p, arithptr->rightptr, vd, NULL, obj_oid, tplrec, &peek_right) !=
 		      NO_ERROR)
@@ -1316,10 +1731,35 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 
   /* clear any previous result */
   pr_clear_value (arithptr->value);
-  if (regu_var->domain != NULL && TP_DOMAIN_TYPE (regu_var->domain) == DB_TYPE_VARIABLE)
+  if (domain != NULL && TP_DOMAIN_TYPE (domain) == DB_TYPE_VARIABLE)
     {
-      original_domain = regu_var->domain;
-      regu_var->domain = NULL;
+      /* the node's first computation in this execution takes the domain resolve_domains resolved before the main block
+       * as its execution domain for the rest of the execution. A character result carries its merged
+       * collation. */
+      const TP_DOMAIN *resolved_domain = NULL;
+      FETCH_RESOLVED_READING reading = fetch_arith_resolved_domain (vd, arithptr, &resolved_domain);
+      switch (reading)
+	{
+	case FETCH_RESOLVED_DOMAIN:
+	  domain = (TP_DOMAIN *) resolved_domain;
+	  qexec_set_node_domain (vd, regu_var->plan_item, regu_var->domain, resolved_domain);
+	  if (resolved_domain != arith_domain)
+	    {
+	      arith_domain = (TP_DOMAIN *) resolved_domain;
+	      qexec_set_node_domain (vd, arithptr->plan_item, arithptr->domain, resolved_domain);
+	    }
+	  break;
+
+	case FETCH_RESOLVED_NO_VALUE:
+	  no_value_domain = domain;
+	  domain = NULL;
+	  break;
+
+	case FETCH_RESOLVED_UNRESOLVED:
+	default:
+	  (void) domain_unresolved_error ("", qexec_item_index (vd, arithptr->plan_item), DB_TYPE_VARIABLE);
+	  goto error;
+	}
     }
   switch (arithptr->opcode)
     {
@@ -1330,18 +1770,17 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	check_empty_string = (prm_get_bool_value (PRM_ID_ORACLE_STYLE_EMPTY_STRING) ? true : false);
 
 	/* check for result type. */
-	if (check_empty_string && regu_var->domain != NULL
-	    && QSTR_IS_ANY_CHAR_OR_BIT (TP_DOMAIN_TYPE (regu_var->domain)))
+	if (check_empty_string && domain != NULL && QSTR_IS_ANY_CHAR_OR_BIT (TP_DOMAIN_TYPE (domain)))
 	  {
 	    /* at here, T_ADD is really T_STRCAT */
-	    if (qdata_strcat_dbval (peek_left, peek_right, arithptr->value, regu_var->domain) != NO_ERROR)
+	    if (qdata_strcat_dbval (peek_left, peek_right, arithptr->value, domain) != NO_ERROR)
 	      {
 		goto error;
 	      }
 	  }
 	else
 	  {
-	    if (qdata_add_dbval (peek_left, peek_right, arithptr->value, regu_var->domain) != NO_ERROR)
+	    if (fetch_arith_binary (thread_p, vd, arithptr, peek_left, peek_right, domain) != NO_ERROR)
 	      {
 		goto error;
 	      }
@@ -1350,28 +1789,28 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
       break;
 
     case T_BIT_NOT:
-      if (qdata_bit_not_dbval (peek_right, arithptr->value, regu_var->domain) != NO_ERROR)
+      if (qdata_bit_not_dbval (peek_right, arithptr->value, domain) != NO_ERROR)
 	{
 	  goto error;
 	}
       break;
 
     case T_BIT_AND:
-      if (qdata_bit_and_dbval (peek_left, peek_right, arithptr->value, regu_var->domain) != NO_ERROR)
+      if (qdata_bit_and_dbval (peek_left, peek_right, arithptr->value, domain) != NO_ERROR)
 	{
 	  goto error;
 	}
       break;
 
     case T_BIT_OR:
-      if (qdata_bit_or_dbval (peek_left, peek_right, arithptr->value, regu_var->domain) != NO_ERROR)
+      if (qdata_bit_or_dbval (peek_left, peek_right, arithptr->value, domain) != NO_ERROR)
 	{
 	  goto error;
 	}
       break;
 
     case T_BIT_XOR:
-      if (qdata_bit_xor_dbval (peek_left, peek_right, arithptr->value, regu_var->domain) != NO_ERROR)
+      if (qdata_bit_xor_dbval (peek_left, peek_right, arithptr->value, domain) != NO_ERROR)
 	{
 	  goto error;
 	}
@@ -1379,8 +1818,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 
     case T_BITSHIFT_LEFT:
     case T_BITSHIFT_RIGHT:
-      if (qdata_bit_shift_dbval (peek_left, peek_right, arithptr->opcode, arithptr->value, regu_var->domain) !=
-	  NO_ERROR)
+      if (qdata_bit_shift_dbval (peek_left, peek_right, arithptr->opcode, arithptr->value, domain) != NO_ERROR)
 	{
 	  goto error;
 	}
@@ -1388,7 +1826,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 
     case T_INTDIV:
     case T_INTMOD:
-      if (qdata_divmod_dbval (peek_left, peek_right, arithptr->opcode, arithptr->value, regu_var->domain) != NO_ERROR)
+      if (qdata_divmod_dbval (peek_left, peek_right, arithptr->opcode, arithptr->value, domain) != NO_ERROR)
 	{
 	  goto error;
 	}
@@ -1402,21 +1840,21 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
       break;
 
     case T_SUB:
-      if (qdata_subtract_dbval (peek_left, peek_right, arithptr->value, regu_var->domain) != NO_ERROR)
+      if (fetch_arith_binary (thread_p, vd, arithptr, peek_left, peek_right, domain) != NO_ERROR)
 	{
 	  goto error;
 	}
       break;
 
     case T_MUL:
-      if (qdata_multiply_dbval (peek_left, peek_right, arithptr->value, regu_var->domain) != NO_ERROR)
+      if (fetch_arith_binary (thread_p, vd, arithptr, peek_left, peek_right, domain) != NO_ERROR)
 	{
 	  goto error;
 	}
       break;
 
     case T_DIV:
-      if (qdata_divide_dbval (peek_left, peek_right, arithptr->value, regu_var->domain) != NO_ERROR)
+      if (fetch_arith_binary (thread_p, vd, arithptr, peek_left, peek_right, domain) != NO_ERROR)
 	{
 	  goto error;
 	}
@@ -1652,7 +2090,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	{
 	  PRIM_SET_NULL (arithptr->value);
 	}
-      else if (db_date_dbval (arithptr->value, peek_right, arithptr->domain) != NO_ERROR)
+      else if (db_date_dbval (arithptr->value, peek_right, arith_domain) != NO_ERROR)
 	{
 	  goto error;
 	}
@@ -1663,7 +2101,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	{
 	  PRIM_SET_NULL (arithptr->value);
 	}
-      else if (db_time_dbval (arithptr->value, peek_right, arithptr->domain) != NO_ERROR)
+      else if (db_time_dbval (arithptr->value, peek_right, arith_domain) != NO_ERROR)
 	{
 	  goto error;
 	}
@@ -1707,9 +2145,6 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 
     case T_INCR:
     case T_DECR:
-      /* incr/decr is not constant */
-      REGU_VARIABLE_SET_FLAG (regu_var, REGU_VARIABLE_FETCH_NOT_CONST);
-      assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST));
       if (DB_IS_NULL (peek_right))
 	{
 	  /* an instance does not exist to do increment */
@@ -1792,7 +2227,8 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	  pos = db_get_int (peek_right);
 	  if (pos < 0)
 	    {
-	      if (QSTR_IS_BIT (TP_DOMAIN_TYPE (arithptr->leftptr->domain)))
+	      if (QSTR_IS_BIT (TP_DOMAIN_TYPE (qexec_get_node_domain (vd, arithptr->leftptr->domain,
+								      arithptr->leftptr->plan_item))))
 		{
 		  if (db_string_bit_length (peek_left, &tmp_len) != NO_ERROR)
 		    {
@@ -2208,7 +2644,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	{
 	  PRIM_SET_NULL (arithptr->value);
 	}
-      else if (db_from_unixtime (peek_left, peek_right, peek_third, arithptr->value, arithptr->domain) != NO_ERROR)
+      else if (db_from_unixtime (peek_left, peek_right, peek_third, arithptr->value, arith_domain) != NO_ERROR)
 	{
 	  goto error;
 	}
@@ -2341,7 +2777,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	{
 	  PRIM_SET_NULL (arithptr->value);
 	}
-      else if (db_time_format (peek_left, peek_right, peek_third, arithptr->value, arithptr->domain) != NO_ERROR)
+      else if (db_time_format (peek_left, peek_right, peek_third, arithptr->value, arith_domain) != NO_ERROR)
 	{
 	  goto error;
 	}
@@ -2502,7 +2938,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	}
       else
 	{
-	  if (db_add_time (peek_left, peek_right, arithptr->value, regu_var->domain) != NO_ERROR)
+	  if (db_add_time (peek_left, peek_right, arithptr->value, domain) != NO_ERROR)
 	    {
 	      goto error;
 	    }
@@ -2616,7 +3052,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	{
 	  PRIM_SET_NULL (arithptr->value);
 	}
-      else if (db_format (peek_left, peek_right, peek_third, arithptr->value, arithptr->domain) != NO_ERROR)
+      else if (db_format (peek_left, peek_right, peek_third, arithptr->value, arith_domain) != NO_ERROR)
 	{
 	  goto error;
 	}
@@ -2627,7 +3063,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	{
 	  PRIM_SET_NULL (arithptr->value);
 	}
-      else if (db_date_format (peek_left, peek_right, peek_third, arithptr->value, arithptr->domain) != NO_ERROR)
+      else if (db_date_format (peek_left, peek_right, peek_third, arithptr->value, arith_domain) != NO_ERROR)
 	{
 	  goto error;
 	}
@@ -2639,7 +3075,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	{
 	  PRIM_SET_NULL (arithptr->value);
 	}
-      else if (db_str_to_date (peek_left, peek_right, peek_third, arithptr->value, regu_var->domain) != NO_ERROR)
+      else if (db_str_to_date (peek_left, peek_right, peek_third, arithptr->value, domain) != NO_ERROR)
 	{
 	  goto error;
 	}
@@ -2850,7 +3286,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	{
 	  PRIM_SET_NULL (arithptr->value);
 	}
-      else if (db_to_char (peek_left, peek_right, peek_third, arithptr->value, arithptr->domain) != NO_ERROR)
+      else if (db_to_char (peek_left, peek_right, peek_third, arithptr->value, arith_domain) != NO_ERROR)
 	{
 	  goto error;
 	}
@@ -2951,7 +3387,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	  dom_status = tp_value_cast (peek_left, &tval, &tp_Char_domain, false);
 	  if (dom_status != DOMAIN_COMPATIBLE)
 	    {
-	      (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_left, arithptr->domain);
+	      (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_left, arith_domain);
 	      goto error;
 	    }
 	  if (db_to_date (&tval, peek_right, peek_third, arithptr->value) != NO_ERROR)
@@ -2980,7 +3416,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	  dom_status = tp_value_cast (peek_left, &tval, &tp_Char_domain, false);
 	  if (dom_status != DOMAIN_COMPATIBLE)
 	    {
-	      (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_left, arithptr->domain);
+	      (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_left, arith_domain);
 	      goto error;
 	    }
 	  if (db_to_time (&tval, peek_right, peek_third, DB_TYPE_TIME, arithptr->value) != NO_ERROR)
@@ -3013,7 +3449,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	      dom_status = tp_value_cast (peek_left, &tval, &tp_Char_domain, false);
 	      if (dom_status != DOMAIN_COMPATIBLE)
 		{
-		  (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_left, arithptr->domain);
+		  (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_left, arith_domain);
 		  goto error;
 		}
 	      if (db_to_timestamp (&tval, peek_right, peek_third, db_type, arithptr->value) != NO_ERROR)
@@ -3047,7 +3483,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	      dom_status = tp_value_cast (peek_left, &tval, &tp_Char_domain, false);
 	      if (dom_status != DOMAIN_COMPATIBLE)
 		{
-		  (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_left, arithptr->domain);
+		  (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_left, arith_domain);
 		  goto error;
 		}
 	      if (db_to_datetime (&tval, peek_right, peek_third, db_type, arithptr->value) != NO_ERROR)
@@ -3071,19 +3507,16 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	}
       else
 	{
+	  /* the value carries the precision and scale its format gives: the node's domain, a cached one the plan
+	   * shares, stays as compiled */
 	  if (db_to_number (peek_left, peek_right, peek_third, arithptr->value) != NO_ERROR)
 	    {
 	      goto error;
 	    }
-	  regu_var->domain->precision = arithptr->value->domain.numeric_info.precision;
-	  regu_var->domain->scale = arithptr->value->domain.numeric_info.scale;
 	}
       break;
 
     case T_CURRENT_VALUE:
-      /* serial.current_value() is not constant */
-      REGU_VARIABLE_SET_FLAG (regu_var, REGU_VARIABLE_FETCH_NOT_CONST);
-      assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST));
       if (DB_IS_NULL (peek_left) || DB_IS_NULL (peek_right))
 	{
 	  PRIM_SET_NULL (arithptr->value);
@@ -3104,9 +3537,6 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
       break;
 
     case T_NEXT_VALUE:
-      /* serial.next_value() is not constant */
-      REGU_VARIABLE_SET_FLAG (regu_var, REGU_VARIABLE_FETCH_NOT_CONST);
-      assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST));
       if (DB_IS_NULL (peek_left) || DB_IS_NULL (peek_right) || DB_IS_NULL (peek_third))
 	{
 	  PRIM_SET_NULL (arithptr->value);
@@ -3135,43 +3565,37 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	{
 	  pr_clone_value (peek_right, arithptr->value);
 
-	  if (TP_IS_CHAR_TYPE (TP_DOMAIN_TYPE (regu_var->domain)))
+	  if (TP_IS_CHAR_TYPE (TP_DOMAIN_TYPE (domain)))
 	    {
 	      if (!DB_IS_NULL (arithptr->value))
 		{
 		  assert (TP_IS_CHAR_TYPE (DB_VALUE_TYPE (arithptr->value)));
-		  assert (regu_var->domain->codeset == db_get_string_codeset (arithptr->value));
+		  assert (domain->codeset == db_get_string_codeset (arithptr->value));
 		}
-	      db_string_put_cs_and_collation (arithptr->value, regu_var->domain->codeset,
-					      regu_var->domain->collation_id);
+	      db_string_put_cs_and_collation (arithptr->value, domain->codeset, domain->collation_id);
 	    }
 	  else
 	    {
-	      assert (TP_DOMAIN_TYPE (regu_var->domain) == DB_TYPE_ENUMERATION);
+	      assert (TP_DOMAIN_TYPE (domain) == DB_TYPE_ENUMERATION);
 
 	      if (!DB_IS_NULL (arithptr->value))
 		{
 		  assert (DB_VALUE_DOMAIN_TYPE (arithptr->value) == DB_TYPE_ENUMERATION);
-		  assert (regu_var->domain->codeset == db_get_enum_codeset (arithptr->value));
+		  assert (domain->codeset == db_get_enum_codeset (arithptr->value));
 		}
-	      db_enum_put_cs_and_collation (arithptr->value, regu_var->domain->codeset, regu_var->domain->collation_id);
+	      db_enum_put_cs_and_collation (arithptr->value, domain->codeset, domain->collation_id);
 
 	    }
 	}
       else
 	{
-	  if (REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_STRICT_TYPE_CAST) && arithptr->opcode == T_CAST_WRAP)
-	    {
-	      dom_status = tp_value_cast (peek_right, arithptr->value, arithptr->domain, false);
-	    }
-	  else
-	    {
-	      dom_status = tp_value_cast_force (peek_right, arithptr->value, arithptr->domain, false);
-	    }
+	  dom_status = fetch_cast_operand (arithptr, 1, peek_right, arithptr->value, arith_domain,
+					   !REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_STRICT_TYPE_CAST)
+					   || arithptr->opcode != T_CAST_WRAP);
 
 	  if (dom_status != DOMAIN_COMPATIBLE)
 	    {
-	      (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_right, arithptr->domain);
+	      (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_right, arith_domain);
 	      goto error;
 	    }
 	}
@@ -3182,26 +3606,25 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	{
 	  pr_clone_value (peek_right, arithptr->value);
 
-	  if (TP_IS_CHAR_TYPE (TP_DOMAIN_TYPE (regu_var->domain)))
+	  if (TP_IS_CHAR_TYPE (TP_DOMAIN_TYPE (domain)))
 	    {
 	      if (!DB_IS_NULL (arithptr->value))
 		{
 		  assert (TP_IS_CHAR_TYPE (DB_VALUE_TYPE (arithptr->value)));
-		  assert (regu_var->domain->codeset == db_get_string_codeset (arithptr->value));
+		  assert (domain->codeset == db_get_string_codeset (arithptr->value));
 		}
-	      db_string_put_cs_and_collation (arithptr->value, regu_var->domain->codeset,
-					      regu_var->domain->collation_id);
+	      db_string_put_cs_and_collation (arithptr->value, domain->codeset, domain->collation_id);
 	    }
 	  else
 	    {
-	      assert (TP_DOMAIN_TYPE (regu_var->domain) == DB_TYPE_ENUMERATION);
+	      assert (TP_DOMAIN_TYPE (domain) == DB_TYPE_ENUMERATION);
 
 	      if (!DB_IS_NULL (arithptr->value))
 		{
 		  assert (DB_VALUE_DOMAIN_TYPE (arithptr->value) == DB_TYPE_ENUMERATION);
-		  assert (regu_var->domain->codeset == db_get_enum_codeset (arithptr->value));
+		  assert (domain->codeset == db_get_enum_codeset (arithptr->value));
 		}
-	      db_enum_put_cs_and_collation (arithptr->value, regu_var->domain->codeset, regu_var->domain->collation_id);
+	      db_enum_put_cs_and_collation (arithptr->value, domain->codeset, domain->collation_id);
 
 	    }
 	}
@@ -3209,7 +3632,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	{
 	  TP_DOMAIN_STATUS status;
 
-	  status = tp_value_cast (peek_right, arithptr->value, arithptr->domain, false);
+	  status = tp_value_cast (peek_right, arithptr->value, arith_domain, false);
 	  if (status != NO_ERROR)
 	    {
 	      PRIM_SET_NULL (arithptr->value);
@@ -3220,9 +3643,6 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
     case T_CASE:
     case T_DECODE:
     case T_IF:
-      /* set pred is not constant */
-      REGU_VARIABLE_SET_FLAG (regu_var, REGU_VARIABLE_FETCH_NOT_CONST);
-      assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST));
       /* fetch values */
       switch (eval_pred (thread_p, arithptr->pred, vd, obj_oid))
 	{
@@ -3245,18 +3665,20 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	  goto error;
 	}
 
-      dom_status = tp_value_auto_cast (peek_left, arithptr->value, regu_var->domain);
+      dom_status = tp_value_auto_cast (peek_left, arithptr->value, domain);
       if (dom_status != DOMAIN_COMPATIBLE)
 	{
-	  (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_left, regu_var->domain);
+	  (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_left, domain);
+	  goto error;
+	}
+      /* branches whose collations resolve_domains merged: the picked value takes the merged domain */
+      if (fetch_convert_to_resolved_branch (vd, arithptr->plan_item, arithptr->value) != NO_ERROR)
+	{
 	  goto error;
 	}
       break;
 
     case T_PREDICATE:
-      /* set pred is not constant */
-      REGU_VARIABLE_SET_FLAG (regu_var, REGU_VARIABLE_FETCH_NOT_CONST);
-      assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST));
       /* return 0,1 or NULL accordingly */
       peek_left = &tmp_value;
 
@@ -3275,10 +3697,10 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	  goto error;
 	}
 
-      dom_status = tp_value_auto_cast (peek_left, arithptr->value, regu_var->domain);
+      dom_status = tp_value_auto_cast (peek_left, arithptr->value, domain);
       if (dom_status != DOMAIN_COMPATIBLE)
 	{
-	  (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_left, regu_var->domain);
+	  (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_left, domain);
 	  goto error;
 	}
       break;
@@ -3290,7 +3712,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	DB_VALUE *src;
 	TP_DOMAIN *target_domain;
 
-	target_domain = regu_var->domain;
+	target_domain = domain;
 
 	if (fetch_peek_dbval (thread_p, arithptr->leftptr, vd, NULL, obj_oid, tplrec, &peek_left) != NO_ERROR)
 	  {
@@ -3305,18 +3727,23 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	      }
 	  }
 
+	if (target_domain == NULL && no_value_domain != NULL && DB_IS_NULL (peek_left) && DB_IS_NULL (peek_right))
+	  {
+	    /* resolve_domains found no value: every argument is NULL */
+	    PRIM_SET_NULL (arithptr->value);
+	    break;
+	  }
 	if (target_domain == NULL)
 	  {
-	    TP_DOMAIN *arg1, *arg2, tmp_arg1, tmp_arg2;
-
-	    arg1 = tp_domain_resolve_value (peek_left, &tmp_arg1);
-	    arg2 = tp_domain_resolve_value (peek_right, &tmp_arg2);
-
-	    target_domain = tp_infer_common_domain (arg1, arg2);
+	    /* no row infers a common domain: resolve_domains resolved the node, or found it takes no value, which only
+	     * NULL arguments give */
+	    (void) qexec_domain_unresolved (vd, arithptr->plan_item, regu_var->domain);
+	    goto error;
 	  }
 
 	src = DB_IS_NULL (peek_left) ? peek_right : peek_left;
-	dom_status = tp_value_cast (src, arithptr->value, target_domain, false);
+	dom_status = fetch_cast_operand (arithptr, DB_IS_NULL (peek_left) ? 1 : 0, src, arithptr->value, target_domain,
+					 false);
 	if (dom_status != DOMAIN_COMPATIBLE)
 	  {
 	    (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, src, target_domain);
@@ -3329,7 +3756,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	DB_VALUE *src;
 	TP_DOMAIN *target_domain;
 
-	target_domain = regu_var->domain;
+	target_domain = domain;
 
 	if (fetch_peek_dbval (thread_p, arithptr->leftptr, vd, NULL, obj_oid, tplrec, &peek_left) != NO_ERROR)
 	  {
@@ -3338,8 +3765,6 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 
 	if (target_domain == NULL)
 	  {
-	    TP_DOMAIN *arg1, *arg2, *arg3, tmp_arg1, tmp_arg2, tmp_arg3;
-
 	    if (fetch_peek_dbval (thread_p, arithptr->rightptr, vd, NULL, obj_oid, tplrec, &peek_right) != NO_ERROR)
 	      {
 		goto error;
@@ -3350,21 +3775,16 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 		goto error;
 	      }
 
-	    arg1 = tp_domain_resolve_value (peek_left, &tmp_arg1);
-	    arg2 = tp_domain_resolve_value (peek_right, &tmp_arg2);
-
-	    target_domain = tp_infer_common_domain (arg1, arg2);
-
-	    arg3 = NULL;
-	    if (peek_third)
+	    if (no_value_domain != NULL && DB_IS_NULL (peek_right) && DB_IS_NULL (peek_third))
 	      {
-		TP_DOMAIN *tmp_domain;
-
-		arg3 = tp_domain_resolve_value (peek_third, &tmp_arg3);
-		tmp_domain = tp_infer_common_domain (target_domain, arg3);
-
-		target_domain = tmp_domain;
+		/* resolve_domains found no value: both results are NULL */
+		PRIM_SET_NULL (arithptr->value);
+		break;
 	      }
+	    /* no row infers a common domain: resolve_domains resolved the node, or found it takes no value, which only
+	     * NULL arguments give */
+	    (void) qexec_domain_unresolved (vd, arithptr->plan_item, regu_var->domain);
+	    goto error;
 	  }
 
 	if (DB_IS_NULL (peek_left))
@@ -3391,7 +3811,8 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	    src = peek_right;
 	  }
 
-	dom_status = tp_value_cast (src, arithptr->value, target_domain, false);
+	dom_status = fetch_cast_operand (arithptr, DB_IS_NULL (peek_left) ? 2 : 1, src, arithptr->value, target_domain,
+					 false);
 	if (dom_status != DOMAIN_COMPATIBLE)
 	  {
 	    (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, src, target_domain);
@@ -3415,17 +3836,17 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
     case T_CONCAT:
       if (arithptr->rightptr != NULL)
 	{
-	  if (qdata_strcat_dbval (peek_left, peek_right, arithptr->value, regu_var->domain) != NO_ERROR)
+	  if (qdata_strcat_dbval (peek_left, peek_right, arithptr->value, domain) != NO_ERROR)
 	    {
 	      goto error;
 	    }
 	}
       else
 	{
-	  dom_status = tp_value_auto_cast (peek_left, arithptr->value, regu_var->domain);
+	  dom_status = tp_value_auto_cast (peek_left, arithptr->value, domain);
 	  if (dom_status != DOMAIN_COMPATIBLE)
 	    {
-	      (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_left, regu_var->domain);
+	      (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_left, domain);
 	      goto error;
 	    }
 	}
@@ -3445,19 +3866,19 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	    }
 	  else if (DB_IS_NULL (peek_left))
 	    {
-	      dom_status = tp_value_auto_cast (peek_right, arithptr->value, regu_var->domain);
+	      dom_status = tp_value_auto_cast (peek_right, arithptr->value, domain);
 	      if (dom_status != DOMAIN_COMPATIBLE)
 		{
-		  (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_right, regu_var->domain);
+		  (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_right, domain);
 		  goto error;
 		}
 	    }
 	  else if (DB_IS_NULL (peek_right))
 	    {
-	      dom_status = tp_value_auto_cast (peek_left, arithptr->value, regu_var->domain);
+	      dom_status = tp_value_auto_cast (peek_left, arithptr->value, domain);
 	      if (dom_status != DOMAIN_COMPATIBLE)
 		{
-		  (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_left, regu_var->domain);
+		  (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_left, domain);
 		  goto error;
 		}
 	    }
@@ -3466,11 +3887,11 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	      DB_VALUE tmp_val;
 
 	      db_make_null (&tmp_val);
-	      if (qdata_strcat_dbval (peek_left, peek_third, &tmp_val, regu_var->domain) != NO_ERROR)
+	      if (qdata_strcat_dbval (peek_left, peek_third, &tmp_val, domain) != NO_ERROR)
 		{
 		  goto error;
 		}
-	      if (qdata_strcat_dbval (&tmp_val, peek_right, arithptr->value, regu_var->domain) != NO_ERROR)
+	      if (qdata_strcat_dbval (&tmp_val, peek_right, arithptr->value, domain) != NO_ERROR)
 		{
 		  (void) pr_clear_value (&tmp_val);
 		  goto error;
@@ -3486,10 +3907,10 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	    }
 	  else
 	    {
-	      dom_status = tp_value_auto_cast (peek_left, arithptr->value, regu_var->domain);
+	      dom_status = tp_value_auto_cast (peek_left, arithptr->value, domain);
 	      if (dom_status != DOMAIN_COMPATIBLE)
 		{
-		  (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_left, regu_var->domain);
+		  (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, peek_left, domain);
 		  goto error;
 		}
 	    }
@@ -3507,7 +3928,10 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	  bool can_compare = false;
 	  int cmp_res = DB_UNK;
 
-	  cmp_res = tp_value_compare_with_error (peek_third, peek_left, 1, 0, &can_compare);
+	  /* the comparisons the load or resolve_domains resolved */
+	  cmp_res =
+	    eval_compare_values_resolved (thread_p, fetch_arith_compare (arithptr, 0), vd, peek_third, peek_left, 0,
+					  &can_compare);
 	  if (cmp_res == DB_EQ)
 	    {
 	      db_make_int (arithptr->value, 1);
@@ -3519,7 +3943,9 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	    }
 
 
-	  cmp_res = tp_value_compare_with_error (peek_third, peek_right, 1, 0, &can_compare);
+	  cmp_res =
+	    eval_compare_values_resolved (thread_p, fetch_arith_compare (arithptr, 1), vd, peek_third, peek_right, 0,
+					  &can_compare);
 	  if (cmp_res == DB_EQ)
 	    {
 	      db_make_int (arithptr->value, 2);
@@ -3553,7 +3979,9 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	      bool can_compare = false;
 	      int cmp_res = DB_UNK;
 
-	      cmp_res = tp_value_compare_with_error (peek_third, peek_right, 1, 0, &can_compare);
+	      cmp_res =
+		eval_compare_values_resolved (thread_p, fetch_arith_compare (arithptr, 1), vd, peek_third, peek_right,
+					      0, &can_compare);
 	      if (cmp_res == DB_EQ)
 		{
 		  /* match */
@@ -3627,7 +4055,8 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	{
 	  DB_VALUE tmp_val, tmp_val2;
 
-	  if (QSTR_IS_BIT (TP_DOMAIN_TYPE (arithptr->leftptr->domain)))
+	  if (QSTR_IS_BIT (TP_DOMAIN_TYPE (qexec_get_node_domain (vd, arithptr->leftptr->domain,
+								  arithptr->leftptr->plan_item))))
 	    {
 	      if (db_string_bit_length (peek_left, &tmp_val) != NO_ERROR)
 		{
@@ -3761,7 +4190,8 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 
 	  if (pos < 0)
 	    {
-	      if (QSTR_IS_BIT (TP_DOMAIN_TYPE (arithptr->leftptr->domain)))
+	      if (QSTR_IS_BIT (TP_DOMAIN_TYPE (qexec_get_node_domain (vd, arithptr->leftptr->domain,
+								      arithptr->leftptr->plan_item))))
 		{
 		  if (db_string_bit_length (peek_left, &tmp_len) != NO_ERROR)
 		    {
@@ -3865,7 +4295,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	bool can_compare = false;
 	int cmp_res = DB_UNK;
 
-	target_domain = regu_var->domain;
+	target_domain = domain;
 	if (DB_IS_NULL (peek_left))
 	  {
 	    PRIM_SET_NULL (arithptr->value);
@@ -3873,15 +4303,16 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	  }
 	else if (target_domain == NULL)
 	  {
-	    TP_DOMAIN *arg1, *arg2, tmp_arg1, tmp_arg2;
-
-	    arg1 = tp_domain_resolve_value (peek_left, &tmp_arg1);
-	    arg2 = tp_domain_resolve_value (peek_right, &tmp_arg2);
-
-	    target_domain = tp_infer_common_domain (arg1, arg2);
+	    /* no row infers a common domain: resolve_domains resolved the node, or found it takes no value, which only
+	     * NULL arguments give */
+	    (void) qexec_domain_unresolved (vd, arithptr->plan_item, regu_var->domain);
+	    goto error;
 	  }
 
-	cmp_res = tp_value_compare_with_error (peek_left, peek_right, 1, 0, &can_compare);
+	/* the comparison the load or resolve_domains resolved */
+	cmp_res =
+	  eval_compare_values_resolved (thread_p, fetch_arith_compare (arithptr, 0), vd, peek_left, peek_right, 0,
+					&can_compare);
 	if (cmp_res == DB_EQ)
 	  {
 	    PRIM_SET_NULL (arithptr->value);
@@ -3903,7 +4334,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
       break;
 
     case T_EXTRACT:
-      if (qdata_extract_dbval (arithptr->misc_operand, peek_right, arithptr->value, regu_var->domain) != NO_ERROR)
+      if (qdata_extract_dbval (arithptr->misc_operand, peek_right, arithptr->value, domain) != NO_ERROR)
 	{
 	  goto error;
 	}
@@ -3914,21 +4345,24 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	int error;
 	TP_DOMAIN *target_domain;
 
-	error = db_least_or_greatest (peek_left, peek_right, arithptr->value, true);
+	error = fetch_least_or_greatest (thread_p, arithptr, vd, peek_left, peek_right, true);
 	if (error != NO_ERROR)
 	  {
 	    goto error;
 	  }
 
-	target_domain = regu_var->domain;
+	target_domain = domain;
+	if (target_domain == NULL && no_value_domain != NULL && DB_IS_NULL (arithptr->value))
+	  {
+	    /* resolve_domains found no value */
+	    break;
+	  }
 	if (target_domain == NULL)
 	  {
-	    TP_DOMAIN *arg1, *arg2, tmp_arg1, tmp_arg2;
-
-	    arg1 = tp_domain_resolve_value (peek_left, &tmp_arg1);
-	    arg2 = tp_domain_resolve_value (peek_right, &tmp_arg2);
-
-	    target_domain = tp_infer_common_domain (arg1, arg2);
+	    /* no row infers a common domain: resolve_domains resolved the node, or found it takes no value, which only
+	     * NULL arguments give */
+	    (void) qexec_domain_unresolved (vd, arithptr->plan_item, regu_var->domain);
+	    goto error;
 	  }
 
 	dom_status = tp_value_cast (arithptr->value, arithptr->value, target_domain, false);
@@ -3945,21 +4379,24 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	int error;
 	TP_DOMAIN *target_domain;
 
-	error = db_least_or_greatest (peek_left, peek_right, arithptr->value, false);
+	error = fetch_least_or_greatest (thread_p, arithptr, vd, peek_left, peek_right, false);
 	if (error != NO_ERROR)
 	  {
 	    goto error;
 	  }
 
-	target_domain = regu_var->domain;
+	target_domain = domain;
+	if (target_domain == NULL && no_value_domain != NULL && DB_IS_NULL (arithptr->value))
+	  {
+	    /* resolve_domains found no value */
+	    break;
+	  }
 	if (target_domain == NULL)
 	  {
-	    TP_DOMAIN *arg1, *arg2, tmp_arg1, tmp_arg2;
-
-	    arg1 = tp_domain_resolve_value (peek_left, &tmp_arg1);
-	    arg2 = tp_domain_resolve_value (peek_right, &tmp_arg2);
-
-	    target_domain = tp_infer_common_domain (arg1, arg2);
+	    /* no row infers a common domain: resolve_domains resolved the node, or found it takes no value, which only
+	     * NULL arguments give */
+	    (void) qexec_domain_unresolved (vd, arithptr->plan_item, regu_var->domain);
+	    goto error;
 	  }
 
 	dom_status = tp_value_cast (arithptr->value, arithptr->value, target_domain, false);
@@ -3979,17 +4416,17 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 	    goto error;
 	  }
 
-	dom_status = tp_value_auto_cast (arithptr->value, arithptr->value, regu_var->domain);
+	dom_status = tp_value_auto_cast (arithptr->value, arithptr->value, domain);
 	if (dom_status != DOMAIN_COMPATIBLE)
 	  {
-	    (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, arithptr->value, regu_var->domain);
+	    (void) tp_domain_status_er_set (dom_status, ARG_FILE_LINE, arithptr->value, domain);
 	    goto error;
 	  }
 	break;
       }
 
     case T_STRCAT:
-      if (qdata_strcat_dbval (peek_left, peek_right, arithptr->value, regu_var->domain) != NO_ERROR)
+      if (qdata_strcat_dbval (peek_left, peek_right, arithptr->value, domain) != NO_ERROR)
 	{
 	  goto error;
 	}
@@ -4000,9 +4437,6 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
       break;
 
     case T_ROW_COUNT:
-      /* session info is not constant */
-      REGU_VARIABLE_SET_FLAG (regu_var, REGU_VARIABLE_FETCH_NOT_CONST);
-      assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST));
       {
 	int row_count = -1;
 	if (session_get_row_count (thread_p, &row_count) != NO_ERROR)
@@ -4014,9 +4448,6 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
       break;
 
     case T_LAST_INSERT_ID:
-      /* session info is not constant */
-      REGU_VARIABLE_SET_FLAG (regu_var, REGU_VARIABLE_FETCH_NOT_CONST);
-      assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST));
       if (session_get_last_insert_id (thread_p, arithptr->value, true) != NO_ERROR)
 	{
 	  goto error;
@@ -4024,19 +4455,17 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
       break;
 
     case T_EVALUATE_VARIABLE:
-      /* session info is not constant */
-      REGU_VARIABLE_SET_FLAG (regu_var, REGU_VARIABLE_FETCH_NOT_CONST);
-      assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST));
       if (session_get_variable (thread_p, peek_right, arithptr->value) != NO_ERROR)
+	{
+	  goto error;
+	}
+      if (fetch_session_read_value (vd, arithptr, peek_right) != NO_ERROR)
 	{
 	  goto error;
 	}
       break;
 
     case T_DEFINE_VARIABLE:
-      /* session info is not constant */
-      REGU_VARIABLE_SET_FLAG (regu_var, REGU_VARIABLE_FETCH_NOT_CONST);
-      assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST));
       if (session_define_variable (thread_p, peek_left, peek_right, arithptr->value) != NO_ERROR)
 	{
 	  goto error;
@@ -4045,9 +4474,6 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 
     case T_RAND:
     case T_RANDOM:
-      /* random(), drandom() is not constant */
-      REGU_VARIABLE_SET_FLAG (regu_var, REGU_VARIABLE_FETCH_NOT_CONST);
-      assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST));
       if (DB_IS_NULL (peek_right))
 	{
 	  /* When random functions are called without a seed, peek_right is null. In this case, rand() or drand() uses
@@ -4110,9 +4536,6 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 
     case T_DRAND:
     case T_DRANDOM:
-      /* random(), drandom() is not constant */
-      REGU_VARIABLE_SET_FLAG (regu_var, REGU_VARIABLE_FETCH_NOT_CONST);
-      assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST));
       if (DB_IS_NULL (peek_right))
 	{
 	  if (arithptr->opcode == T_DRAND)
@@ -4163,16 +4586,13 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
       break;
 
     case T_LIST_DBS:
-      if (qdata_list_dbs (thread_p, arithptr->value, arithptr->domain) != NO_ERROR)
+      if (qdata_list_dbs (thread_p, arithptr->value, arith_domain) != NO_ERROR)
 	{
 	  goto error;
 	}
       break;
 
     case T_SYS_GUID:
-      /* sys_guid() is not constant */
-      REGU_VARIABLE_SET_FLAG (regu_var, REGU_VARIABLE_FETCH_NOT_CONST);
-      assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST));
       if (db_uuidv4 (arithptr->value) != NO_ERROR)
 	{
 	  goto error;
@@ -4181,8 +4601,6 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 
     case T_UUID:
       {
-	REGU_VARIABLE_SET_FLAG (regu_var, REGU_VARIABLE_FETCH_NOT_CONST);
-	assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST));
 	int version;
 	if (DB_IS_NULL (peek_right))
 	  {
@@ -4247,9 +4665,6 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
       break;
 
     case T_EXEC_STATS:
-      /* session info is not constant */
-      REGU_VARIABLE_SET_FLAG (regu_var, REGU_VARIABLE_FETCH_NOT_CONST);
-      assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST));
       if (session_get_exec_stats_and_clear (thread_p, peek_right, arithptr->value) != NO_ERROR)
 	{
 	  goto error;
@@ -4257,7 +4672,7 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
       break;
 
     case T_TO_ENUMERATION_VALUE:
-      if (db_value_to_enumeration_value (peek_right, arithptr->value, arithptr->domain) != NO_ERROR)
+      if (db_value_to_enumeration_value (peek_right, arithptr->value, arith_domain) != NO_ERROR)
 	{
 	  goto error;
 	}
@@ -4294,9 +4709,6 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
       break;
 
     case T_TRACE_STATS:
-      /* session info is not constant */
-      REGU_VARIABLE_SET_FLAG (regu_var, REGU_VARIABLE_FETCH_NOT_CONST);
-      assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST));
       if (session_get_trace_stats (thread_p, arithptr->value) != NO_ERROR)
 	{
 	  goto error;
@@ -4318,9 +4730,6 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
       break;
 
     case T_SLEEP:
-      /* sleep() is not constant */
-      REGU_VARIABLE_SET_FLAG (regu_var, REGU_VARIABLE_FETCH_NOT_CONST);
-      assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST));
       if (db_sleep (arithptr->value, peek_right) != NO_ERROR)
 	{
 	  goto error;
@@ -4465,134 +4874,89 @@ fetch_peek_arith (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
 
   *peek_dbval = arithptr->value;
 
-  if (original_domain != NULL && TP_DOMAIN_TYPE (original_domain) == DB_TYPE_VARIABLE)
-    {
-      TP_DOMAIN *resolved_dom = tp_domain_resolve_value (arithptr->value, NULL);
 
-      /* keep DB_TYPE_VARIABLE if resolved domain is NULL */
-      if (TP_DOMAIN_TYPE (resolved_dom) != DB_TYPE_NULL)
+  if (no_value_domain != NULL)
+    {
+      /* FETCH_RESOLVED_NO_VALUE: resolve_domains found the node takes no value, so the row gave NULL or raised the
+       * operator's error (a return_null_on_function_errors NULL included); the node binds nothing: an unbound node
+       * whose value is NULL keeps its variable domain */
+      assert (DB_IS_NULL (arithptr->value));
+      if (!DB_IS_NULL (arithptr->value))
 	{
-	  regu_var->domain = arithptr->domain = resolved_dom;
+	  (void) domain_unresolved_error ("", qexec_item_index (vd, arithptr->plan_item), DB_TYPE_NULL);
+	  goto error;
 	}
-      else
-	{
-	  regu_var->domain = arithptr->domain = original_domain;
-	}
+      domain = no_value_domain;
     }
 
-  if (arithptr->domain != NULL && arithptr->domain->collation_flag != TP_DOMAIN_COLL_NORMAL
-      && !DB_IS_NULL (arithptr->value))
+  if (arith_domain != NULL && arith_domain->collation_flag != TP_DOMAIN_COLL_NORMAL && !DB_IS_NULL (arithptr->value))
     {
-      TP_DOMAIN *resolved_dom;
+      assert (TP_TYPE_HAS_COLLATION (arith_domain->type->id));
 
-      assert (TP_TYPE_HAS_COLLATION (arithptr->domain->type->id));
-
-      resolved_dom = tp_domain_resolve_value (arithptr->value, NULL);
-
-      /* keep DB_TYPE_VARIABLE if resolved domain is NULL */
-      if (TP_DOMAIN_TYPE (resolved_dom) != DB_TYPE_NULL)
+      const TP_DOMAIN *resolved_domain = qexec_resolved_domain (vd, arithptr->plan_item);
+      if (resolved_domain != NULL)
 	{
-	  regu_var->domain = resolved_dom;
-	}
-    }
-
-  /* check for the first time */
-  if (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST)
-      && !REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_NOT_CONST))
-    {
-      int not_const = 0;
-
-      assert (arithptr->pred == NULL);
-
-      if (arithptr->leftptr == NULL || REGU_VARIABLE_IS_FLAGED (arithptr->leftptr, REGU_VARIABLE_FETCH_ALL_CONST))
-	{
-	  ;			/* is_const, go ahead */
+	  /* resolve_domains resolved this string's domain once for the execution from its operands' resolved domains;
+	   * the row reads it in place of its value's. A NULL value keeps the compiled domain. */
+#if !defined (NDEBUG)
+	  /* debug cross-check: the resolution is the value's domain but for a string's precision, which stays the
+	   * value's */
+	  {
+	    const TP_DOMAIN *value_domain = tp_domain_resolve_value (arithptr->value, NULL);
+	    assert (value_domain == NULL || (TP_DOMAIN_TYPE (value_domain) == TP_DOMAIN_TYPE (resolved_domain)
+					     && (!TP_TYPE_HAS_COLLATION (TP_DOMAIN_TYPE (resolved_domain))
+						 || (value_domain->codeset == resolved_domain->codeset
+						     && value_domain->collation_id == resolved_domain->collation_id))));
+	  }
+#endif
+	  domain = (TP_DOMAIN *) resolved_domain;
+	  qexec_set_node_domain (vd, regu_var->plan_item, regu_var->domain, domain);
 	}
       else
 	{
-	  not_const++;
-	}
-
-      if (arithptr->rightptr == NULL || REGU_VARIABLE_IS_FLAGED (arithptr->rightptr, REGU_VARIABLE_FETCH_ALL_CONST))
-	{
-	  ;			/* is_const, go ahead */
-	}
-      else
-	{
-	  not_const++;
-	}
-
-      if (arithptr->thirdptr == NULL || REGU_VARIABLE_IS_FLAGED (arithptr->thirdptr, REGU_VARIABLE_FETCH_ALL_CONST))
-	{
-	  ;			/* is_const, go ahead */
-	}
-      else
-	{
-	  not_const++;
-	}
-
-      if (not_const == 0)
-	{
-	  REGU_VARIABLE_SET_FLAG (regu_var, REGU_VARIABLE_FETCH_ALL_CONST);
-	  assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_NOT_CONST));
-	}
-      else
-	{
-	  REGU_VARIABLE_SET_FLAG (regu_var, REGU_VARIABLE_FETCH_NOT_CONST);
-	  assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST));
+	  /* resolve_domains resolves every string, a string over a session variable read too: a string
+	   * without a resolution fails the unresolved-domain check (execution) */
+	  (void) domain_unresolved_error ("", qexec_item_index (vd, arithptr->plan_item),
+					  TP_DOMAIN_TYPE (arith_domain));
+	  goto error;
 	}
     }
 
 fetch_peek_arith_end:
 
-  assert (REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST)
-	  || REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_NOT_CONST));
-
 #if !defined(NDEBUG)
+  /* the operators a fetch never caches are the load's non-cacheable ones, which resolve_domains evaluates none of */
   switch (arithptr->opcode)
     {
-      /* incr/decr is not constant */
     case T_INCR:
     case T_DECR:
-      /* serial.current_value(), serial.next_value() is not constant */
     case T_CURRENT_VALUE:
     case T_NEXT_VALUE:
-      /* set pred is not constant */
     case T_CASE:
     case T_DECODE:
     case T_IF:
     case T_PREDICATE:
-      /* session info is not constant */
     case T_ROW_COUNT:
     case T_LAST_INSERT_ID:
     case T_EVALUATE_VARIABLE:
     case T_DEFINE_VARIABLE:
     case T_EXEC_STATS:
     case T_TRACE_STATS:
-      /* random(), drandom() is not constant */
     case T_RAND:
     case T_RANDOM:
     case T_DRAND:
     case T_DRANDOM:
-      /* sys_guid() is not constant */
     case T_SYS_GUID:
-      /* uuid() is not constant */
     case T_UUID:
-      /* sleep() is not constant */
     case T_SLEEP:
-
-      assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST));
-      assert (REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_NOT_CONST));
+      assert (arithptr->plan_item == NULL || arithptr->plan_item->operand_class == OPERAND_NON_CACHEABLE);
       break;
     default:
       break;
     }
-
-  /* set pred is not constant */
   if (arithptr->pred != NULL)
     {
-      assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST));
-      assert (REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_NOT_CONST));
+      assert (arithptr->plan_item == NULL || arithptr->plan_item->operand_class == OPERAND_NON_CACHEABLE);
     }
 #endif
 
@@ -4603,13 +4967,62 @@ fetch_peek_arith_end:
 error:
   thread_dec_recursion_depth (thread_p);
 
-  if (original_domain)
-    {
-      /* restores regu variable domain */
-      regu_var->domain = original_domain;
-    }
-
+  /* nothing to restore: a late or unbound computation took no execution domain */
   return ER_FAILED;
+}
+
+/*
+ * fetch_read_plan_domain () - a variable regu takes the domain resolve_domains resolved for it as its execution domain
+ *   for the rest of the execution
+ *   return: NO_ERROR, or ER_QPROC_DOMAIN_UNRESOLVED at the unresolved-domain check (execution)
+ *   regu_var(in): a regu whose compiled domain is VARIABLE or leaves its collation variable
+ *   value(in): its non-NULL value of this row
+ *
+ * resolve_domains recorded a variable POS's bound value domain (codeset and collation included), and a derived consumer
+ * or a string function reads its producer's or its own resolution, so the domain the first value would give is
+ * already there, a resolution over a session variable read included: the variable keeps the type resolve_domains gave
+ * it for the statement. A bind value is the one resolve_domains saw: a comparison converts its constant into a value of
+ * its own, not in place.
+ */
+/*
+ * [리뷰] fetch_read_plan_domain — fetch_peek_dbval_slow 이 값이 있는 regu 를 돌려주기 직전, 그 regu 의 컴파일 도메인이 variable 이면
+ * 게이트가 정해 둔 도메인을 이 실행의 슬롯에 세팅한다. 성공이면 NO_ERROR, 해결이 없으면 ER_QPROC_DOMAIN_UNRESOLVED.
+ * develop: develop 에 없음 — develop 은 같은 자리에서 `regu_var->domain = tp_domain_resolve_value (*peek_dbval, NULL);`
+ * 로 값에서 역산한 도메인을 공유 regu 노드에 직접 썼다.
+ * 이 PR: qexec_plan_domain 으로 읽고 qexec_set_node_domain 으로 실행 슬롯에만 쓴다. 디버그 빌드에서는 값에서 역산한 도메인과
+ * 타입·codeset·collation 이 같은지(precision 만 다를 수 있음) assert 하고, TYPE_POSITION 이면 리스트 스캔이 이미 같은 도메인을 채워 뒀음도 assert
+ * 한다.
+ * 바뀐 것: 신설 약 40줄, develop 의 2줄 대입 삭제. '행이 도메인을 쓴다'가 '행이 도메인을 읽는다'로 바뀌는 대표 자리다.
+ */
+static inline int
+fetch_read_plan_domain (REGU_VARIABLE * regu_var, val_descr * vd, const DB_VALUE * value)
+{
+  /* a regu fetched without a descriptor with resolved-domain state has no resolution to read: the unresolved-domain
+   * check */
+  const DOMAIN_PLAN_ITEM *item = vd != NULL && vd->xasl_state != NULL ? regu_var->plan_item : NULL;
+  const TP_DOMAIN *resolved = qexec_plan_domain (vd, item);
+  if (resolved != NULL)
+    {
+#if !defined (NDEBUG)
+      /* the resolution is the value's domain but for a string's precision, which stays the value's */
+      const TP_DOMAIN *from_value = tp_domain_resolve_value (value, NULL);
+      assert (from_value == NULL || (TP_DOMAIN_TYPE (from_value) == TP_DOMAIN_TYPE (resolved)
+				     && (!TP_TYPE_HAS_COLLATION (TP_DOMAIN_TYPE (resolved))
+					 || (from_value->codeset == resolved->codeset
+					     && from_value->collation_id == resolved->collation_id))));
+#endif
+      /* a list position's resolution is its list scan's resolved column, which the position's execution domain holds
+       * already */
+      assert (regu_var->type != TYPE_POSITION
+	      || qexec_get_node_domain (vd, regu_var->value.pos_descr.dom,
+					regu_var->value.pos_descr.plan_item) == resolved
+	      || domain_is_variable (regu_var->value.pos_descr.dom));
+      qexec_set_node_domain (vd, regu_var->plan_item, regu_var->domain, resolved);
+      return NO_ERROR;
+    }
+  /* resolve_domains resolves every variable regu, one over a session variable read too: none here fails the
+   * unresolved-domain check (execution) */
+  return domain_unresolved_error ("", qexec_item_index (vd, item), TP_DOMAIN_TYPE (regu_var->domain));
 }
 
 /*
@@ -4623,6 +5036,19 @@ error:
  *   tplrec(in): tuple slot (record + layout descriptor)
  *   peek_dbval(out): Set to the value ref resulting from the fetch operation
  *
+ */
+/*
+ * [리뷰] fetch_peek_dbval_slow — fetch_peek_dbval 의 인라인 빠른 경로가 처리하지 못하는 모든 REGU 타입을 타입별로 분기해 값 포인터를 돌려주는 본체 — 모든
+ * 행 평가의 입구다.
+ * develop: 타입마다 REGU_VARIABLE_FETCH_ALL_CONST / NOT_CONST 를 노드에 기록했고, TYPE_POSITION 은 pos_descr.dom 을 그대로 컬럼
+ * 도메인으로 썼고, TYPE_POS_VALUE 는 vd->dbval_ptr + val_pos 를 읽었고, 끝에서 variable·collation 도메인이면 regu_var->domain 을
+ * 값에서 역산해 덮어썼으며, 안정적인 regu 에 REGU_VARIABLE_FAST_PEEK 를 실행 중에 세웠다. TYPE_SP 는 fetch_force_not_const_recursive 로
+ * 하위 트리의 플래그를 강제했다.
+ * 이 PR: 플래그 기록이 전부 사라졌다(상수 판정은 fetch_constant_evaluated). TYPE_POSITION 은 qexec_get_node_domain 이 준 실행 도메인으로
+ * 컬럼을 읽고, TYPE_POS_VALUE 는 plan_item 이 있으면 REGU_RESOLVED_VALUE 로 바인드 참조별 자기 값을 읽는다. variable 이면
+ * fetch_read_plan_domain, APPLY_COLLATION 도 실행 도메인으로 적용하고, REGUVAL_LIST 의 행별 타입 대조도 실행 도메인끼리 한다. FAST_PEEK 를
+ * 실행 중에 세우는 블록은 통째로 삭제됐다(이제 로드가 세운다).
+ * 바뀐 것: 약 250줄 삭제(플래그 기록·함수 상수 판정 switch·FAST_PEEK 설정), 약 60줄 추가. 이 함수가 공유 regu 노드에 쓰는 일이 없어졌다.
  */
 int
 fetch_peek_dbval_slow (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr * vd, OID * class_oid,
@@ -4641,9 +5067,6 @@ fetch_peek_dbval_slow (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_de
     case TYPE_ATTR_ID:		/* fetch object attribute value */
     case TYPE_SHARED_ATTR_ID:
     case TYPE_CLASS_ATTR_ID:
-      /* is not constant */
-      REGU_VARIABLE_SET_FLAG (regu_var, REGU_VARIABLE_FETCH_NOT_CONST);
-      assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST));
       if (regu_var->value.attr_descr.cache_slot != NULL
 	  && regu_var->value.attr_descr.cache_slot->state == HEAP_LAZY_ATTRVALUE
 	  && regu_var->value.attr_descr.cache_attrinfo->lazy_recdes != NULL)
@@ -4700,39 +5123,37 @@ fetch_peek_dbval_slow (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_de
       break;
 
     case TYPE_OID:		/* fetch object identifier value */
-      REGU_VARIABLE_SET_FLAG (regu_var, REGU_VARIABLE_FETCH_ALL_CONST);
-      assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_NOT_CONST));
       *peek_dbval = &regu_var->value.dbval;
       db_make_oid (*peek_dbval, obj_oid);
       break;
 
     case TYPE_CLASSOID:	/* fetch class identifier value */
-      REGU_VARIABLE_SET_FLAG (regu_var, REGU_VARIABLE_FETCH_ALL_CONST);
-      assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_NOT_CONST));
       *peek_dbval = &regu_var->value.dbval;
       db_make_oid (*peek_dbval, class_oid);
       break;
 
     case TYPE_POSITION:	/* fetch list file tuple value */
-      /* is not constant */
-      REGU_VARIABLE_SET_FLAG (regu_var, REGU_VARIABLE_FETCH_NOT_CONST);
-      assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST));
 
       pr_clear_value (regu_var->vfetch_to);
 
       *peek_dbval = regu_var->vfetch_to;
 
-      /* slot accessor: layout from the bound descriptor, domain from the regu; NULL column leaves vfetch_to as is */
-      if (regu_var->value.pos_descr.dom->type == NULL)
-	{
-	  goto exit_on_error;
-	}
-      if (qfile_slot_read_column_value
-	  (tplrec, regu_var->value.pos_descr.pos_no, regu_var->value.pos_descr.dom, *peek_dbval,
-	   false /* Don't copy */ , &is_null) != NO_ERROR)
-	{
-	  goto exit_on_error;
-	}
+      /* slot accessor: layout from the bound descriptor, domain from the position's execution domain - the list scan
+       * or the block that reads the list gave a variable position its resolved domain; NULL column leaves vfetch_to
+       * as is */
+      {
+	TP_DOMAIN *column_domain =
+	  qexec_get_node_domain (vd, regu_var->value.pos_descr.dom, regu_var->value.pos_descr.plan_item);
+	if (column_domain->type == NULL)
+	  {
+	    goto exit_on_error;
+	  }
+	if (qfile_slot_read_column_value (tplrec, regu_var->value.pos_descr.pos_no, column_domain, *peek_dbval,
+					  false /* Don't copy */ , &is_null) != NO_ERROR)
+	  {
+	    goto exit_on_error;
+	  }
+      }
       break;
 
     case TYPE_POS_VALUE:	/* fetch positional value */
@@ -4744,15 +5165,14 @@ fetch_peek_dbval_slow (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_de
 	}
 #endif
 
-      REGU_VARIABLE_SET_FLAG (regu_var, REGU_VARIABLE_FETCH_ALL_CONST);
-      assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_NOT_CONST));
-      *peek_dbval = (DB_VALUE *) vd->dbval_ptr + regu_var->value.val_pos;
+      /* each bind reference reads its own value. An operand-less aggregate's placeholder operand
+       * (GROUPBY_NUM: an unset TYPE_POS_VALUE, no domain) is no bind reference and has no item; it reads its position
+       * (none when there are no values) */
+      *peek_dbval = regu_var->plan_item != NULL ? (DB_VALUE *) REGU_RESOLVED_VALUE (vd, regu_var)
+	: (DB_VALUE *) vd->dbval_ptr + regu_var->value.val_pos;
       break;
 
     case TYPE_CONSTANT:	/* fetch constant-column value */
-      /* is not constant */
-      REGU_VARIABLE_SET_FLAG (regu_var, REGU_VARIABLE_FETCH_NOT_CONST);
-      assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST));
       xasl = regu_var->xasl;
       if (xasl && XASL_IS_FLAGED (xasl, XASL_USES_SQ_CACHE) && !(SQ_CACHE_HT (xasl) && !SQ_CACHE_ENABLED (xasl)))
 	{
@@ -4794,22 +5214,14 @@ fetch_peek_dbval_slow (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_de
       break;
 
     case TYPE_ORDERBY_NUM:
-      /* is not constant */
-      REGU_VARIABLE_SET_FLAG (regu_var, REGU_VARIABLE_FETCH_NOT_CONST);
-      assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST));
       *peek_dbval = regu_var->value.dbvalptr;
       break;
 
     case TYPE_DBVAL:		/* fetch db_value */
-      REGU_VARIABLE_SET_FLAG (regu_var, REGU_VARIABLE_FETCH_ALL_CONST);
-      assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_NOT_CONST));
       *peek_dbval = &regu_var->value.dbval;
       break;
 
     case TYPE_REGUVAL_LIST:
-      /* is not constant */
-      REGU_VARIABLE_SET_FLAG (regu_var, REGU_VARIABLE_FETCH_NOT_CONST);
-      assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST));
       reguval_list = regu_var->value.reguval_list;
       assert (reguval_list != NULL);
       assert (reguval_list->current_value != NULL);
@@ -4837,9 +5249,6 @@ fetch_peek_dbval_slow (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_de
 	{
 	  goto exit_on_error;
 	}
-
-      assert (REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST)
-	      || REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_NOT_CONST));
       break;
 
     case TYPE_SP:		/* fetch stored procedure value */
@@ -4850,7 +5259,6 @@ fetch_peek_dbval_slow (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_de
 
 	/* clear any value from a previous iteration */
 	pr_clear_value (regu_var->value.sp_ptr->value);
-	fetch_force_not_const_recursive (*regu_var);
 
 	if (thread_is_on_trace (thread_p))
 	  {
@@ -4901,17 +5309,12 @@ fetch_peek_dbval_slow (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_de
       break;
 
     case TYPE_FUNC:		/* fetch function value */
-      if (REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST))
+      if (fetch_constant_evaluated (vd, regu_var->plan_item))
 	{
-	  funcp = regu_var->value.funcp;
-	  assert (funcp != NULL);
-
-	  *peek_dbval = funcp->value;
-
+	  /* a constant function resolve_domains evaluated once */
+	  *peek_dbval = vd->dbval_ptr + regu_var->plan_item->ref;
 	  return NO_ERROR;
 	}
-
-      assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST));
 
       error = qdata_evaluate_function (thread_p, regu_var, vd, obj_oid, tplrec);
       if (error != NO_ERROR)
@@ -4922,206 +5325,13 @@ fetch_peek_dbval_slow (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_de
       funcp = regu_var->value.funcp;
       assert (funcp != NULL);
 
-      *peek_dbval = funcp->value;
-
-      /* check for the first time */
-      if (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST)
-	  && !REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_NOT_CONST))
+      /* ELT over branches whose collations resolve_domains merged: the picked value takes the merged domain */
+      if (fetch_convert_to_resolved_branch (vd, regu_var->plan_item, funcp->value) != NO_ERROR)
 	{
-	  int not_const = 0;
-
-	  switch (funcp->ftype)
-	    {
-	    case F_JSON_ARRAY:
-	    case F_JSON_ARRAY_APPEND:
-	    case F_JSON_ARRAY_INSERT:
-	    case F_JSON_CONTAINS:
-	    case F_JSON_CONTAINS_PATH:
-	    case F_JSON_DEPTH:
-	    case F_JSON_EXTRACT:
-	    case F_JSON_GET_ALL_PATHS:
-	    case F_JSON_KEYS:
-	    case F_JSON_INSERT:
-	    case F_JSON_LENGTH:
-	    case F_JSON_MERGE:
-	    case F_JSON_MERGE_PATCH:
-	    case F_JSON_OBJECT:
-	    case F_JSON_PRETTY:
-	    case F_JSON_QUOTE:
-	    case F_JSON_REMOVE:
-	    case F_JSON_REPLACE:
-	    case F_JSON_SEARCH:
-	    case F_JSON_SET:
-	    case F_JSON_TYPE:
-	    case F_JSON_UNQUOTE:
-	    case F_JSON_VALID:
-	    case F_REGEXP_COUNT:
-	    case F_REGEXP_INSTR:
-	    case F_REGEXP_LIKE:
-	    case F_REGEXP_REPLACE:
-	    case F_REGEXP_SUBSTR:
-	      {
-		regu_variable_list_node *operand;
-
-		operand = funcp->operand;
-
-		while (operand != NULL)
-		  {
-		    if (!REGU_VARIABLE_IS_FLAGED (&(operand->value), REGU_VARIABLE_FETCH_ALL_CONST))
-		      {
-			not_const++;
-			break;
-		      }
-		    operand = operand->next;
-		  }
-	      }
-	      break;
-
-	    case F_INSERT_SUBSTRING:
-	      /* should sync with qdata_insert_substring_function () */
-	      {
-		REGU_VARIABLE *regu_array[NUM_F_INSERT_SUBSTRING_ARGS];
-		int i;
-		int num_regu = 0;
-
-		/* initialize the argument array */
-		for (i = 0; i < NUM_F_INSERT_SUBSTRING_ARGS; i++)
-		  {
-		    regu_array[i] = NULL;
-		  }
-
-		error = qdata_regu_list_to_regu_array (funcp, NUM_F_INSERT_SUBSTRING_ARGS, regu_array, &num_regu);
-		if (num_regu != NUM_F_INSERT_SUBSTRING_ARGS)
-		  {
-		    assert (false);
-		    er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_GENERIC_FUNCTION_FAILURE, 0);
-		    goto exit_on_error;
-		  }
-		if (error != NO_ERROR)
-		  {
-		    goto exit_on_error;
-		  }
-
-		for (i = 0; i < NUM_F_INSERT_SUBSTRING_ARGS; i++)
-		  {
-		    if (!REGU_VARIABLE_IS_FLAGED (regu_array[i], REGU_VARIABLE_FETCH_ALL_CONST))
-		      {
-			not_const++;
-			break;	/* exit for-loop */
-		      }
-		  }		/* for (i = 0; ...) */
-	      }
-	      break;
-
-	    case F_ELT:
-	      /* should sync with qdata_elt () */
-	      {
-		regu_variable_list_node *operand;
-		DB_VALUE *index = NULL;
-		DB_TYPE index_type;
-		DB_BIGINT idx = 0;
-		bool is_null_elt = false;
-
-		assert (funcp->operand != NULL);
-		if (!REGU_VARIABLE_IS_FLAGED (&funcp->operand->value, REGU_VARIABLE_FETCH_ALL_CONST))
-		  {
-		    not_const++;
-		  }
-		else
-		  {
-		    error = fetch_peek_dbval (thread_p, &funcp->operand->value, vd, NULL, obj_oid, tplrec, &index);
-		    if (error != NO_ERROR)
-		      {
-			goto exit_on_error;
-		      }
-
-		    index_type = DB_VALUE_DOMAIN_TYPE (index);
-
-		    switch (index_type)
-		      {
-		      case DB_TYPE_SMALLINT:
-			idx = db_get_short (index);
-			break;
-		      case DB_TYPE_INTEGER:
-			idx = db_get_int (index);
-			break;
-		      case DB_TYPE_BIGINT:
-			idx = db_get_bigint (index);
-			break;
-		      case DB_TYPE_NULL:
-			is_null_elt = true;
-			break;
-		      default:
-			assert (false);	/* is impossible */
-			error = ER_QPROC_INVALID_DATATYPE;
-			er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, error, 0);
-			if (index != NULL && index->need_clear == true)
-			  {
-			    pr_clear_value (index);
-			  }
-			goto exit_on_error;
-		      }
-
-		    if (!is_null_elt)
-		      {
-			if (idx <= 0)
-			  {
-			    /* index is 0 or is negative */
-			    is_null_elt = true;
-			  }
-			else
-			  {
-			    idx--;
-			    operand = funcp->operand->next;
-
-			    while (idx > 0 && operand != NULL)
-			      {
-				operand = operand->next;
-				idx--;
-			      }
-
-			    if (operand == NULL)
-			      {
-				/* index greater than number of arguments */
-				is_null_elt = true;
-			      }
-			    else
-			      {
-				assert (operand != NULL);
-				if (!REGU_VARIABLE_IS_FLAGED (&(operand->value), REGU_VARIABLE_FETCH_ALL_CONST))
-				  {
-				    not_const++;
-				  }
-			      }	/* operand != NULL */
-			  }
-		      }		/* if (!is_null_elt) */
-		  }		/* else */
-
-#if !defined(NDEBUG)
-		if (is_null_elt)
-		  {
-		    assert (not_const == 0);
-		  }
-#endif
-	      }
-	      break;
-
-	    default:
-	      not_const++;	/* is not constant */
-	      break;
-	    }
-
-	  if (not_const == 0)
-	    {
-	      REGU_VARIABLE_SET_FLAG (regu_var, REGU_VARIABLE_FETCH_ALL_CONST);
-	      assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_NOT_CONST));
-	    }
-	  else
-	    {
-	      REGU_VARIABLE_SET_FLAG (regu_var, REGU_VARIABLE_FETCH_NOT_CONST);
-	      assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST));
-	    }
+	  goto exit_on_error;
 	}
+
+      *peek_dbval = funcp->value;
 
 #if !defined(NDEBUG)
       switch (funcp->ftype)
@@ -5136,9 +5346,8 @@ fetch_peek_dbval_slow (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_de
 	case F_GENERIC:
 	case F_CLASS_OF:
 	case F_BENCHMARK:
-	  /* is not constant */
-	  assert (!REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST));
-	  assert (REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_NOT_CONST));
+	  /* a fetch never caches these: the load marks them non-cacheable */
+	  assert (regu_var->plan_item == NULL || regu_var->plan_item->operand_class == OPERAND_NON_CACHEABLE);
 	  break;
 
 	case F_INSERT_SUBSTRING:
@@ -5185,40 +5394,42 @@ fetch_peek_dbval_slow (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_de
       goto exit_on_error;
     }
 
-  assert (REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST)
-	  || REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_NOT_CONST));
-
   if (REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_APPLY_COLLATION))
     {
-      if (TP_IS_CHAR_TYPE (TP_DOMAIN_TYPE (regu_var->domain)))
+      const TP_DOMAIN *collate = qexec_get_node_domain (vd, regu_var->domain, regu_var->plan_item);
+      if (TP_IS_CHAR_TYPE (TP_DOMAIN_TYPE (collate)))
 	{
 	  if (!DB_IS_NULL (*peek_dbval))
 	    {
 	      assert (TP_IS_CHAR_TYPE (DB_VALUE_TYPE (*peek_dbval)));
-	      assert (regu_var->domain->codeset == db_get_string_codeset (*peek_dbval));
+	      assert (collate->codeset == db_get_string_codeset (*peek_dbval));
 	    }
-	  db_string_put_cs_and_collation (*peek_dbval, regu_var->domain->codeset, regu_var->domain->collation_id);
+	  db_string_put_cs_and_collation (*peek_dbval, collate->codeset, collate->collation_id);
 	}
       else
 	{
-	  assert (TP_DOMAIN_TYPE (regu_var->domain) == DB_TYPE_ENUMERATION);
+	  assert (TP_DOMAIN_TYPE (collate) == DB_TYPE_ENUMERATION);
 
 	  if (!DB_IS_NULL (*peek_dbval))
 	    {
 	      assert (DB_VALUE_DOMAIN_TYPE (*peek_dbval) == DB_TYPE_ENUMERATION);
-	      assert (regu_var->domain->codeset == db_get_enum_codeset (*peek_dbval));
+	      assert (collate->codeset == db_get_enum_codeset (*peek_dbval));
 	    }
-	  db_enum_put_cs_and_collation (*peek_dbval, regu_var->domain->codeset, regu_var->domain->collation_id);
+	  db_enum_put_cs_and_collation (*peek_dbval, collate->codeset, collate->collation_id);
 
 	}
     }
 
   if (*peek_dbval != NULL && !DB_IS_NULL (*peek_dbval))
     {
-      if (TP_DOMAIN_TYPE (regu_var->domain) == DB_TYPE_VARIABLE
-	  || TP_DOMAIN_COLLATION_FLAG (regu_var->domain) != TP_DOMAIN_COLL_NORMAL)
+      if (qexec_node_domain_is_variable (vd, regu_var->plan_item))
 	{
-	  regu_var->domain = tp_domain_resolve_value (*peek_dbval, NULL);
+	  /* the domain resolve_domains resolved before the main block - a variable POS's is its bound value's, a value
+	   * pointer's or a list position's its producer's, a string function's its own */
+	  if (fetch_read_plan_domain (regu_var, vd, *peek_dbval) != NO_ERROR)
+	    {
+	      goto exit_on_error;
+	    }
 	}
 
       /* for REGUVAL_LIST compare type with the corresponding column of first row if not compatible, raise an error
@@ -5228,45 +5439,34 @@ fetch_peek_dbval_slow (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_de
 	  head_regu = reguval_list->regu_list->value;
 	  regu = reguval_list->current_value->value;
 
-	  if (regu->domain == NULL || TP_DOMAIN_TYPE (regu->domain) == DB_TYPE_VARIABLE
-	      || TP_DOMAIN_COLLATION_FLAG (regu->domain) != TP_DOMAIN_COLL_NORMAL)
+	  if (regu->domain == NULL || qexec_node_domain_is_variable (vd, regu->plan_item))
 	    {
-	      regu->domain = tp_domain_resolve_value (*peek_dbval, NULL);
+	      /* the row's own resolution, read as above */
+	      if (fetch_read_plan_domain (regu, vd, *peek_dbval) != NO_ERROR)
+		{
+		  goto exit_on_error;
+		}
 	    }
-	  head_type = TP_DOMAIN_TYPE (head_regu->domain);
-	  cur_type = TP_DOMAIN_TYPE (regu->domain);
+	  const TP_DOMAIN *row_domain = qexec_get_node_domain (vd, regu->domain, regu->plan_item);
+	  const TP_DOMAIN *head_domain = qexec_get_node_domain (vd, head_regu->domain, head_regu->plan_item);
+	  head_type = TP_DOMAIN_TYPE (head_domain);
+	  cur_type = TP_DOMAIN_TYPE (row_domain);
 
 	  /* compare the type */
-	  if (head_type != DB_TYPE_NULL && cur_type != DB_TYPE_NULL && head_regu->domain != regu->domain)
+	  if (head_type != DB_TYPE_NULL && cur_type != DB_TYPE_NULL && head_domain != row_domain)
 	    {
 	      if (head_type != cur_type || !pr_is_string_type (head_type) || !pr_is_variable_type (head_type))
 		{
 		  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QPROC_INCOMPATIBLE_TYPES, 0);
 		  goto exit_on_error;
 		}
-	      else if (TP_DOMAIN_COLLATION (head_regu->domain) != TP_DOMAIN_COLLATION (regu->domain))
+	      else if (TP_DOMAIN_COLLATION (head_domain) != TP_DOMAIN_COLLATION (row_domain))
 		{
 		  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_QSTR_INCOMPATIBLE_COLLATIONS, 0);
 		  goto exit_on_error;
 		}
 	    }
 	}
-    }
-
-  assert (REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_ALL_CONST)
-	  || REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_FETCH_NOT_CONST));
-
-  /* flag a stable regu_var (cached attr/literal/pos/const) so inline fetch_peek_dbval () peeks it directly */
-  if ((((regu_var->type == TYPE_ATTR_ID || regu_var->type == TYPE_SHARED_ATTR_ID
-	 || regu_var->type == TYPE_CLASS_ATTR_ID) && regu_var->value.attr_descr.cache_dbvalp != NULL)
-       || regu_var->type == TYPE_DBVAL || regu_var->type == TYPE_POS_VALUE
-       || (regu_var->type == TYPE_CONSTANT && regu_var->xasl == NULL && regu_var->value.dbvalptr != NULL))
-      && !REGU_VARIABLE_IS_FLAGED (regu_var, REGU_VARIABLE_APPLY_COLLATION)
-      && regu_var->domain != NULL
-      && TP_DOMAIN_TYPE (regu_var->domain) != DB_TYPE_VARIABLE
-      && TP_DOMAIN_COLLATION_FLAG (regu_var->domain) == TP_DOMAIN_COLL_NORMAL)
-    {
-      REGU_VARIABLE_SET_FLAG (regu_var, REGU_VARIABLE_FAST_PEEK);
     }
 
   return NO_ERROR;
@@ -5461,6 +5661,12 @@ fetch_copy_dbval (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, val_descr *
  *   tplrec(in): tuple slot (record + layout descriptor)
  *   peek(int):
  */
+/*
+ * [리뷰] fetch_val_list — regu 리스트 전체를 한 튜플에서 채우는 함수 — 스캔·필터가 행마다 부르고 NO_ERROR/ER_code 를 돌려준다.
+ * develop: 리스트가 전부 TYPE_POSITION 이면 fetch_peek_dbval_pos (regu_list, tplrec) 로 넘겼다.
+ * 이 PR: 같은 자리에서 vd 를 함께 넘긴다 — 위치가 자기 실행 도메인으로 컬럼을 읽어야 하기 때문이다.
+ * 바뀐 것: 호출 인자 1개 추가(1줄).
+ */
 int
 fetch_val_list (THREAD_ENTRY * thread_p, regu_variable_list_node * regu_list, val_descr * vd, OID * class_oid,
 		OID * obj_oid, QFILE_TUPLE_RECORD * tplrec, int peek)
@@ -5474,7 +5680,7 @@ fetch_val_list (THREAD_ENTRY * thread_p, regu_variable_list_node * regu_list, va
       if (regu_list && regu_list->value.type == TYPE_POSITION)
 	{
 	  /* the list is all TYPE_POSITION (existing invariant): one sequential pass over the tuple */
-	  return fetch_peek_dbval_pos (regu_list, tplrec);
+	  return fetch_peek_dbval_pos (regu_list, tplrec, vd);
 	}
       for (regup = regu_list; regup != NULL; regup = regup->next)
 	{
@@ -5522,9 +5728,19 @@ fetch_val_list (THREAD_ENTRY * thread_p, regu_variable_list_node * regu_list, va
 /*
  * fetch_peek_dbval_pos () - fetch_val_list (peek) for an all-TYPE_POSITION regu list: reads columns in pos_no order
  *   return: NO_ERROR or ER_code
+ *   vd(in): the execution's value descriptor: a position reads its column with its execution domain
+ */
+/*
+ * [리뷰] fetch_peek_dbval_pos — 전부 TYPE_POSITION 인 regu 리스트를 pos_no 오름차순으로 한 번에 훑어 각 regu 의 vfetch_to 를 채우는 순차
+ * 경로 — fetch_val_list 가 부른다.
+ * develop: 시그니처 (regu_list, tplrec). 컬럼 도메인으로 pos_descr->dom 을 그대로 qfile_slot_read_column_value 에 넘겼고,
+ * dom->type 이 NULL 이면 ER_FAILED.
+ * 이 PR: const VAL_DESCR *vd 인자를 받아 qexec_get_node_domain (vd, pos_descr->dom, pos_descr->plan_item) 이 준 실행
+ * 도메인으로 NULL 검사와 컬럼 읽기를 한다.
+ * 바뀐 것: 시그니처 +1 인자, 도메인 출처 2곳 교체(+4/-2).
  */
 static int
-fetch_peek_dbval_pos (regu_variable_list_node * regu_list, QFILE_TUPLE_RECORD * tplrec)
+fetch_peek_dbval_pos (regu_variable_list_node * regu_list, QFILE_TUPLE_RECORD * tplrec, const VAL_DESCR * vd)
 {
   regu_variable_list_node *regup;
   REGU_VARIABLE *regu_var;
@@ -5543,7 +5759,9 @@ fetch_peek_dbval_pos (regu_variable_list_node * regu_list, QFILE_TUPLE_RECORD * 
       assert (pos_descr->pos_no >= prev_pos);
       prev_pos = pos_descr->pos_no;
 #endif
-      if (pos_descr->dom->type == NULL)
+      /* the position's domains in this execution: its execution domain, which the list scan filled */
+      const TP_DOMAIN *column_domain = qexec_get_node_domain (vd, pos_descr->dom, pos_descr->plan_item);
+      if (column_domain->type == NULL)
 	{
 	  return ER_FAILED;
 	}
@@ -5559,7 +5777,7 @@ fetch_peek_dbval_pos (regu_variable_list_node * regu_list, QFILE_TUPLE_RECORD * 
 	  PRIM_SET_NULL (regu_var->vfetch_to);
 	}
       if (qfile_slot_read_column_value
-	  (tplrec, pos_descr->pos_no, pos_descr->dom, regu_var->vfetch_to, false /* Don't copy */ ,
+	  (tplrec, pos_descr->pos_no, column_domain, regu_var->vfetch_to, false /* Don't copy */ ,
 	   &is_null) != NO_ERROR)
 	{
 	  return ER_FAILED;
@@ -5823,29 +6041,6 @@ error_exit:
   return error_status;
 }
 
-// *INDENT-OFF*
-// C++ implementation stuff
-void
-fetch_force_not_const_recursive (REGU_VARIABLE & reguvar)
-{
-  auto map_func = [&] (regu_variable_node &regu, bool & stop)
-    {
-    switch (regu.type)
-      {
-      case TYPE_INARITH:
-      case TYPE_OUTARITH:
-      case TYPE_FUNC:
-      case TYPE_SP:
-        REGU_VARIABLE_SET_FLAG (&regu, REGU_VARIABLE_FETCH_NOT_CONST);
-        break;
-      default:
-        break;
-      }
-    };
-  reguvar.map_regu (map_func);
-}
-// *INDENT-ON*
-
 /*
  * fetch_peek_leftmost_numeric_regu () - Recursively search leftptr of an arith tree for the first NUMERIC-typed node.
  *
@@ -5853,6 +6048,14 @@ fetch_force_not_const_recursive (REGU_VARIABLE & reguvar)
  *   thread_p(in) : thread entry
  *   regu_var(in) : root of the regu variable arith tree to search
  *   vd(in)       : value descriptor
+ */
+/*
+ * [리뷰] fetch_peek_leftmost_numeric_regu — ARITH 트리의 leftptr 를 따라 내려가 첫 NUMERIC 타입 노드의 값을 찾아 돌려주는 보조 함수(해시 조인
+ * NUMERIC 정밀도 결정에 쓰인다). 못 찾으면 NULL.
+ * develop: TP_DOMAIN_TYPE (regu_var->domain) 으로 NUMERIC 여부를 판정했다 — 컴파일 도메인만 봤다.
+ * 이 PR: TP_DOMAIN_TYPE (qexec_get_node_domain (vd, regu_var->domain, regu_var->plan_item)) 로 판정한다 — 컴파일 때
+ * variable 이었다가 이 실행에서 NUMERIC 으로 정해진 노드도 잡힌다.
+ * 바뀐 것: 조건식 1줄 교체. 같은 커밋에서 바로 위 fetch_force_not_const_recursive(24줄)가 삭제됐다.
  */
 DB_VALUE *
 fetch_peek_leftmost_numeric_regu (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var, VAL_DESCR * vd)
@@ -5865,7 +6068,7 @@ fetch_peek_leftmost_numeric_regu (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_
       return NULL;
     }
 
-  if (TP_DOMAIN_TYPE (regu_var->domain) == DB_TYPE_NUMERIC)
+  if (TP_DOMAIN_TYPE (qexec_get_node_domain (vd, regu_var->domain, regu_var->plan_item)) == DB_TYPE_NUMERIC)
     {
       dbvalp = NULL;
       if (fetch_peek_dbval (thread_p, regu_var, vd, NULL, NULL, NULL, &dbvalp) == NO_ERROR

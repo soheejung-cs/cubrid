@@ -966,6 +966,14 @@ hjoin_clear_manager (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager)
  *   manager(in): Hash join manager containing shared state.
  *   domain_info(in/out): Domain information for join columns.
  */
+/*
+ * [리뷰] hjoin_init_domain_info — 해시 조인 매니저 초기화(hjoin_init_manager)가 부르는 함수 — 바깥/안쪽 리스트의 키 컬럼 도메인을 읽어 공통
+ * 도메인(coerce_domains)과 need_coerce_domains 를 정하고 NO_ERROR 를 돌려준다.
+ * develop: 동일한 로직. 루프 앞 주석은 "tp_infer_common_domain 을 참조하되 tp_domain_new 호출을 줄인다" 한 줄뿐이었다.
+ * 이 PR: 코드는 그대로다. 주석에 키 컬럼의 도메인이 플랜의 것(조인의 두 리스트가 qdata_get_valptr_type_list 로 열렸다)이어서 공통 도메인이 행 이전 해석에서 따라
+ * 나온다는 설명이 붙었다.
+ * 바뀐 것: 주석 +2줄뿐 — 실행 코드 변경 없음. 이 PR 에서 "리스트 컬럼 도메인이 행 이전에 확정된다"가 성립해 이 함수가 그대로 유지된다는 표시다.
+ */
 static int
 hjoin_init_domain_info (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HASHJOIN_DOMAIN_INFO * domain_info)
 {
@@ -1019,7 +1027,9 @@ hjoin_init_domain_info (THREAD_ENTRY * thread_p, HASHJOIN_MANAGER * manager, HAS
 
   memset (coerce_domains, 0, domain_cnt * sizeof (TP_DOMAIN *));
 
-  /* This code references tp_infer_common_domain but reduces unnecessary calls to tp_domain_new. */
+  /* This code references tp_infer_common_domain but reduces unnecessary calls to tp_domain_new.
+   * the key columns' domains are the plan's - the join's lists opened with them (qdata_get_valptr_type_list)
+   * - so the common domain follows from resolutions made before any row. */
   for (domain_index = 0; domain_index < domain_cnt; domain_index++)
     {
       outer_value_index = outer_value_indexes[domain_index];
