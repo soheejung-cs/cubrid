@@ -39,6 +39,7 @@
 #include "work_space.h"
 #include "memory_alloc.h"
 #include "xasl.h"
+#include "expr_program.hpp"
 #include "xasl_aggregate.hpp"
 #include "xasl_analytic.hpp"
 #include "xasl_predicate.hpp"
@@ -4371,6 +4372,71 @@ xts_process_merge_proc (char *ptr, const MERGE_PROC_NODE * merge_info)
   return ptr;
 }
 
+/*
+ * xts_save_expr_packed_prog () - the list's expression program (expr_program.hpp): ints, then per step its ints
+ *				   and an optional domain
+ *   return: offset in the stream, 0 for no program, ER_FAILED
+ */
+static int
+xts_save_expr_packed_prog (const EXPR_PACKED_PROG * prog)
+{
+  int offset, size, i, k;
+  char *ptr;
+
+  if (prog == NULL)
+    {
+      return 0;
+    }
+  size = OR_INT_SIZE * 3 + OR_INT_SIZE * prog->n_roots;
+  for (i = 0; i < prog->n_steps; i++)
+    {
+      const EXPR_PACKED_STEP *s = &prog->steps[i];
+      size += OR_INT_SIZE * (12 + EXPR_PATH_MAX);
+      if (s->domain != NULL)
+	{
+	  size += or_packed_domain_size (s->domain, 0);
+	}
+    }
+  offset = xts_reserve_location_in_stream (size);
+  if (offset == ER_FAILED)
+    {
+      return ER_FAILED;
+    }
+  ptr = &xts_Stream_buffer[offset];
+  ptr = or_pack_int (ptr, prog->n_steps);
+  ptr = or_pack_int (ptr, prog->n_cells);
+  ptr = or_pack_int (ptr, prog->n_roots);
+  for (k = 0; k < prog->n_roots; k++)
+    {
+      ptr = or_pack_int (ptr, prog->root_cells[k]);
+    }
+  for (i = 0; i < prog->n_steps; i++)
+    {
+      const EXPR_PACKED_STEP *s = &prog->steps[i];
+      ptr = or_pack_int (ptr, s->opcode);
+      ptr = or_pack_int (ptr, s->type);
+      ptr = or_pack_int (ptr, s->arg1);
+      ptr = or_pack_int (ptr, s->arg2);
+      ptr = or_pack_int (ptr, s->out);
+      ptr = or_pack_int (ptr, s->root);
+      ptr = or_pack_int (ptr, s->path_len);
+      for (k = 0; k < EXPR_PATH_MAX; k++)
+	{
+	  ptr = or_pack_int (ptr, s->path[k]);
+	}
+      ptr = or_pack_int (ptr, s->aux);
+      ptr = or_pack_int (ptr, s->flags);
+      ptr = or_pack_int (ptr, s->jump_to);
+      ptr = or_pack_int (ptr, s->alias_of);
+      ptr = or_pack_int (ptr, s->domain != NULL ? 1 : 0);
+      if (s->domain != NULL)
+	{
+	  ptr = or_pack_domain (ptr, s->domain, 0, 0);
+	}
+    }
+  return offset;
+}
+
 static char *
 xts_process_outptr_list (char *ptr, const OUTPTR_LIST * outptr_list)
 {
@@ -4379,6 +4445,13 @@ xts_process_outptr_list (char *ptr, const OUTPTR_LIST * outptr_list)
   ptr = or_pack_int (ptr, outptr_list->valptr_cnt);
 
   offset = xts_save_regu_variable_list (outptr_list->valptrp);
+  if (offset == ER_FAILED)
+    {
+      return NULL;
+    }
+  ptr = or_pack_int (ptr, offset);
+
+  offset = xts_save_expr_packed_prog (outptr_list->packed_prog);
   if (offset == ER_FAILED)
     {
       return NULL;
@@ -6679,7 +6752,8 @@ xts_sizeof_outptr_list (const OUTPTR_LIST * outptr_list)
   int size = 0;
 
   size += (OR_INT_SIZE		/* valptr_cnt */
-	   + PTR_SIZE);		/* valptrp */
+	   + PTR_SIZE		/* valptrp */
+	   + PTR_SIZE);		/* packed_prog */
 
   return size;
 }

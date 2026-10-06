@@ -42,6 +42,7 @@
 #include "error_manager.h"
 #include "fetch.h"
 #include "domain_resolve.h"
+#include "expr_program.hpp"
 #include "memory_alloc.h"
 #include "numeric_opfunc.h"
 #include "object_domain.h"
@@ -1367,6 +1368,38 @@ expr_k_fallback (EXPR_STEP * step, EXPR_EVAL_CTX * ctx)
       return ER_FAILED;
     }
   *step->out_cell = peek;
+  return NO_ERROR;
+}
+
+/* an operand converter of an open arithmetic node (client programs): the converter the gate chose for this
+ * execution, or none.  Mirrors qdata_coerce_arith_operands (): an operand is converted only when both operands
+ * are non-NULL (the operator answers NULL otherwise), and a failed conversion is the operand's error, or NULL
+ * under return_null_on_function_errors. */
+static int
+expr_k_conv (EXPR_STEP * step, EXPR_EVAL_CTX * ctx)
+{
+  DB_VALUE *value = *step->arg1p;
+  TP_DOMAIN_STATUS status;
+
+  if (step->conv == NULL || DB_IS_NULL (value) || (step->arg2p != NULL && DB_IS_NULL (*step->arg2p)))
+    {
+      *step->out_cell = value;
+      return NO_ERROR;
+    }
+  pr_clear_value (step->out);
+  status = tp_value_convert (step->conv, step->conv_domain, value, step->out);
+  if (status != DOMAIN_COMPATIBLE)
+    {
+      if (!prm_get_bool_value (PRM_ID_RETURN_NULL_ON_FUNCTION_ERRORS))
+	{
+	  (void) tp_domain_status_er_set (status, ARG_FILE_LINE, value, step->conv_domain);
+	  return ER_FAILED;
+	}
+      pr_clear_value (step->out);
+      db_make_null (step->out);
+      er_clear ();
+    }
+  *step->out_cell = step->out;
   return NO_ERROR;
 }
 
@@ -4696,6 +4729,350 @@ expr_prog_compile_roots (cubthread::entry * thread_p, REGU_VARIABLE ** roots, in
   return prog;
 }
 
+/******************************************************************************
+ * client programs (expr_program.hpp)
+ *
+ * The SQL compiler packed the program's structure with the plan; this binds it to the server's kernels and
+ * cells for one clone -- the register file -- and classifies hoisting the way the server compiler does.  An
+ * OPEN step (a node whose type a bind decides) is bound to the interpreted fetch until the gate's resolution
+ * of an execution gives it a kernel (expr_prog_fill_open), and re-bound at every execution entry.
+ ******************************************************************************/
+
+/* the tree node a packed step names: the root column's regu, then left/right/third turns */
+static REGU_VARIABLE *
+expr_packed_node (valptr_list_node * list, const EXPR_PACKED_STEP * ps)
+{
+  REGU_VARIABLE_LIST col = list->valptrp;
+  REGU_VARIABLE *regu;
+  int k;
+
+  for (k = 0; k < ps->root && col != NULL; k++)
+    {
+      col = col->next;
+    }
+  if (col == NULL)
+    {
+      return NULL;
+    }
+  regu = &col->value;
+  for (k = 0; k < ps->path_len; k++)
+    {
+      ARITH_TYPE *arith;
+
+      if (regu == NULL || (regu->type != TYPE_INARITH && regu->type != TYPE_OUTARITH) || regu->value.arithptr == NULL)
+	{
+	  return NULL;
+	}
+      arith = regu->value.arithptr;
+      regu = ps->path[k] == 0 ? arith->leftptr : ps->path[k] == 1 ? arith->rightptr : arith->thirdptr;
+    }
+  return regu;
+}
+
+static OPERATOR_TYPE
+expr_packed_operator (int opcode)
+{
+  switch (opcode)
+    {
+    case EXPR_OPC_ADD:
+      return T_ADD;
+    case EXPR_OPC_SUB:
+      return T_SUB;
+    case EXPR_OPC_MUL:
+      return T_MUL;
+    default:
+      return T_DIV;
+    }
+}
+
+EXPR_PROG *
+expr_prog_from_packed (cubthread::entry * thread_p, valptr_list_node * list, val_descr * vd)
+{
+  const EXPR_PACKED_PROG *pk = list->packed_prog;
+  EXPR_BUILD_CTX *bctx;
+  EXPR_PROG *prog = NULL;
+  int step_map[EXPR_MAX_STEPS];
+  bool guarded[EXPR_MAX_STEPS];
+  int i, k;
+
+  if (pk == NULL || pk->n_steps <= 0 || pk->n_steps > EXPR_MAX_STEPS || pk->n_cells > EXPR_MAX_STEPS
+      || pk->n_roots != list->valptr_cnt)
+    {
+      return NULL;
+    }
+  bctx = (EXPR_BUILD_CTX *) malloc (sizeof (EXPR_BUILD_CTX));
+  if (bctx == NULL)
+    {
+      return NULL;
+    }
+  memset (bctx, 0, sizeof (*bctx));
+  bctx->vd = vd;
+  bctx->depth_limit = prm_get_integer_value (PRM_ID_MAX_RECURSION_SQL_DEPTH);
+
+  /* the cells, numbered as packed; a wired leaf fills its address below */
+  for (i = 0; i < pk->n_cells; i++)
+    {
+      expr_new_cell (bctx, NULL);
+    }
+  /* the lazy right-hand regions: the steps between a NULL check and its jump target run under a guard, so a
+   * fallible step there is not hoisted (the interpreter reaches it only for a non-NULL left operand) */
+  memset (guarded, 0, sizeof (guarded));
+  for (i = 0; i < pk->n_steps; i++)
+    {
+      const EXPR_PACKED_STEP *ps = &pk->steps[i];
+      if (ps->opcode == EXPR_OPC_JUMP_NULL_ARITH && ps->jump_to > i)
+	{
+	  for (k = i + 1; k < ps->jump_to && k < pk->n_steps; k++)
+	    {
+	      guarded[k] = true;
+	    }
+	}
+    }
+
+  for (i = 0; i < pk->n_steps; i++)
+    {
+      const EXPR_PACKED_STEP *ps = &pk->steps[i];
+      REGU_VARIABLE *regu = expr_packed_node (list, ps);
+      EXPR_STEP *step = NULL;
+
+      step_map[i] = -1;
+      if (regu == NULL || ps->out < 0 || ps->out >= pk->n_cells)
+	{
+	  goto fail;
+	}
+      bctx->cur_guard = guarded[i] ? 1 : 0;
+      switch (ps->opcode)
+	{
+	case EXPR_OPC_COLUMN:
+	  if (regu->type != TYPE_CONSTANT || regu->xasl != NULL)
+	    {
+	      goto fail;
+	    }
+	  bctx->cells[ps->out] = regu->value.dbvalptr;
+	  bctx->cell_is_slot[ps->out] = false;
+	  bctx->cell_fixed[ps->out] = EXPR_CELL_ROW;
+	  continue;
+	case EXPR_OPC_CONST:
+	  if (regu->type != TYPE_DBVAL)
+	    {
+	      goto fail;
+	    }
+	  bctx->cells[ps->out] = &regu->value.dbval;
+	  bctx->cell_is_slot[ps->out] = false;
+	  bctx->cell_fixed[ps->out] = EXPR_CELL_LITERAL;
+	  continue;
+	case EXPR_OPC_HOSTVAR:
+	  {
+	    const int vidx = expr_pos_value_index (bctx, regu);
+	    if (regu->type != TYPE_POS_VALUE || vidx < 0)
+	      {
+		goto fail;
+	      }
+	    step = expr_new_step (bctx, expr_k_hostvar, ps->out);
+	    if (step == NULL)
+	      {
+		goto fail;
+	      }
+	    step->aux = vidx;
+	    step->regu = regu;
+	    /* the bound values are fixed for the execution: once per execution, unless under a guard */
+	    bctx->step_exec_prologue[step - bctx->steps] = !guarded[i];
+	    bctx->cell_fixed[ps->out] = guarded[i] ? EXPR_CELL_ROW : EXPR_CELL_EXEC;
+	    break;
+	  }
+	case EXPR_OPC_LEAF_FETCH:
+	case EXPR_OPC_FALLBACK:
+	  step = expr_new_step (bctx, ps->opcode == EXPR_OPC_FALLBACK ? expr_k_fallback : expr_k_leaf_fetch, ps->out);
+	  if (step == NULL)
+	    {
+	      goto fail;
+	    }
+	  step->regu = regu;
+	  break;
+	case EXPR_OPC_COERCE_NUMERIC:
+	  step = expr_new_step (bctx, expr_k_coerce_numeric, ps->out);
+	  if (step == NULL || ps->arg1 < 0)
+	    {
+	      goto fail;
+	    }
+	  step->arg1p = EXPR_ARG_ENCODE (ps->arg1);
+	  step->out = (DB_VALUE *) 1;
+	  bctx->n_slots++;
+	  expr_step_hoist (bctx, step, ps->out, ps->arg1, -1, false);
+	  break;
+	case EXPR_OPC_JUMP_NULL_ARITH:
+	  step = expr_new_step (bctx, expr_k_jump_null_arith, ps->out);
+	  if (step == NULL || ps->arg1 < 0)
+	    {
+	      goto fail;
+	    }
+	  step->arg1p = EXPR_ARG_ENCODE (ps->arg1);
+	  step->jump_to = ps->jump_to;	/* packed indexes: remapped below */
+	  step->alias_of = ps->alias_of;
+	  break;
+	case EXPR_OPC_CONV:
+	  step = expr_new_step (bctx, expr_k_conv, ps->out);
+	  if (step == NULL || ps->arg1 < 0)
+	    {
+	      goto fail;
+	    }
+	  step->arg1p = EXPR_ARG_ENCODE (ps->arg1);
+	  step->arg2p = ps->arg2 >= 0 ? EXPR_ARG_ENCODE (ps->arg2) : NULL;
+	  step->out = (DB_VALUE *) 1;
+	  bctx->n_slots++;
+	  step->regu = regu;
+	  step->aux = ps->aux;
+	  step->open = true;
+	  step->open_type = DB_TYPE_UNKNOWN;
+	  break;
+	case EXPR_OPC_ADD:
+	case EXPR_OPC_SUB:
+	case EXPR_OPC_MUL:
+	case EXPR_OPC_DIV:
+	  if (ps->arg1 < 0 || ps->arg2 < 0 || (regu->type != TYPE_INARITH && regu->type != TYPE_OUTARITH))
+	    {
+	      goto fail;
+	    }
+	  if (ps->flags & EXPR_STEPF_OPEN)
+	    {
+	      /* bound to the interpreted fetch until the gate's resolution gives it a kernel */
+	      step = expr_new_step (bctx, expr_k_fallback, ps->out);
+	      if (step == NULL)
+		{
+		  goto fail;
+		}
+	      step->open = true;
+	      step->open_type = DB_TYPE_UNKNOWN;
+	    }
+	  else
+	    {
+	      EXPR_KERNEL_FN kernel = expr_arith_kernel (expr_packed_operator (ps->opcode), (DB_TYPE) ps->type, ps->aux != 0);
+	      if (kernel == NULL)
+		{
+		  goto fail;
+		}
+	      step = expr_new_step (bctx, kernel, ps->out);
+	      if (step == NULL)
+		{
+		  goto fail;
+		}
+	      step->domain = (ps->type == DB_TYPE_NUMERIC) ? ps->domain : NULL;
+	    }
+	  step->arg1p = EXPR_ARG_ENCODE (ps->arg1);
+	  step->arg2p = EXPR_ARG_ENCODE (ps->arg2);
+	  step->out = (DB_VALUE *) 1;
+	  bctx->n_slots++;
+	  step->regu = regu;
+	  step->aux = ps->opcode;
+	  if (!(ps->flags & EXPR_STEPF_OPEN))
+	    {
+	      expr_step_hoist (bctx, step, ps->out, ps->arg1, ps->arg2, true);
+	    }
+	  break;
+	default:
+	  goto fail;
+	}
+      step_map[i] = (int) (step - bctx->steps);
+    }
+  bctx->cur_guard = 0;
+  /* the check steps' targets were packed step indexes */
+  for (i = 0; i < bctx->n_steps; i++)
+    {
+      EXPR_STEP *step = &bctx->steps[i];
+      if (step->kernel == expr_k_jump_null_arith)
+	{
+	  const int jt = step->jump_to, al = step->alias_of;
+	  if (al < 0 || al >= pk->n_steps || step_map[al] < 0)
+	    {
+	      goto fail;
+	    }
+	  step->alias_of = step_map[al];
+	  step->jump_to = (jt >= pk->n_steps) ? bctx->n_steps : -1;
+	  for (k = jt; k < pk->n_steps && step->jump_to < 0; k++)
+	    {
+	      if (step_map[k] >= 0)
+		{
+		  step->jump_to = step_map[k];
+		}
+	    }
+	  if (step->jump_to < 0)
+	    {
+	      step->jump_to = bctx->n_steps;
+	    }
+	}
+    }
+  prog = expr_prog_finish (bctx, pk->root_cells, pk->n_roots, vd, NULL);
+  if (prog != NULL)
+    {
+      prog->from_client = true;
+    }
+  free (bctx);
+  return prog;
+
+fail:
+  expr_build_free_preds (bctx);
+  free (bctx);
+  return NULL;
+}
+
+void
+expr_prog_fill_open (EXPR_PROG * prog, const val_descr * vd)
+{
+  int i;
+
+  for (i = 0; i < prog->n_steps; i++)
+    {
+      EXPR_STEP *step = &prog->steps[i];
+      const ARITH_TYPE *arith;
+      const RESOLVED_DOMAIN *resolved;
+
+      if (!step->open || step->regu == NULL)
+	{
+	  continue;
+	}
+      arith = step->regu->value.arithptr;
+      resolved = arith != NULL ? expr_item_resolution (vd, arith->plan_item) : NULL;
+      if (step->kernel == expr_k_conv)
+	{
+	  const int side = step->aux;
+	  step->conv = (resolved != NULL && side >= 0 && side < 2) ? resolved->conv[side] : NULL;
+	  step->conv_domain = (resolved != NULL && side >= 0 && side < 2) ? resolved->operand_domain[side] : NULL;
+	  if (step->conv_domain == NULL)
+	    {
+	      step->conv = NULL;
+	    }
+	  continue;
+	}
+      /* an open arithmetic node: the kernel its resolved type takes, or the interpreted fetch */
+      {
+	TP_DOMAIN *domain = expr_arith_exec_domain (vd, step->regu);
+	EXPR_KERNEL_FN kernel = NULL;
+
+	if (domain != NULL)
+	  {
+	    const DB_TYPE type = TP_DOMAIN_TYPE (domain);
+	    bool pure = (type == DB_TYPE_NUMERIC);
+	    if (resolved != NULL && type == DB_TYPE_NUMERIC)
+	      {
+		int side;
+		for (side = 0; side < 2; side++)
+		  {
+		    const TP_DOMAIN *od = resolved->operand_domain[side];
+		    if (od != NULL && TP_DOMAIN_TYPE (od) != DB_TYPE_NUMERIC)
+		      {
+			pure = false;
+		      }
+		  }
+	      }
+	    kernel = expr_arith_kernel (expr_packed_operator (step->aux), type, pure);
+	    step->open_type = type;
+	  }
+	step->kernel = kernel != NULL ? kernel : expr_k_fallback;
+	step->domain = (kernel != NULL && TP_DOMAIN_TYPE (domain) == DB_TYPE_NUMERIC) ? domain : NULL;
+      }
+    }
+}
+
 bool
 expr_prog_signature_matches (const EXPR_PROG * prog, const val_descr * vd)
 {
@@ -4887,7 +5264,8 @@ expr_kernel_name (EXPR_KERNEL_FN kernel)
     {
     expr_k_hostvar, "hostvar"},
     {
-  expr_k_fallback, "fallback"},};
+  expr_k_fallback, "fallback"}, {
+  expr_k_conv, "conv"},};
   size_t i;
 
   for (i = 0; i < sizeof (names) / sizeof (names[0]); i++)
@@ -4973,8 +5351,9 @@ expr_prog_dump (FILE * fp, const EXPR_PROG * prog, int indent)
     }
 
   fprintf (fp,
-	   "%*csteps: %d (prologue: %d, exec-prologue: %d, compute: %d), cells: %d, slots: %d, roots: %d, hostvar types: %d",
-	   indent, ' ', prog->n_steps, prog->n_prologue, prog->n_exec_prologue, prog->n_compute, prog->n_cells,
+	   "%*c%ssteps: %d (prologue: %d, exec-prologue: %d, compute: %d), cells: %d, slots: %d, roots: %d, hostvar types: %d",
+	   indent, ' ', prog->from_client ? "program: client, " : "", prog->n_steps, prog->n_prologue,
+	   prog->n_exec_prologue, prog->n_compute, prog->n_cells,
 	   prog->n_slots, prog->n_roots, prog->n_hv);
   if (prog->n_shared > 0)
     {

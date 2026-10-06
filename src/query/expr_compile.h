@@ -53,6 +53,7 @@
 #include "query_evaluator.h"
 #include "porting_inline.hpp"
 #include "regu_var.hpp"
+#include "object_domain.h"
 
 // forward definitions
 struct val_descr;
@@ -123,12 +124,19 @@ struct expr_step
    * never open. */
   bool open;
   DB_TYPE open_type;		/* the type the open step was compiled for */
+  /* an operand converter step of a client program (expr_k_conv): the converter the gate chose for this
+   * execution and its target, NULL = publish the operand as it is */
+  TP_VALUE_CONVERTER conv;
+  const TP_DOMAIN *conv_domain;
 };
 
 struct expr_prog
 {
   EXPR_STEP *steps;
   int n_steps;
+  /* bound from the program the SQL compiler packed with the plan (expr_program.hpp): its open steps are filled
+   * from the gate's resolution at every execution entry (expr_prog_fill_open) and it is never recompiled */
+  bool from_client;
 
   /* the first n_prologue steps only read compile-time literals, so they run once per
    * program lifetime instead of once per row (e.g. coercing the INT literal of
@@ -234,6 +242,16 @@ extern TP_DOMAIN *expr_regu_exec_domain (const VAL_DESCR * vd, REGU_VARIABLE * r
  * per row. */
 extern bool expr_prog_signature_matches (const EXPR_PROG * prog, const val_descr * vd);
 
+/* bind the program the SQL compiler packed for a value list (valptr_list_node.packed_prog) to this server's
+ * kernels and cells: the clone's register file for it.  NULL when the packed program cannot be bound here
+ * (a node path the tree does not have, a limit) -- the caller may then compile on the server instead. */
+extern EXPR_PROG *expr_prog_from_packed (cubthread::entry * thread_p, valptr_list_node * list, val_descr * vd);
+
+/* fill every open step of a client program from the gate's resolution of this execution: the kernel the
+ * node's type takes (the kernel table), its domain, the operand converters. Always succeeds: a node the gate
+ * resolved to no kernel runs the interpreted fetch of the node. */
+extern void expr_prog_fill_open (EXPR_PROG * prog, const val_descr * vd);
+
 /* re-read the gate's resolution into every open step for this execution; false when a node's
  * type changed, so the consumer must recompile (expr_prog_signature_ok () calls it) */
 extern bool expr_prog_refill_open (EXPR_PROG * prog, const val_descr * vd);
@@ -257,6 +275,14 @@ expr_prog_signature_ok (EXPR_PROG * prog, const val_descr * vd, unsigned long lo
 {
   if (exec_stamp != 0 && prog->sig_stamp_valid && prog->sig_stamp == exec_stamp)
     {
+      return true;
+    }
+  if (prog->from_client)
+    {
+      /* a client program is never recompiled: its open steps take this execution's resolution */
+      expr_prog_fill_open (prog, vd);
+      prog->sig_stamp = exec_stamp;
+      prog->sig_stamp_valid = (exec_stamp != 0);
       return true;
     }
   if (!expr_prog_signature_matches (prog, vd) || !expr_prog_refill_open (prog, vd))

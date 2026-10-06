@@ -134,6 +134,9 @@ struct valptr_list_node
    * exactly one executing thread at a time (the xcache clone mutex publishes the stores
    * when the clone changes hands).  Nothing here tolerates two threads sharing one clone
    * -- do not add such a caller without making this state per-thread or synchronized. */
+  /* the program the SQL compiler packed for this list (expr_program.hpp): structure only, shared by every clone
+   * through the stream; the server binds it to kernels when a clone first runs it (expr_prog_from_packed) */
+  struct EXPR_PACKED_PROG *packed_prog;
   void *eval_prog;		/* EXPR_PROG * */
   int *eval_prog_idx;		/* program root index per column, or -1 */
   int eval_prog_state;		/* 0 = untried, 1 = active, 2 = disabled */

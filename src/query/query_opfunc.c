@@ -36,6 +36,7 @@
 #include "system_parameter.h"
 #include "error_manager.h"
 #include "expr_compile.h"
+#include "expr_program.hpp"
 #include "fetch.h"
 #include "list_file.h"
 #include "object_domain.h"
@@ -376,6 +377,31 @@ qdata_valptr_prog_compile (THREAD_ENTRY * thread_p, valptr_list_node * valptr_li
     {
       valptr_list_p->eval_prog_state = 2;
       return;
+    }
+
+  /* the program the SQL compiler packed with the plan: bind it (every column it covers, open steps filled from
+   * this execution's resolution); the server compiler below is the fallback for a list without one */
+  if (valptr_list_p->packed_prog != NULL)
+    {
+      prog = expr_prog_from_packed (thread_p, valptr_list_p, val_desc_p);
+      if (prog != NULL)
+	{
+	  idx = (int *) malloc (sizeof (int) * valptr_list_p->valptr_cnt);
+	  if (idx == NULL)
+	    {
+	      expr_prog_free (prog);
+	      valptr_list_p->eval_prog_state = 2;
+	      return;
+	    }
+	  for (k = 0; k < valptr_list_p->valptr_cnt; k++)
+	    {
+	      idx[k] = valptr_list_p->packed_prog->root_cells[k] >= 0 ? k : -1;
+	    }
+	  valptr_list_p->eval_prog = prog;
+	  valptr_list_p->eval_prog_idx = idx;
+	  valptr_list_p->eval_prog_state = 1;
+	  return;
+	}
     }
 
   valptr_list_p->eval_prog_state = 2;	/* disabled unless everything below succeeds */

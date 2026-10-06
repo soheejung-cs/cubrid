@@ -233,6 +233,7 @@ set(PARSER_SOURCES
   ${PARSER_DIR}/view_transform.c
   ${PARSER_DIR}/xasl_regu_alloc.cpp
   ${PARSER_DIR}/xasl_generation.c
+  ${PARSER_DIR}/expr_gen.c
   ${PARSER_DIR}/func_type.cpp
   )
 set(PARSER_HEADERS
@@ -538,6 +539,7 @@ SET_SOURCE_FILES_PROPERTIES(
   ${PARSER_DIR}/type_checking.c
   ${PARSER_DIR}/view_transform.c
   ${PARSER_DIR}/xasl_generation.c
+  ${PARSER_DIR}/expr_gen.c
   ${OPTIMIZER_SOURCES}
   ${REWRITER_SOURCES}
   ${QUERY_SOURCES}
