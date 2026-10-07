@@ -4875,9 +4875,10 @@ expr_prog_from_packed (cubthread::entry * thread_p, valptr_list_node * list, val
 	      }
 	    step->aux = vidx;
 	    step->regu = regu;
-	    /* the bound values are fixed for the execution: once per execution, unless under a guard */
-	    bctx->step_exec_prologue[step - bctx->steps] = !guarded[i];
-	    bctx->cell_fixed[ps->out] = guarded[i] ? EXPR_CELL_ROW : EXPR_CELL_EXEC;
+	    /* the bound values are fixed for the execution and the publish cannot fail: once per execution, a
+	     * guarded right side included (expr_step_hoist's rule for a step that cannot fail) */
+	    bctx->step_exec_prologue[step - bctx->steps] = true;
+	    bctx->cell_fixed[ps->out] = EXPR_CELL_EXEC;
 	    break;
 	  }
 	case EXPR_OPC_LEAF_FETCH:
@@ -5395,7 +5396,7 @@ expr_prog_dump (FILE * fp, const EXPR_PROG * prog, int indent)
 	}
       if (step->open)
 	{
-	  fprintf (fp, " open:%s", pr_type_name (step->open_type));
+	  fprintf (fp, step->open_type != DB_TYPE_UNKNOWN ? " open:%s" : " open", pr_type_name (step->open_type));
 	}
       if (step->alias_of >= 0)
 	{
