@@ -77,6 +77,7 @@
 #endif /* WINDOWS */
 
 #include "dbtype.h"
+#include "expr_gen.h"
 
 extern void qo_plan_lite_print (QO_PLAN * plan, FILE * f, int howfar);
 
@@ -14568,6 +14569,9 @@ pt_to_outlist (PARSER_CONTEXT * parser, PT_NODE * node_list, SELUPD_LIST ** selu
     }
 
   outlist->valptr_cnt = count;
+
+  /* the expression program for the list's visible columns, packed with the plan (expr_program.hpp) */
+  outlist->packed_prog = expr_gen_outlist (outlist);
 
   return outlist;
 

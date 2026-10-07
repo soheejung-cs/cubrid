@@ -38,6 +38,7 @@
 #include "error_manager.h"
 #include "query_aggregate.hpp"
 #include "xasl.h"
+#include "expr_program.hpp"
 #include "xasl_aggregate.hpp"
 #include "xasl_analytic.hpp"
 #include "xasl_predicate.hpp"
@@ -4247,11 +4248,75 @@ error:
   return NULL;
 }
 
+/*
+ * stx_restore_expr_packed_prog () - the list's expression program as xts_save_expr_packed_prog packed it
+ */
+static EXPR_PACKED_PROG *
+stx_restore_expr_packed_prog (THREAD_ENTRY * thread_p, char *ptr)
+{
+  EXPR_PACKED_PROG *prog;
+  int i, k, has_domain;
+
+  prog = (EXPR_PACKED_PROG *) stx_alloc_struct (thread_p, sizeof (EXPR_PACKED_PROG));
+  if (prog == NULL)
+    {
+      stx_set_xasl_errcode (thread_p, ER_OUT_OF_VIRTUAL_MEMORY);
+      return NULL;
+    }
+  ptr = or_unpack_int (ptr, &prog->n_steps);
+  ptr = or_unpack_int (ptr, &prog->n_cells);
+  ptr = or_unpack_int (ptr, &prog->n_roots);
+  prog->root_cells = (int *) stx_alloc_struct (thread_p, sizeof (int) * MAX (1, prog->n_roots));
+  prog->steps = (EXPR_PACKED_STEP *) stx_alloc_struct (thread_p, sizeof (EXPR_PACKED_STEP) * MAX (1, prog->n_steps));
+  if (prog->root_cells == NULL || prog->steps == NULL)
+    {
+      stx_set_xasl_errcode (thread_p, ER_OUT_OF_VIRTUAL_MEMORY);
+      return NULL;
+    }
+  for (k = 0; k < prog->n_roots; k++)
+    {
+      ptr = or_unpack_int (ptr, &prog->root_cells[k]);
+    }
+  for (i = 0; i < prog->n_steps; i++)
+    {
+      EXPR_PACKED_STEP *s = &prog->steps[i];
+      ptr = or_unpack_int (ptr, &s->opcode);
+      ptr = or_unpack_int (ptr, &s->type);
+      ptr = or_unpack_int (ptr, &s->arg1);
+      ptr = or_unpack_int (ptr, &s->arg2);
+      ptr = or_unpack_int (ptr, &s->out);
+      ptr = or_unpack_int (ptr, &s->root);
+      ptr = or_unpack_int (ptr, &s->path_len);
+      for (k = 0; k < EXPR_PATH_MAX; k++)
+	{
+	  ptr = or_unpack_int (ptr, &s->path[k]);
+	}
+      ptr = or_unpack_int (ptr, &s->aux);
+      ptr = or_unpack_int (ptr, &s->flags);
+      ptr = or_unpack_int (ptr, &s->jump_to);
+      ptr = or_unpack_int (ptr, &s->alias_of);
+      ptr = or_unpack_int (ptr, &has_domain);
+      s->domain = NULL;
+      if (has_domain)
+	{
+	  ptr = or_unpack_domain (ptr, &s->domain, NULL);
+	}
+    }
+  return prog;
+}
+
 static char *
 stx_build_outptr_list (THREAD_ENTRY * thread_p, char *ptr, OUTPTR_LIST * outptr_list)
 {
   int offset;
   XASL_UNPACK_INFO *xasl_unpack_info = get_xasl_unpack_info_ptr (thread_p);
+
+  outptr_list->packed_prog = NULL;
+  outptr_list->eval_prog = NULL;
+  outptr_list->eval_prog_idx = NULL;
+  outptr_list->eval_prog_state = 0;
+  outptr_list->eval_prog_row_ready = false;
+  outptr_list->eval_prog_share_spec = NULL;
 
   ptr = or_unpack_int (ptr, &outptr_list->valptr_cnt);
 
@@ -4266,6 +4331,16 @@ stx_build_outptr_list (THREAD_ENTRY * thread_p, char *ptr, OUTPTR_LIST * outptr_
       if (outptr_list->valptrp == NULL)
 	{
 	  stx_set_xasl_errcode (thread_p, ER_OUT_OF_VIRTUAL_MEMORY);
+	  return NULL;
+	}
+    }
+
+  ptr = or_unpack_int (ptr, &offset);
+  if (offset != 0)
+    {
+      outptr_list->packed_prog = stx_restore_expr_packed_prog (thread_p, &xasl_unpack_info->packed_xasl[offset]);
+      if (outptr_list->packed_prog == NULL)
+	{
 	  return NULL;
 	}
     }
@@ -4313,6 +4388,11 @@ stx_build_pred_expr (THREAD_ENTRY * thread_p, char *ptr, PRED_EXPR * pred_expr)
 
   ptr = or_unpack_int (ptr, &tmp);
   pred_expr->type = (TYPE_PRED_EXPR) tmp;
+
+  /* server-side only: compiled lazily on the first evaluation (eval_data_filter ()) */
+  pred_expr->scan_prog = NULL;
+  pred_expr->scan_prog_state = 0;
+  pred_expr->scan_prog_gen = 0;
 
   switch (pred_expr->type)
     {
@@ -6095,6 +6175,14 @@ stx_build_aggregate_type (THREAD_ENTRY * thread_p, char *ptr, AGGREGATE_TYPE * a
   XASL_UNPACK_INFO *xasl_unpack_info_p = get_xasl_unpack_info_ptr (thread_p);
 
   assert (ptr != NULL && aggregate != NULL);
+
+  /* server-side runtime state, never part of the stream */
+  aggregate->operand_prog = NULL;
+  aggregate->operand_prog_idx = NULL;
+  aggregate->operand_prog_state = 0;
+  aggregate->operand_prog_base = -1;
+  aggregate->operand_prog_share_spec = NULL;
+  aggregate->operand_prog_link_stamp = 0;
 
   /* domain */
   ptr = or_unpack_domain (ptr, &aggregate->domain, NULL);

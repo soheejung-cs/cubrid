@@ -246,6 +246,7 @@ set(PARSER_SOURCES
   ${PARSER_DIR}/view_transform.c
   ${PARSER_DIR}/xasl_regu_alloc.cpp
   ${PARSER_DIR}/xasl_generation.c
+  ${PARSER_DIR}/expr_gen.c
   )
 set(PARSER_HEADERS
   ${PARSER_DIR}/func_type.hpp
@@ -295,6 +296,7 @@ set(QUERY_SOURCES
   ${QUERY_DIR}/query_evaluator.c
   ${QUERY_DIR}/query_executor.c
   ${QUERY_DIR}/query_manager.c
+  ${QUERY_DIR}/expr_compile.c
   ${QUERY_DIR}/query_opfunc.c
   ${QUERY_DIR}/query_reevaluation.cpp
   ${QUERY_DIR}/regu_var.cpp
@@ -683,6 +685,7 @@ SET_SOURCE_FILES_PROPERTIES(
   ${PARSER_DIR}/semantic_check.c
   ${PARSER_DIR}/type_checking.c
   ${PARSER_DIR}/xasl_generation.c
+  ${PARSER_DIR}/expr_gen.c
   ${PARSER_DIR}/scanner_support.c
   ${PARSER_DIR}/view_transform.c
   ${OPTIMIZER_SOURCES}
