@@ -1371,6 +1371,14 @@ expr_k_fallback (EXPR_STEP * step, EXPR_EVAL_CTX * ctx)
   return NO_ERROR;
 }
 
+/* a step this execution does not need (a lazy NULL check of an open node that fell back to the interpreted
+ * fetch, which handles its NULL operands itself): nothing, the row goes on */
+static int
+expr_k_nop (EXPR_STEP * step, EXPR_EVAL_CTX * ctx)
+{
+  return NO_ERROR;
+}
+
 /* an operand converter of an open arithmetic node (client programs): the converter the gate chose for this
  * execution, or none.  Mirrors qdata_coerce_arith_operands (): an operand is converted only when both operands
  * are non-NULL (the operator answers NULL otherwise), and a failed conversion is the operand's error, or NULL
@@ -1770,7 +1778,7 @@ expr_step_is_fallible (const EXPR_STEP * step)
 	   || step->kernel == expr_k_extract_datetime || step->kernel == expr_k_extract_timestamp_date
 	   || step->kernel == expr_k_extract_timestamp_time || step->kernel == expr_k_jump_null_arith
 	   || step->kernel == expr_k_jump_null_nullif || step->kernel == expr_k_jump_notnull_nvl
-	   || step->kernel == expr_k_jump || step->kernel == expr_k_case_pub_select);
+	   || step->kernel == expr_k_jump || step->kernel == expr_k_case_pub_select || step->kernel == expr_k_nop);
 }
 
 static bool
@@ -4947,7 +4955,8 @@ expr_prog_from_packed (cubthread::entry * thread_p, valptr_list_node * list, val
 	    }
 	  else
 	    {
-	      EXPR_KERNEL_FN kernel = expr_arith_kernel (expr_packed_operator (ps->opcode), (DB_TYPE) ps->type, ps->aux != 0);
+	      EXPR_KERNEL_FN kernel =
+		expr_arith_kernel (expr_packed_operator (ps->opcode), (DB_TYPE) ps->type, ps->aux != 0);
 	      if (kernel == NULL)
 		{
 		  goto fail;
@@ -5071,6 +5080,20 @@ expr_prog_fill_open (EXPR_PROG * prog, const val_descr * vd)
 	step->kernel = kernel != NULL ? kernel : expr_k_fallback;
 	step->domain = (kernel != NULL && TP_DOMAIN_TYPE (domain) == DB_TYPE_NUMERIC) ? domain : NULL;
       }
+    }
+  /* The lazy NULL check of an open node publishes the node's NULL through the node's SLOT and skips its steps.
+   * A node bound to the interpreted fetch publishes a pointer of its own, not the slot, so the check would leave
+   * a stale pointer in the node's cell: such a check does nothing this execution, and the fetch -- which
+   * handles its NULL operands itself -- runs on every row.  A node bound to a kernel takes its check back. */
+  for (i = 0; i < prog->n_steps; i++)
+    {
+      EXPR_STEP *step = &prog->steps[i];
+
+      if ((step->kernel == expr_k_jump_null_arith || step->kernel == expr_k_nop) && step->alias_of >= 0
+	  && step->alias_of < prog->n_steps && prog->steps[step->alias_of].open)
+	{
+	  step->kernel = prog->steps[step->alias_of].kernel == expr_k_fallback ? expr_k_nop : expr_k_jump_null_arith;
+	}
     }
 }
 
@@ -5265,8 +5288,11 @@ expr_kernel_name (EXPR_KERNEL_FN kernel)
     {
     expr_k_hostvar, "hostvar"},
     {
-  expr_k_fallback, "fallback"}, {
-  expr_k_conv, "conv"},};
+    expr_k_fallback, "fallback"},
+    {
+    expr_k_conv, "conv"},
+    {
+  expr_k_nop, "nop"},};
   size_t i;
 
   for (i = 0; i < sizeof (names) / sizeof (names[0]); i++)
@@ -5354,8 +5380,7 @@ expr_prog_dump (FILE * fp, const EXPR_PROG * prog, int indent)
   fprintf (fp,
 	   "%*c%ssteps: %d (prologue: %d, exec-prologue: %d, compute: %d), cells: %d, slots: %d, roots: %d, hostvar types: %d",
 	   indent, ' ', prog->from_client ? "program: client, " : "", prog->n_steps, prog->n_prologue,
-	   prog->n_exec_prologue, prog->n_compute, prog->n_cells,
-	   prog->n_slots, prog->n_roots, prog->n_hv);
+	   prog->n_exec_prologue, prog->n_compute, prog->n_cells, prog->n_slots, prog->n_roots, prog->n_hv);
   if (prog->n_shared > 0)
     {
       fprintf (fp, ", shared from data filter: %d", prog->n_shared);
