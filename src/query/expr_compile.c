@@ -5079,6 +5079,13 @@ expr_prog_fill_open (EXPR_PROG * prog, const val_descr * vd)
 	  }
 	step->kernel = kernel != NULL ? kernel : expr_k_fallback;
 	step->domain = (kernel != NULL && TP_DOMAIN_TYPE (domain) == DB_TYPE_NUMERIC) ? domain : NULL;
+	if (kernel != NULL && step->out != NULL && step->out_cell != NULL)
+	  {
+	    /* a kernel writes its slot and relies on the node's cell pointing at it; an earlier execution bound to the
+	     * interpreted fetch left the fetch's own pointer in the cell (expr_k_fallback publishes it) -- wire the
+	     * cell back to the slot */
+	    *step->out_cell = step->out;
+	  }
       }
     }
   /* The lazy NULL check of an open node publishes the node's NULL through the node's SLOT and skips its steps.
