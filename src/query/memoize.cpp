@@ -39,6 +39,13 @@ namespace memoize
 {
   struct possible_check
   {
+    /*
+     * [리뷰] possible_check::operator() — new_memoize_storage 가 inner xasl 에 memo 를 붙일지 정하는 검사. level 0 은 inner 자신,
+     * level>=1 은 그 dptr/aptr 부질의를 재귀 검사한다.
+     * develop: develop(a9f075586 143-160): level>=1 에서 aptr 만 재귀 확인.
+     * 이 PR: level>=1 에서 CONNECT BY, BUILDLIST 의 GROUP BY·분석 함수·HAVING 부질의(eptr_list)가 있으면 거부(146-157).
+     * 바뀐 것: 거부 조건 +12줄. key_maker 가 방문하지 않는 자리에 상관 참조가 숨을 수 있는 모양을 memo 대상에서 뺀다.
+     */
     bool operator() (xasl_node *xasl, int level = 0) const noexcept
     {
       OID cls_oid;
@@ -176,6 +183,15 @@ namespace memoize
   template <TARGET_TYPE target_type>
   struct key_maker
   {
+    /*
+     * [리뷰] key_maker::operator()(thread_p, xasl, key_ptr_src) — storage::init 에 넘길 memo 키 원천(DB_VALUE*)을 inner 의
+     * where_key/where_pred/where_range/if_pred/after_join_pred 와 dptr 부질의에서 TYPE_CONSTANT regu 로 모은다. inner 자신의
+     * fetch 대상(vfetch_to)은 뺀다.
+     * develop: develop(a9f075586 165-273): dptr 부질의 결과 regu(regu->xasl == dptr)도 키에 남았다 — put 시점과 get 시점 값이 달라 재생
+     * 누락.
+     * 이 PR: dptr 순회 뒤 regu->xasl 이 이 xasl 의 dptr 인 regu 를 제거(215-228).
+     * 바뀐 것: 필터 +15줄. 키 구성 규칙 변경(부질의 결과 → 부질의의 상관 참조).
+     */
     int operator() (THREAD_ENTRY *thread_p, xasl_node *xasl,
 		    std::vector<DB_VALUE *> &key_ptr_src) const noexcept
     {
@@ -301,6 +317,16 @@ namespace memoize
       return key_ptr_src.size();
     }
 
+    /*
+     * [리뷰] key_maker::operator()(thread_p, subquery, vec) — 부질의(dptr/aptr/scan_ptr 재귀) 안에서 키에 들어갈 상수를 모아 상위 벡터에
+     * 보탠다.
+     * develop: develop(a9f075586 275-398): where/if/after_join/dptr/aptr/scan_ptr/outptr 에서 TYPE_CONSTANT 전부 수집 —
+     * 집계 accumulator·중첩 부질의 결과까지 키에 들어갔다.
+     * 이 PR: instnum_pred·ordbynum_pred·BUILDVALUE 집계 인자·PERCENTILE 인자·having_pred 도 방문(362-384)하고,
+     * REGU_VARIABLE_CORRELATED 가 없는 regu 를 전부 제거(389-393) — subquery cache 키와 같은 기준.
+     * 바뀐 것: 방문 +22줄, 필터 +8줄.
+     * [지적 T1-outer-ref-only-in-index-key-range]
+     */
     void operator() (THREAD_ENTRY *thread_p, xasl_node *subquery,
 		     std::vector<REGU_VARIABLE *> &const_regu_var_vector) const noexcept
     {

@@ -8462,6 +8462,17 @@ qexec_reset_sa_inner_scan_block (THREAD_ENTRY * thread_p, XASL_NODE * inner)
  * chain (CBRD-26872).  Reached from the real scan on S_END and from a memoized
  * "no match" (CBRD-27465).
  */
+/*
+ * [리뷰] qexec_execute_sa_anti_survive — NL ANTI inner 가 현재 바깥 행에 매치를 못 찾았을 때(scan S_END 8832·파티션 소진 8823·memo
+ * ENDED 8565) 호출되어, inner 의 scan 래치를 잠그고 scan_ptr 를 리셋한 뒤 다음 scan 함수로 바깥 행을 진행시킨다. S_SUCCESS/S_END/S_ERROR 를
+ * 돌려준다.
+ * develop: develop(a9f075586 8466-8498): 래치 설정 → scan_ptr 리셋·memoize set_key_changed → next_scan_fnc. dptr 는
+ * 건드리지 않았다.
+ * 이 PR: 함수 첫머리에서 xasl->dptr_list 를 qexec_execute_dptr_list(truncate=true) 로 초기화한다 — LINK 부질의는 status 만 초기화되어
+ * 소비 시점에 재실행되고, LINK 가 아닌 dptr(상관 derived table)는 즉시 실행된다.
+ * 바뀐 것: 분기 추가 +8줄(에러면 S_ERROR). 시그니처·자료구조 변화 없음.
+ * [지적 A1-anti-inner-correlated-derived-table]
+ */
 static SCAN_CODE
 qexec_execute_sa_anti_survive (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
 			       QFILE_TUPLE_RECORD * ignore, XASL_SCAN_FNC_PTR next_scan_fnc)
@@ -8531,6 +8542,16 @@ qexec_execute_sa_anti_survive (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_S
  * accesses in nested loop join operations.
  */
 
+/*
+ * [리뷰] qexec_execute_nljoin_with_memoize — qexec_execute_scan(8714) 이 memoize 스토리지가 있는 inner 에서 스캔 대신 먼저 부르는
+ * 재생 함수. memoize_get 으로 키를 조회해 적중이면 val_list 를 복원해 행을 내보내거나(ENDED 면 S_END/anti 생존), 미적중이면
+ * is_memoize_succeed=false 로 호출자가 실제 스캔을 하게 한다.
+ * develop: develop(a9f075586 8527-8662): 재생 행 분기(else)에서 바로 scan_ptr 처리로 들어가 dptr 를 초기화하지 않았다 — select list
+ * 부질의가 직전 행의 결과를 들고 있었다.
+ * 이 PR: 재생 행 분기 진입(8595)과 다음 재생 행(8655)에서 dptr_list 를 초기화한다. ENDED 분기는 행을 내보내지 않으므로 그대로.
+ * 바뀐 것: 분기 추가 +17줄, 두 자리. 루프 구조·반환값 변화 없음.
+ * [지적 P1-replay-path-clear-cost]
+ */
 static SCAN_CODE
 qexec_execute_nljoin_with_memoize (THREAD_ENTRY * thread_p, bool * is_memoize_succeed,
 				   XASL_NODE * xasl, XASL_STATE * xasl_state,
