@@ -177,6 +177,13 @@ db_is_bind_sensitive (PT_NODE * statement)
  * return         : pointer to the watch-state pointer, or NULL
  * statement (in) : statement being executed
  */
+/*
+ * [리뷰] db_stmt_bind_watch_ptr — statement 종류(쿼리/UPDATE/DELETE)에 따라 parse tree 노드 안의 BIND_WATCH_STATE* 슬롯 주소를
+ * 돌려주는 접근자. NULL 이면 그 statement 는 bind 감시 대상이 아니다.
+ * develop: 기준 rev 164 db_stmt_bind_fp_ptr: 같은 세 분기이나 UINT64 bind_fp(값 해시 1개) 의 주소를 돌려줬다
+ * 이 PR: 슬롯 타입이 UINT64 → BIND_WATCH_STATE*(parser_alloc, fingerprint 벡터·variant 디렉터리·XASL_ID 32개). 이름·자료구조 변경.
+ * 바뀐 것: 자료구조 교체 (bind_fp 삭제, bind_watch 추가 — parse_tree.h)
+ */
 static BIND_WATCH_STATE **
 db_stmt_bind_watch_ptr (PT_NODE * statement)
 {
@@ -202,6 +209,13 @@ db_stmt_bind_watch_ptr (PT_NODE * statement)
 /*
  * db_stmt_bind_watch_state () - the statement's bind-value state, allocated on first use
  * return         : the state, NULL for a statement type that has none (or out of memory)
+ */
+/*
+ * [리뷰] db_stmt_bind_watch_state — 슬롯이 비어 있으면 BIND_WATCH_STATE 를 parser_alloc 으로 만들어 초기화(terms=-1, state=WATCH,
+ * cur_variant=-1)하고 돌려준다. db_bind_watch_verdict 와 db_bind_variant_step 이 부른다.
+ * develop: develop 에 없음
+ * 이 PR: +28줄 신설. 실패 시 er_clear 후 NULL (호출자는 NO_ERROR 로 계속). parser 수명에 묶임(src/parser/AGENTS.md 규약).
+ * 바뀐 것: 신설
  */
 static BIND_WATCH_STATE *
 db_stmt_bind_watch_state (PARSER_CONTEXT * parser, PT_NODE * statement)
@@ -244,6 +258,14 @@ db_stmt_bind_watch_state (PARSER_CONTEXT * parser, PT_NODE * statement)
  *     execution prices it once (what develop does with the feature off).
  * Statements in plan-variant mode never get here (db_bind_variant_mode ()).
  */
+/*
+ * [리뷰] db_bind_watch_is_open — 힌트/파라미터 기반 재플랜(watch) 분기를 열지 결정: 슬롯이 있고 (BIND_SENSITIVE
+ * 힌트·plan_cache_bind_sensitivity 또는 첫 실행의 hv_pred_plan_unpeeked).
+ * develop: develop 에 없음 — 같은 조건이 기준 rev 2239 의 if 식에 인라인돼 있었다(`(hv_pred_plan_unpeeked || db_is_bind_sensitive)
+ * && bind_fp_p != NULL`)
+ * 이 PR: +9줄 추출. 2769·4173 두 호출자가 공유.
+ * 바뀐 것: 조건식 추출(동작 동일)
+ */
 static bool
 db_bind_watch_is_open (PT_NODE * statement)
 {
@@ -259,6 +281,16 @@ db_bind_watch_is_open (PT_NODE * statement)
  * return         : what the caller should do with the plan
  * parser (in)    : parser holding the statement and the bound values
  * statement (in) : statement being executed
+ */
+/*
+ * [리뷰] db_bind_watch_verdict — watch 분기의 판정: 값 해시가 지난번과 같으면 KEEP, 아니면 histogram_bind_watch_check 로 예측 행수가 band
+ * 밖으로 움직였는지 보고 OFF/KEEP/STOP/REPLAN 을 돌려준다.
+ * develop: 기준 rev 2242-2262: UINT64 fingerprint(histogram_bind_fingerprint 의 해시) 가 바뀌면 재플랜 — 값이 같은 버킷이면 유지, 다른
+ * 버킷이면 무조건 재플랜
+ * 이 PR: +41줄 신설. 버킷 해시 비교 → 예측 행수 비율(BIND_WATCH_BAND 1.5 / HINT_BAND 1.1) 비교로 바뀜. usable=false 면 STOP(호출자가
+ * unpeeked 를 내림).
+ * 바뀐 것: 판정 기준 교체(해시 동일성 → 행수 band), 함수로 분리
+ * [지적 F15]
  */
 static BIND_WATCH_VERDICT
 db_bind_watch_verdict (PARSER_CONTEXT * parser, PT_NODE * statement)
@@ -307,6 +339,16 @@ db_bind_watch_verdict (PARSER_CONTEXT * parser, PT_NODE * statement)
  * return         : true for a SELECT picked by target selection while the feature is on, unless
  *                  the hint asks for the every-execution path instead
  */
+/*
+ * [리뷰] db_bind_variant_mode — plan variant 모드 게이트: 플랜 헤더의 BIND_WATCH_CANDIDATE(target selection) 가 statement 에
+ * 기록돼 있고, 쿼리이거나 서버측 UPDATE/DELETE 이며, plan_cache_bind_variants>0·XASL 캐시 on·힌트/파라미터 off 일 때 true.
+ * 2754·2828·4162 가 부른다.
+ * develop: develop 에 없음
+ * 이 PR: +21줄 신설. db_is_bind_sensitive 와 배타(힌트가 켜지면 variant 모드가 꺼지고 watch 분기로 간다).
+ * 바뀐 것: 신설
+ * [지적 F8]
+ * [지적 F24]
+ */
 static bool
 db_bind_variant_mode (PT_NODE * statement)
 {
@@ -332,6 +374,15 @@ db_bind_variant_mode (PT_NODE * statement)
 /*
  * db_stmt_bind_variant_key_ptr () - where the statement keeps the key of its current plan variant
  */
+/*
+ * [리뷰] db_stmt_bind_variant_key_ptr — statement 노드의 bind_variant_key(해시 텍스트 뒤에 붙여 variant 를 별도 캐시 엔트리로 만드는
+ * 문자열) 슬롯 주소. 소비자는 execute_statement.c:15250 do_append_bind_variant_key(do_prepare_select/update/delete 가 SHA1
+ * 계산 직전에 호출).
+ * develop: develop 에 없음
+ * 이 PR: +17줄 신설. statement NULL 검사 없음·비대상이면 NULL — 호출자 402·484 는 역참조하지만 둘 다
+ * db_bind_variant_mode(쿼리/UPDATE/DELETE 만 true) 뒤에만 도달.
+ * 바뀐 것: 신설
+ */
 static const char **
 db_stmt_bind_variant_key_ptr (PT_NODE * statement)
 {
@@ -353,6 +404,14 @@ db_stmt_bind_variant_key_ptr (PT_NODE * statement)
 /*
  * db_bind_variant_key () - the hash-text key of one variant of the base entry's generation
  */
+/*
+ * [리뷰] db_bind_variant_key — ' /* bind variant <base sec>.<usec> #<k> */' 키 문자열을 parser 아레나에 만든다. base_time 이
+ * 세대를 구분하므로 새 세대는 옛 variant 엔트리를 재사용하지 않는다.
+ * develop: develop 에 없음
+ * 이 PR: +8줄 신설. CACHE_TIME.sec/usec 는 int(storage_common.h) 라 buf[96] 은 충분. 호출마다 새로 할당(F2).
+ * 바뀐 것: 신설
+ * [지적 F2]
+ */
 static const char *
 db_bind_variant_key (PARSER_CONTEXT * parser, const BIND_WATCH_STATE * ws, int variant)
 {
@@ -364,6 +423,13 @@ db_bind_variant_key (PARSER_CONTEXT * parser, const BIND_WATCH_STATE * ws, int v
 
 /*
  * db_bind_variant_remember () - keep the statement's XASL_ID as its current variant's
+ */
+/*
+ * [리뷰] db_bind_variant_remember — 현재 cur_variant 슬롯에 statement->xasl_id 를 복사해 두어 다음에 그 variant 로 돌아올 때 prepare
+ * 왕복 없이 XASL_ID 를 되살릴 수 있게 한다. switch 성공 뒤(422)와 XASLNODE_RECOMPILE 재시도 뒤(2831) 호출.
+ * develop: develop 에 없음
+ * 이 PR: +13줄 신설. cur_variant 범위·xasl_id NULL 검사 후 복사.
+ * 바뀐 것: 신설
  */
 static void
 db_bind_variant_remember (PT_NODE * statement)
@@ -389,6 +455,18 @@ db_bind_variant_remember (PT_NODE * statement)
  * trip. Otherwise this is a cache lookup; when the variant's entry was evicted it is compiled
  * again under the current values, which are the nearest to it anyway -- that decides nothing
  * about which plans the query has.
+ */
+/*
+ * [리뷰] db_bind_variant_switch — statement 의 XASL_ID 를 지정 variant 의 플랜으로 바꾼다: 같은 variant 면 무동작, 기억한 XASL_ID 가
+ * 있으면 malloc 복사로 교체(소유권은 statement), 아니면 variant 키를 붙여 do_replan_statement_internal(compile=true 면 강제 컴파일,
+ * false 면 캐시 조회). step 의 MATCH/FROZEN/COMPILE/SAME_PLAN 과 nearest 가 부른다.
+ * develop: develop 에 없음
+ * 이 PR: +33줄 신설. 402 키 대입이 418 재플랜보다 앞이라 실패 시 키·cur_variant 불일치(F3). 402 가 매번 새 키를 할당(F2). malloc@406 은
+ * pt_free_statement_xasl_id 짝으로 회수(arch gate-imbalance 는 오탐).
+ * 바뀐 것: 신설
+ * [지적 F2]
+ * [지적 F3]
+ * [지적 F12]
  */
 static int
 db_bind_variant_switch (PARSER_CONTEXT * parser, PT_NODE * statement, BIND_WATCH_STATE * ws, int variant, bool compile)
@@ -427,6 +505,12 @@ db_bind_variant_switch (PARSER_CONTEXT * parser, PT_NODE * statement, BIND_WATCH
 /*
  * db_bind_variant_learn () - keep what the server said about the query's variants
  */
+/*
+ * [리뷰] db_bind_variant_learn — 서버 응답의 state·n_records·records 를 ws 에 복사. WATCH→DONE/SELECT 전이 때 debug 로그 1회.
+ * develop: develop 에 없음
+ * 이 PR: +18줄 신설. 복사 상한 min(n_records, MAX_COMPILES) — 7916 클램프와 이중 안전.
+ * 바뀐 것: 신설
+ */
 static void
 db_bind_variant_learn (BIND_WATCH_STATE * ws, const BIND_VARIANT_REPLY * reply)
 {
@@ -449,6 +533,14 @@ db_bind_variant_learn (BIND_WATCH_STATE * ws, const BIND_VARIANT_REPLY * reply)
 /*
  * db_bind_variant_nearest () - run the variant nearest to the values
  */
+/*
+ * [리뷰] db_bind_variant_nearest — 로컬 디렉터리에서 거리와 무관하게 가장 가까운 레코드의 variant 로 switch(false). FROZEN 응답 뒤(646) 호출.
+ * 레코드가 없으면 NO_ERROR(기존 플랜 유지).
+ * develop: develop 에 없음
+ * 이 PR: +13줄 신설.
+ * 바뀐 것: 신설
+ * [지적 F25]
+ */
 static int
 db_bind_variant_nearest (PARSER_CONTEXT * parser, PT_NODE * statement, BIND_WATCH_STATE * ws,
 			 const BIND_FINGERPRINT * fp)
@@ -466,6 +558,14 @@ db_bind_variant_nearest (PARSER_CONTEXT * parser, PT_NODE * statement, BIND_WATC
 /*
  * db_bind_variant_rebase () - attach the statement to the query's current base entry: its
  *   generation is gone (DDL, eviction, cache drop), so the variants start over
+ */
+/*
+ * [리뷰] db_bind_variant_rebase — 서버가 NOT_FOUND(base 세대 불일치) 를 돌려줬을 때 ws 를 초기화하고 키 없이
+ * do_replan_statement_internal(false) 로 base 엔트리를 다시 잡아 base_sha1/base_time 을 갱신한다.
+ * develop: develop 에 없음
+ * 이 PR: +29줄 신설. value_hash·records 내용은 지우지 않음(n_records=0 으로 가려짐). 재플랜 실패는 호출자가 그대로 반환(608).
+ * 바뀐 것: 신설
+ * [지적 F8]
  */
 static int
 db_bind_variant_rebase (PARSER_CONTEXT * parser, PT_NODE * statement, BIND_WATCH_STATE * ws)
@@ -510,6 +610,20 @@ db_bind_variant_rebase (PARSER_CONTEXT * parser, PT_NODE * statement, BIND_WATCH
  * a plan the query already has is folded into that variant. Once the query is done learning:
  * one plan means the values are not looked at again, several mean each new set of values runs
  * the nearest plan, without asking the server and without compiling.
+ */
+/*
+ * [리뷰] db_bind_variant_step — 실행 직전의 variant 선택 상태기계: 값 해시 단락 → DONE 검사 → fingerprint → base 기록 → 로컬 디렉터리에서
+ * band 안의 variant 면 왕복 없이 switch → 없으면 CHECK 왕복(NOT_FOUND 면 rebase 후 1회 재시도) → MATCH/FROZEN/COMPILE(+REGISTER
+ * 왕복) 처리. 통신 오류는 질의를 실패시키지 않고 DONE 으로 접는다.
+ * develop: develop 에 없음 — 기준 rev 는 2239-2273 의 단일 플랜 재생성(해시 다르면 do_replan_statement_with_bind_peek) 뿐
+ * 이 PR: +187줄 신설. cur_variant<0 & WATCH 에서 같은 값이 반복돼도 532 단락이 안 걸리지만, 서버 응답으로 cur_variant 가 잡히거나 FROZEN+빈
+ * 디렉터리는 MAX_POLLS=4 로 유계·그 뒤 DONE/SELECT — 무한 왕복 경로 없음. COMPILE 은 왕복 2회 + 클라이언트 컴파일 1회(학습기에만). 651-655 컴파일 실패
+ * 시 REGISTER 없이 return(F1).
+ * 바뀐 것: 신설 (상태기계)
+ * [지적 F1]
+ * [지적 F3]
+ * [지적 F9]
+ * [지적 F10]
  */
 static int
 db_bind_variant_step (PARSER_CONTEXT * parser, PT_NODE * statement)
@@ -2510,6 +2624,19 @@ do_execute_subquery_pre (PARSER_CONTEXT * parser, PT_NODE * stmt, void *arg, int
  * stmt(in) : int returned by a successful compilation
  * result(out): query results descriptor
  */
+/*
+ * [리뷰] db_execute_and_keep_statement_local — 세션의 statement 를 실행하는 중심 함수(CCI/JDBC·csql 의 db_execute_statement
+ * 경로). XASL 캐시가 켜진 statement 는 실행 전 bind 값 검사(variant 또는 watch) 를 거쳐 do_execute_statement 로 간다.
+ * develop: 기준 rev 2238-2273: `(hv_pred_plan_unpeeked || bind_sensitive) && set_host_var && host_var_count>0 &&
+ * xasl_id` 이면 histogram_bind_fingerprint(UINT64 해시) 비교 → 다르면 do_replan_statement_with_bind_peek, 같으면 유지;
+ * 2306-2309 재시도는 do_prepare_statement 뒤 바로 do_execute_statement
+ * 이 PR: 2754-2768 variant 분기(db_bind_variant_mode → db_bind_variant_step) 를 먼저, 2769-2792 watch
+ * 분기(db_bind_watch_verdict==REPLAN 이면 재플랜) 를 else-if 로; 2828-2832 재시도 뒤 variant 모드면 db_bind_variant_remember 로
+ * 새 XASL_ID 를 슬롯에 갱신. 두 분기 모두 끝에 hv_pred_plan_unpeeked=0.
+ * 바뀐 것: 분기 추가·판정 교체 (-29/+33, +5 재시도)
+ * [지적 F2]
+ * [지적 F3]
+ */
 static int
 db_execute_and_keep_statement_local (DB_SESSION * session, int stmt_ndx, DB_QUERY_RESULT ** result)
 {
@@ -4040,6 +4167,15 @@ db_reset_cte_xasl_pre (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *
   return node;
 }
 
+/*
+ * [리뷰] do_replan_statement_with_bind_peek — watch 분기의 재플랜 진입점(2781·4191·4317 계열):
+ * do_replan_statement_internal(…, force_compile=true) 래퍼.
+ * develop: 기준 rev 3520-3585: 본문 66줄이 직접 있었다(xasl_id 해제 → CTE 리셋 → recompile=1 → 옵티마이저 덤프 비트 제거 → plan_trace 정리
+ * → do_prepare_statement → 복원)
+ * 이 PR: 4043-4047 5줄 래퍼. 본문은 do_replan_statement_internal 로 이동하며 recompile 값만 매개변수화(4068: `force_compile ? 1 :
+ * 0`).
+ * 바뀐 것: 본문 추출(-66/+5), 동작 동일(force_compile=true)
+ */
 static int
 do_replan_statement_with_bind_peek (PARSER_CONTEXT * parser, PT_NODE * statement)
 {
@@ -4052,6 +4188,17 @@ do_replan_statement_with_bind_peek (PARSER_CONTEXT * parser, PT_NODE * statement
  * force_compile (in) : true = compile and replace the cache entry (a replan); false = take the
  *                      statement's cache entry when it is there, compile only when it is not
  *                      (switching to a plan variant)
+ */
+/*
+ * [리뷰] do_replan_statement_internal — kept 트리에서 플랜·XASL 만 다시 만든다. force_compile=true 면 recompile=1 로 캐시 엔트리를
+ * 교체(재플랜), false 면 recompile=0 으로 캐시에 있으면 그것을 잡고 없을 때만 컴파일(variant 전환·rebase). xasl_id 를 먼저 해제하므로 실패하면
+ * statement 는 xasl_id 없이 남는다.
+ * develop: 기준 rev 3520-3585 do_replan_statement_with_bind_peek 본문과 동일(recompile=1 고정)
+ * 이 PR: +66줄(이동) + force_compile 매개변수. 옵티마이저 레벨·recompile 플래그 저장/복원은 조기 return 없이 짝이 맞고, plan_trace 해제는 이 함수
+ * 밖에서 채운 것의 소유권 정리(gate -1 은 오탐).
+ * 바뀐 것: 추출 + 매개변수 1개 추가 (4057, 4068)
+ * [지적 F3]
+ * [지적 F8]
  */
 static int
 do_replan_statement_internal (PARSER_CONTEXT * parser, PT_NODE * statement, bool force_compile)
@@ -4133,6 +4280,18 @@ do_replan_statement_internal (PARSER_CONTEXT * parser, PT_NODE * statement, bool
  * force_replan (in) : an existing signal (invalidated XASL, LIKE/limit optimization
  *                     check) already requires replanning under the current values
  */
+/*
+ * [리뷰] do_reexecute_prepared_statement_from_kept_tree — SQL PREPARE/EXECUTE 의 kept 서브세션 재실행: USING 값만 다시
+ * 묶고(set_host_var 를 0 으로 내린 뒤) variant 단계 또는 watch 판정을 돌린 다음 db_execute_and_keep_statement_local(kept) 로 간다.
+ * 2754 는 set_host_var 를 요구하므로 variant/watch 는 여기서만 돈다.
+ * develop: 기준 rev 3600-3665: db_stmt_bind_fp_ptr 로 UINT64 해시를 얻어 `replan || bind_sensitive` 일 때만 fingerprint 를
+ * 걷고, 해시가 다르면 replan=true → do_replan_statement_with_bind_peek 뒤 *fp_p = fp 기록
+ * 이 PR: 4162-4172 variant 분기(db_bind_variant_mode && xasl_id → db_bind_variant_step, replan 변수는 건드리지 않음) /
+ * 4173-4185 watch 분기(verdict REPLAN 이면 replan=true) / 4187-4196 replan 이면 do_replan_statement_with_bind_peek.
+ * host_var_count>0 조건은 없지만 BIND_WATCH_CANDIDATE 가 host-variable 술어를 전제하므로 실질 동일.
+ * 바뀐 것: 판정 교체 (-44/+42)
+ * [지적 F11]
+ */
 static int
 do_reexecute_prepared_statement_from_kept_tree (DB_SESSION * session, DB_SESSION * kept, PT_NODE * statement,
 						DB_QUERY_RESULT ** result, bool force_replan)
@@ -4209,6 +4368,20 @@ do_reexecute_prepared_statement_from_kept_tree (DB_SESSION * session, DB_SESSION
  * session (in)   : client session context
  * statement (in) : statement to be executed
  * result (out)   : execution result
+ */
+/*
+ * [리뷰] do_recompile_and_execute_prepared_statement — SQL 수준 EXECUTE(이름 있는 prepared 문)의 첫 실행: 질의 문자열로 서브세션을 열어
+ * 컴파일·바인딩·실행하고, 값 적응이 끝난 트리를 db_prepared_tree_register 로 보존한다. 반환은 db_execute_and_keep_statement_local 의 행
+ * 수/에러.
+ * develop: 기준 rev(base db_vdb.c:3679-3822): 바인딩·캐스트 뒤 SELECT/UPDATE/DELETE 이고 db_stmt_bind_fp_ptr 슬롯이 있으면
+ * histogram_bind_fingerprint(&fp)(UINT64 해시) 가 true 일 때 무조건 do_replan_statement_with_bind_peek 하고 fp 를 문장 슬롯에
+ * 저장(3797-3804). 보존 트리 등록(3820)은 이미 있었다.
+ * 이 PR: 슬롯 검사가 db_stmt_bind_watch_ptr(4320) 로 바뀌고, db_bind_variant_mode && xasl_id 면
+ * db_bind_variant_step(4331, 서버 변형 목록 CHECK/REGISTER), 아니면 db_bind_watch_is_open 일 때
+ * db_bind_watch_verdict(4341) 가 REPLAN 일 때만 replan. is_bind_candidate 는 verdict 가 OFF/STOP 이 아닐 때.
+ * 바뀐 것: 분기 교체(해시 지문·무조건 replan → 변형 모드/감시 판정), 약 -12/+25 줄. new_session 을 owner 체인에 연결한 뒤 에러 반환 7곳이 해제 없이 돌아가는
+ * 구조는 기준과 동일(owner close 가 체인을 닫음, db_prepared_tree_register 주석 826-827).
+ * [지적 F11]
  */
 static int
 do_recompile_and_execute_prepared_statement (DB_SESSION * session, PT_NODE * statement, DB_QUERY_RESULT ** result)

@@ -7868,6 +7868,16 @@ qmgr_drop_all_query_plans (void)
  * req (in)   : the request
  * reply (out): the outcome and the query's variant directory
  */
+/*
+ * [리뷰] qmgr_bind_variant — db_bind_variant_step 이 CHECK/REGISTER 요청을 보낼 때 부르는 클라이언트 스텁. CS 에서는
+ * BIND_VARIANT_REQUEST 를 고정 열로 패킹해 NET_SERVER_QM_BIND_VARIANT 를 보내고 응답을 BIND_VARIANT_REPLY 로 풀어 서버 status 를
+ * 돌려준다; SA 에서는 enter_server 후 xcache_bind_variant 를 직접 부른다.
+ * develop: develop 에 없음 (기준 rev network_interface_cl.c 의 qmgr_* 는 prepare/execute/end/drop/dump 8개)
+ * 이 PR: +75줄 신설. n_records 만 0..BIND_VARIANT_MAX_COMPILES 로 클램프하고 variant/state/records[i].variant 는 그대로
+ * 받는다(소비자 쪽 374·404 가 범위 검사). 응답 버퍼 8.5KB 를 스택에 둔다.
+ * 바뀐 것: 신설 함수, CS/SA 이중 가드(인접 qmgr_drop_all_query_plans 와 같은 형태)
+ * [지적 F28]
+ */
 int
 qmgr_bind_variant (const BIND_VARIANT_REQUEST * req, BIND_VARIANT_REPLY * reply)
 {

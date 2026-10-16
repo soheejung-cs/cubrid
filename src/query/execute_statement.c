@@ -9769,6 +9769,19 @@ end:
  *
  * Note:
  */
+/*
+ * [리뷰] do_prepare_update — do_prepare_statement 가 UPDATE 문마다 부른다. 서버측 UPDATE 면 해시 텍스트→SHA1→서버 캐시
+ * 조회(prepare_query) 또는 pt_to_update_xasl 로 XASL 을 만들어 등록하고 statement->xasl_id 에 담아 돌려준다; 클라이언트측(트리거·뷰)이면 내부
+ * SELECT 를 만들어 do_prepare_select 로 넘긴다.
+ * develop: develop(dbb986faf) 9771-10170: sql_hash_text = alias_print 바로 뒤 SHA1Compute(9930-9937). 캐시 적중 시
+ * xasl_header.xasl_flag 에서 HV_PRED_PLAN_UNPEEKED 만 읽어 hv_pred_plan_unpeeked 를 세움(9975-9981). 신규 컴파일 경로도 같은
+ * 플래그만(9994-9998).
+ * 이 PR: sql_hash_text 를 do_append_bind_variant_key 로 '텍스트+변종 키' 로 바꾼 뒤 SHA1(9931-9935). 캐시 적중(9988-9992)·신규
+ * 컴파일(10012-10015) 양쪽에서 xasl_flag 의 BIND_WATCH_CANDIDATE 를 statement->flag.bind_watch_candidate=1 로 기록.
+ * 바뀐 것: 분기 추가 3곳(+15줄): 실패 시 조기 return 1, 플래그 기록 2. 시그니처·자료구조 변경 없음. 플래그는 1 로만 쓰고 0 으로 되돌리는 자리 없음(F8).
+ * [지적 F8]
+ * [지적 F16]
+ */
 int
 do_prepare_update (PARSER_CONTEXT * parser, PT_NODE * statement)
 {
@@ -11188,6 +11201,20 @@ end:
  *   parser(in/out): Parser context
  *   statement(in/out): Delete statement
  *   parent(in): Parent statement if using multi-delete list
+ */
+/*
+ * [리뷰] do_prepare_delete — do_prepare_statement 와 자기 자신(del_stmt_list 재귀)이 부른다. DELETE 문 리스트를 돌며 서버측이면 해시→캐시
+ * 조회/컴파일로 xasl_id 를 받고, 클라이언트측이면 내부 SELECT 를 준비한다. 하나라도 실패하거나 cannot_prepare 면 끝 블록(11514-11525)에서 앞서 받은
+ * xasl_id 를 전부 해제하고 parent 에 cannot_prepare 를 올린다.
+ * develop: develop 11177-11499: 11311 sql_hash_text = alias_print → 11312 SHA1Compute → 실패 시 return
+ * err(11318). 적중 경로는 HV_PRED_PLAN_UNPEEKED 만(11352-11358), 컴파일 경로도 같은 플래그만(11368-11372). 끝 정리 블록 11484-11495
+ * 동일.
+ * 이 PR: 11327-11331 do_append_bind_variant_key 호출+실패 return, 11375-11379·11398-11401 BIND_WATCH_CANDIDATE →
+ * bind_watch_candidate=1. 나머지(루프·정리 블록) develop 과 같음.
+ * 바뀐 것: 분기 추가 3곳(+14줄). 새 return 은 루프의 break 규약과 어긋나 끝 정리 블록을 건너뜀 — develop 의 SHA1Compute 실패와 같은 형태(F16, 선재 패턴
+ * 복제).
+ * [지적 F8]
+ * [지적 F16]
  */
 int
 do_prepare_delete (PARSER_CONTEXT * parser, PT_NODE * statement, PT_NODE * parent)
@@ -15246,6 +15273,19 @@ pt_sub_host_vars_index (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int 
  *   of the statement, so the variant is a cache entry of its own (bind_variant.h)
  * return : error code
  */
+/*
+ * [리뷰] do_append_bind_variant_key — do_prepare_select/update/delete 가 sql_hash_text = alias_print 직후 부른다. 문장
+ * 노드(SELECT 류·UPDATE·DELETE)에 db_bind_variant_switch(db_vdb.c:402) 가 실어 둔 bind_variant_key(' /* bind variant
+ * <base time> #n */')가 있으면 parser_alloc 버퍼에 '해시 텍스트+키' 를 만들어 contextp->sql_hash_text 를 그 버퍼로 바꾼다. 키가 없거나 다른
+ * node_type 이면 아무것도 안 하고 NO_ERROR.
+ * develop: develop 에 없음
+ * 이 PR: static 신설 39줄. 할당 실패(ER_OUT_OF_VIRTUAL_MEMORY, parse_tree.c:439 에서 er_set 됨) 만 에러. 버퍼는 parser
+ * 소유(parser_alloc 규약대로 수동 해제 없음). alias_print 자체는 바꾸지 않으므로 statement->alias_print 와 contextp->sql_hash_text 가
+ * 달라진다 — 서버에 저장되는 텍스트는 키가 붙은 쪽(F13). (int)(text_len+key_len+1) 캐스트는 SQL 텍스트 길이 범위에서 문제 없음.
+ * 바뀐 것: 신설 함수(+39줄). 호출자 3곳.
+ * [지적 F13]
+ * [지적 F16]
+ */
 static int
 do_append_bind_variant_key (PARSER_CONTEXT * parser, COMPILE_CONTEXT * contextp, PT_NODE * statement)
 {
@@ -15294,6 +15334,19 @@ do_append_bind_variant_key (PARSER_CONTEXT * parser, COMPILE_CONTEXT * contextp,
  *   statement(in/out): A statement to do
  *
  * Note:
+ */
+/*
+ * [리뷰] do_prepare_select — do_prepare_statement/update/delete/merge/subquery 가 부른다. SELECT 의 해시 텍스트·sha1 을 만들고
+ * 서버 캐시를 조회해 statement->xasl_id 를 채우거나(적중) 클라이언트에서 XASL 을 생성해 prepare_query 로 올린다.
+ * develop: develop(dbb986faf:15225-15430): alias_print → sql_hash_text → SHA1Compute → prepare_query; 적중 시
+ * like/limit 재컴파일 판정과 HV_PRED_PLAN_UNPEEKED 플래그만 statement 에 옮김.
+ * 이 PR: SHA1 전에 do_append_bind_variant_key 로 sql_hash_text 에 변형 키를 덧붙여(변형이면) 다른 sha1 을 만든다(@15350-15354, 실패 시
+ * early return). 적중 분기(@15417-15422) 와 신규 컴파일 분기(@15445-15448) 에서 xasl_flag 의 BIND_WATCH_CANDIDATE 를
+ * statement->flag.bind_watch_candidate 로 옮긴다.
+ * 바뀐 것: 분기 추가 3곳(+~15줄): 변형 키 결합 호출 + 에러 return, 헤더 플래그 전파 2곳. 시그니처 동일.
+ * [지적 F8]
+ * [지적 F13]
+ * [지적 F16]
  */
 int
 do_prepare_select (PARSER_CONTEXT * parser, PT_NODE * statement)

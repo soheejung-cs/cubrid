@@ -616,6 +616,13 @@ histogram_spec_class_name (PARSER_CONTEXT *parser, PT_NODE *statement, PT_NODE *
 }
 
 /* parser-arena copy of a cached histogram blob (same as qo_copy_histogram_value ()) */
+/*
+ * [리뷰] bind_copy_histogram_value — 클래스 캐시가 쥔 BIT/VARBIT 히스토그램 블롭을 parser 아레나로 복사해 돌려준다(qo_copy_histogram_value
+ * 와 같은 역할). histogram_init_reader_from_lhs 만 부른다.
+ * develop: develop 에 없음
+ * 이 PR: NULL/타입/빈 블롭이면 NULL, parser_alloc 2회(수동 해제 없음 — parser AGENTS 규약과 일치) 후 db_make_bit/varbit.
+ * 바뀐 것: 신설 +42
+ */
 static DB_VALUE *
 bind_copy_histogram_value (PARSER_CONTEXT *parser, DB_VALUE *src)
 {
@@ -717,6 +724,18 @@ histogram_blob_from_class_cache (PARSER_CONTEXT *parser, PT_NODE *statement, PT_
   return NULL;
 }
 
+/*
+ * [리뷰] histogram_init_reader_from_lhs — 이름 노드(또는 경로식 끝 노드)의 히스토그램 블롭으로 HistogramReader 를 초기화한다. 모든 선택도 프로브와
+ * bind_target_column_has_mcv 가 부른다.
+ * develop: 기준 rev 673-718: name.histogram 이 없고 bind_fp_active_statement 가 있으면 histogram_blob_from_class_cache
+ * 로 찾아 그대로 썼다(노드에 남기지 않음).
+ * 이 PR: 찾은 블롭을 bind_copy_histogram_value 로 복사해 lhs->info.name.histogram 에 심는다(743-749) — 같은 문장의 다음 지문은 트리·클래스
+ * 캐시 재탐색을 하지 않는다.
+ * 바뀐 것: 분기 안에 복사·주석 추가 +13. bind_fp_active_* 는
+ * bind_term_vector(3216-3222)·histogram_bind_watch_candidate(3633-3639) 양쪽이 set/clear 하므로 bind_target_add
+ * 경로에서도 폴백이 산다(수집 질문 735 닫힘).
+ * [지적 F11]
+ */
 static bool
 histogram_init_reader_from_lhs (PT_NODE *lhs, hist::HistogramReader &reader)
 {
@@ -2824,6 +2843,15 @@ histogram_is_user_host_var (const PARSER_CONTEXT *parser, const PT_NODE *hv)
  *       family -- every `col > ?` / `col BETWEEN ? AND ?` -- was invisible to them, so
  *       such a statement was never peeked and kept the plan chosen under unbound markers.
  */
+/*
+ * [리뷰] histogram_split_hv_range — (column RANGE {…?…}) 술어인지 판정하고 컬럼 노드를 돌려준다.
+ * hv_pred_walk·bind_term_walk·bind_target_walk 가 쓴다.
+ * develop: 기준 rev 2683-2721: range 항목을 `range_node->next` 로 걸어 IN-list 의 첫 항목만 봤다(2704).
+ * 이 PR: `or_next`(2851) 로 걸어 모든 OR 대안을 본다. pt_get_end_path_node 는 non-DOT 입력을 그대로 돌려주므로(parser_support.c:2441)
+ * 2842 은 안전.
+ * 바뀐 것: 루프 링크 1곳 + 주석 2줄
+ * [지적 F14]
+ */
 static bool
 histogram_split_hv_range (PARSER_CONTEXT *parser, PT_NODE *node, PT_NODE **out_name)
 {
@@ -2942,6 +2970,12 @@ struct hv_pred_ctx
 /* structural check only (no value fetch): is there a (column op ?) predicate that the
  * bind-sensitive planner could price? Used at plan generation, where host variables carry
  * no execution values, to mark a plan as chosen under unbound markers. */
+/*
+ * [리뷰] hv_pred_walk — parser_walk_tree 콜백: 가격 가능한 호스트 변수 술어(비교 또는 RANGE)를 하나라도 찾으면 found 를 세우고 걷기를 멈춘다.
+ * develop: 기준 rev 2998-3010 과 본문 동일
+ * 이 PR: 동일(파일 내 위치만 이동)
+ * 바뀐 것: 없음(이동)
+ */
 static PT_NODE *
 hv_pred_walk (PARSER_CONTEXT *parser, PT_NODE *node, void *arg, int *continue_walk)
 {
@@ -2956,6 +2990,13 @@ hv_pred_walk (PARSER_CONTEXT *parser, PT_NODE *node, void *arg, int *continue_wa
   return node;
 }
 
+/*
+ * [리뷰] histogram_stmt_has_hv_predicate — 플랜 생성 시(pt_plan_query·pt_to_update/delete_xasl) 문장이 값 의존 술어를 가지는지
+ * 구조적으로 판정해 unpeeked 플래그의 근거를 준다.
+ * develop: 기준 rev 3012-3019 와 본문 동일
+ * 이 PR: 동일(이동)
+ * 바뀐 것: 없음(이동)
+ */
 bool
 histogram_stmt_has_hv_predicate (PARSER_CONTEXT *parser, PT_NODE *statement)
 {
@@ -2983,6 +3024,16 @@ struct bind_term_ctx
 };
 
 /* record one priced predicate: the rows it is expected to scan, and a label for the log */
+/*
+ * [리뷰] bind_term_add — 가격된 술어 하나를 ctx 벡터에 기록: rows = sel×total_rows(하한 1.0) 또는 BIND_TERM_UNKNOWN(-1.0),
+ * want_names 면 'alias.col op' 라벨. bind_term_walk 만 부른다.
+ * develop: develop 에 없음(기준은 bind_fp_walk 2904- 가 sel 을 양자화해 해시에 섞었다).
+ * 이 PR: MAX_TERMS(32) 초과는 무시, histogram_get_total_rows 실패(컬럼 히스토그램 없음)면 항을 넣지 않음 → '항이 빠지는' 경로는 이 둘뿐.
+ * total_rows 가 선택도 프로브와 별도로 reader 를 다시 연다(F5).
+ * 바뀐 것: 신설 +30
+ * [지적 F5]
+ * [지적 F22]
+ */
 static void
 bind_term_add (bind_term_ctx *ctx, PT_NODE *name, const char *opstr, double sel)
 {
@@ -3018,6 +3069,14 @@ bind_term_add (bind_term_ctx *ctx, PT_NODE *name, const char *opstr, double sel)
  * place. Auto-parameterized literals arrive as host variables too and are resolved here -- for
  * a range term they are part of the term's selectivity even though they are not what makes the
  * term value-dependent (that test stays histogram_is_user_host_var). */
+/*
+ * [리뷰] bind_card_arg_value — range 경계/비교 피연산자 노드의 DB_VALUE 를 qo_between_range_arg_value 와 같은 분류(qo_classify)로
+ * 돌려준다 — host var(자동 파라미터 포함)·상수만, 아니면 NULL.
+ * develop: develop 에 없음(기준 bind_fp_walk 2930 근처가 host_variables 인덱싱을 인라인으로 했고 같은 범위 검사).
+ * 이 PR: 범위 검사 포함. auto param 까지 읽는 것은 'IN (?, 5)' 의 상수 항목을 가격하기 위함이고, histogram_bind_value_hash(3297) 가 user
+ * host var 만 해시하는 것과는 역할이 달라 모순 아님(수집 질문 3039 닫힘).
+ * 바뀐 것: 신설 +30
+ */
 static DB_VALUE *
 bind_card_arg_value (PARSER_CONTEXT *parser, PT_NODE *arg)
 {
@@ -3053,6 +3112,17 @@ bind_card_arg_value (PARSER_CONTEXT *parser, PT_NODE *arg)
  * The items are OR-ed alternatives chained through or_next (the same list qo_range_selectivity
  * walks), so their selectivities add; an unpriceable item would silently shrink that sum, so
  * the whole term is dropped instead. */
+/*
+ * [리뷰] bind_card_range_selectivity — RANGE 항 하나의 총 선택도를 옵티마이저(qo_range_selectivity)와 같은 식으로 더해 돌려주고, 값 의존 여부를
+ * 함께 알린다. bind_term_walk 만 부른다.
+ * develop: develop 에 없음(기준 bind_fp_mix_range 2855- 는 경계마다 따로 해시).
+ * 이 PR: EQ_NA 는 equal 프로브, 나머지는 qo_between_range_histogram_selectivity; NULL 경계는 0.0. 한쪽 경계 op 는 arg2 가
+ * NULL(query_rewrite_term.c 2819/2983) 이라 v2==NULL 이 정상 입력이고 histogram_get_comp_selectivity(1362) 가 NULL 을
+ * success=false 로 받는다(수집 질문 3091 닫힘).
+ * 바뀐 것: 신설 +57. 첫 루프의 early return 과 주석 불일치는 F14.
+ * [지적 F14]
+ * [지적 F5]
+ */
 static bool
 bind_card_range_selectivity (PARSER_CONTEXT *parser, PT_NODE *node, PT_NODE *name, double *out_sel,
 			     bool *out_value_dependent)
@@ -3111,6 +3181,15 @@ bind_card_range_selectivity (PARSER_CONTEXT *parser, PT_NODE *node, PT_NODE *nam
   return priced;
 }
 
+/*
+ * [리뷰] bind_term_walk — 지문 walk 콜백: RANGE 항 또는 (col op ?) 항을 인식해 bind_term_add 로 rows 를 기록한다.
+ * develop: develop 에 없음 — 기준 bind_fp_walk(2904-2996) 가 대응: 가격 실패(!ok) 항은 버렸고(2954) NULL 값은 프로브 실패로 같은 길.
+ * 이 PR: NULL 은 0.0 으로 가격해 슬롯 유지(3155-3171), 가격 실패는 UNKNOWN 슬롯(3203). 5개 op 집합은 NULL 분기와 일반 분기가 일치.
+ * 바뀐 것: 신설 +92(설계 변경: 드롭 → 슬롯 유지, PR 본문 142)
+ * [지적 F22]
+ * [지적 F9]
+ * [지적 F5]
+ */
 static PT_NODE *
 bind_term_walk (PARSER_CONTEXT *parser, PT_NODE *node, void *arg, int *continue_walk)
 {
@@ -3206,6 +3285,14 @@ bind_term_walk (PARSER_CONTEXT *parser, PT_NODE *node, void *arg, int *continue_
 
 /* price every predicate under the current values, in tree order. false = nothing priceable,
  * which the caller reads as "stop watching". */
+/*
+ * [리뷰] bind_term_vector — bind_fp_active_* 전역을 세우고 bind_term_walk 를 한 번 돌린 뒤 내린다.
+ * histogram_bind_fingerprint·histogram_bind_watch_check 가 부른다.
+ * develop: develop 에 없음(기준 histogram_bind_fingerprint 3031-3037 이 같은 set/clear 를 인라인으로).
+ * 이 PR: 중간 early return 없음 → 전역 set/clear 짝 보장. 전역은 static 파일 범위(577-578), 클라이언트 단일 스레드 가정(주석 574-576)은 기준과
+ * 동일.
+ * 바뀐 것: 신설 +17
+ */
 static bool
 bind_term_vector (PARSER_CONTEXT *parser, PT_NODE *statement, bind_term_ctx *ctx, bool want_names)
 {
@@ -3224,6 +3311,14 @@ bind_term_vector (PARSER_CONTEXT *parser, PT_NODE *statement, bind_term_ctx *ctx
   return ctx->count > 0;
 }
 
+/*
+ * [리뷰] histogram_bind_fingerprint — 현재 바인딩 값 아래 문장의 지문(술어별 rows 벡터)을 채운다. db_bind_variant_step 이 부른다(로그용 names
+ * 는 컴파일 때만).
+ * develop: 기준 rev 3021-3045: (parser, statement, UINT64 *out_fp) — 양자화 해시 하나를 돌려줌.
+ * 이 PR: (parser, statement, BIND_FINGERPRINT *fp, names) — terms·rows[] 복사, names 가 있으면 라벨 복사.
+ * 바뀐 것: 시그니처·반환 자료구조 변경(해시 → 벡터), 본문 전면 교체
+ * [지적 F5]
+ */
 bool
 histogram_bind_fingerprint (PARSER_CONTEXT *parser, PT_NODE *statement, BIND_FINGERPRINT *fp,
 			    char (*names)[BIND_WATCH_NAME_LEN])
@@ -3249,6 +3344,12 @@ histogram_bind_fingerprint (PARSER_CONTEXT *parser, PT_NODE *statement, BIND_FIN
   return true;
 }
 
+/*
+ * [리뷰] histogram_bind_describe — 로그 한 줄용 'label then->now, …' 문자열을 만든다. db_bind_variant_step 컴파일 로그만 부른다.
+ * develop: develop 에 없음
+ * 이 PR: ref->terms != now->terms 면 now 만 출력. snprintf 반환이 잘린 길이여도 used<size 가드로 종료.
+ * 바뀐 것: 신설 +33
+ */
 void
 histogram_bind_describe (char *buf, size_t size, const BIND_FINGERPRINT *now, char (*names)[BIND_WATCH_NAME_LEN],
 			 const BIND_FINGERPRINT *ref)
@@ -3283,6 +3384,13 @@ histogram_bind_describe (char *buf, size_t size, const BIND_FINGERPRINT *now, ch
     }
 }
 
+/*
+ * [리뷰] histogram_bind_value_hash — user host var 값들의 해시(0 = 없음) — 같은 값 재실행이면 지문 계산을 건너뛰는 키.
+ * db_bind_watch_verdict·db_bind_variant_step 이 부른다.
+ * develop: develop 에 없음
+ * 이 PR: NULL 은 고정 토큰, 계산값 0 은 1 로 치환.
+ * 바뀐 것: 신설 +24
+ */
 UINT64
 histogram_bind_value_hash (PARSER_CONTEXT *parser)
 {
@@ -3313,6 +3421,15 @@ histogram_bind_value_hash (PARSER_CONTEXT *parser)
  *   values and compare each with the rows it was expected to scan when the plan was chosen:
  *   a replan when any one moved by the band or more, either way. Predicates expected to scan
  *   fewer rows than the floor on both sides are ignored (1 row becoming 3 moves no plan).
+ */
+/*
+ * [리뷰] histogram_bind_watch_check — 힌트 경로/첫 peek 의 판정: 현재 지문을 ws 에 기록된 것과 비교해 band 밖이면 true(재계획) 하고 ws 를 갱신한다.
+ * db_bind_watch_verdict(db_vdb.c:290) 만 부른다.
+ * develop: develop 에 없음(기준은 해시 불일치 = 재계획).
+ * 이 PR: 최초 기록(ws->terms<0) 도 true 를 돌려 첫 peek 재계획을 일으킨다(설계: hpp 192). compared==0 또는 band 미만이면 ws 미갱신 false.
+ * 바뀐 것: 신설 +112. 3351 주석은 F22, 3412 인덱스는 F15(도달 불가 확정).
+ * [지적 F15]
+ * [지적 F22]
  */
 bool
 histogram_bind_watch_check (PARSER_CONTEXT *parser, PT_NODE *statement, BIND_WATCH_STATE *ws, double band,
@@ -3448,6 +3565,14 @@ struct bind_target_ctx
   bind_target_term term[BIND_WATCH_MAX_TERMS];
 };
 
+/*
+ * [리뷰] bind_target_column_has_mcv — 대상 선정 조건 '컬럼에 MCV 가 있다' — reader 를 열어 mcv_count()>0. bind_target_add 만
+ * 부른다.
+ * develop: develop 에 없음
+ * 이 PR: 컬럼 추가마다 블롭 파싱 1회(컴파일 시 1회성, 콜드패스).
+ * 바뀐 것: 신설 +11
+ * [지적 F20]
+ */
 static bool
 bind_target_column_has_mcv (PT_NODE *name)
 {
@@ -3460,6 +3585,14 @@ bind_target_column_has_mcv (PT_NODE *name)
   return reader.mcv_count () > 0;
 }
 
+/*
+ * [리뷰] bind_target_add — 대상 선정 walk 가 찾은 (spec, column) 을 중복 없이 모으고 equality·has_mcv 를 기록한다. bind_target_walk
+ * 만 부른다.
+ * develop: develop 에 없음
+ * 이 PR: (spec_id, original 대소문자 무시) 중복은 equality OR 만 갱신; 32개 초과는 overflow 플래그(읽는 곳 없음, F19).
+ * 바뀐 것: 신설 +27
+ * [지적 F19]
+ */
 static void
 bind_target_add (bind_target_ctx *ctx, PT_NODE *name, bool equality)
 {
@@ -3488,6 +3621,19 @@ bind_target_add (bind_target_ctx *ctx, PT_NODE *name, bool equality)
   ctx->term[i].has_mcv = bind_target_column_has_mcv (name);
 }
 
+/*
+ * [리뷰] bind_target_walk — histogram_bind_watch_candidate 가 parser_walk_tree 에 거는 pre 콜백. 실제 클래스 PT_SPEC 을
+ * 세고(ctx->specs), host-var 를 가진 RANGE/비교 술어의 컬럼을 bind_target_add 로 ctx->term 에 모은다(등호 여부 포함). 항상 node 를 그대로
+ * 돌려주고 continue_walk 를 바꾸지 않는다.
+ * develop: develop 에 없음. 같은 자리의 구조적 검사는 hv_pred_walk(기준 rev histogram_cl.cpp:2998) 가 했고, 그것은 첫 host-var 술어를
+ * 찾으면 PT_STOP_WALK 로 멈추는 bool 검사였다.
+ * 이 PR: spec 수 + 컬럼별 (spec_id, name, equality, has_mcv) 수집. RANGE 는 or_next 사슬 전부가 EQ_NA 일 때만 equality. 서브쿼리
+ * 안쪽 spec 도 센다(F6).
+ * 바뀐 것: 신설 +46줄. reversed/hv 는 채우기만 하고 안 읽음(F19).
+ * [지적 F6]
+ * [지적 F19]
+ * [지적 F7]
+ */
 static PT_NODE *
 bind_target_walk (PARSER_CONTEXT *parser, PT_NODE *node, void *arg, int *continue_walk)
 {
@@ -3539,6 +3685,18 @@ bind_target_walk (PARSER_CONTEXT *parser, PT_NODE *node, void *arg, int *continu
  * columns are matched by an equality yields at most one row whatever the value is, so the
  * optimizer has nothing left to choose there (qo_iscan_cost prices that path at 0) and
  * watching the statement for that column is pure cost. */
+/*
+ * [리뷰] bind_target_spec_is_unique_pinned — histogram_bind_watch_candidate 가 MCV 있는 term 마다 부른다. spec 의
+ * 클래스(histogram_spec_class_name → db_find_class)에서 sm_class_constraints 를 읽어, UNIQUE 계열 제약 하나의 모든 컬럼이 그 spec 의
+ * equality term 과 (대소문자 무시) 매칭되면 true — '값이 무엇이든 ≤1행이라 감시 불필요'.
+ * develop: develop 에 없음.
+ * 이 PR: db_find_class/sm_class_constraints 실패는 er_clear 후 false(감시함). MOP·constraints 는 워크스페이스/클래스 소유라 해제 짝
+ * 없음(observations gate_pairs 의 +2 는 오탐). 다중 컬럼 UNIQUE 의 일부만 매칭 → false(감시함) — 의도에 맞음. 함수/필터 UNIQUE 를 구분하지
+ * 않음(F4).
+ * 바뀐 것: 신설 +68줄. 같은 spec 의 term 마다 재호출돼 db_find_class·au_fetch_class 를 반복하나 컴파일 시점 ≤32회라 콜드패스.
+ * [지적 F4]
+ * [지적 F29]
+ */
 static bool
 bind_target_spec_is_unique_pinned (PARSER_CONTEXT *parser, PT_NODE *statement, bind_target_ctx *ctx,
 				   UINTPTR spec_id)
@@ -3608,6 +3766,21 @@ bind_target_spec_is_unique_pinned (PARSER_CONTEXT *parser, PT_NODE *statement, b
   return false;
 }
 
+/*
+ * [리뷰] histogram_bind_watch_candidate — pt_plan_query / pt_to_update_xasl / pt_to_delete_xasl 가 XASL 생성 직후
+ * 부른다. true 면 호출자가 xasl->header.xasl_flag 에 BIND_WATCH_CANDIDATE 를 세워 실행 측(db_bind_variant_mode)이 variant 선택을
+ * 돌리게 한다. 파라미터 off / host var 없음 / 실제 spec <2 / term 0 이면 false.
+ * develop: develop 에 없음. 기준 rev 의 histogram_bind_fingerprint(histogram_cl.cpp:3021) 가 같은
+ * 전역(bind_fp_active_parser/statement, 기준 rev :573)을 같은 set/NULL 패턴으로 썼다.
+ * 이 PR: bind_fp_active_* 를 걷는 동안만 세우고(3633-3639, 조기 return 없음) bind_target_walk 로 수집 → MCV 있고 UNIQUE 로 고정되지 않은
+ * term 이 하나라도 있으면 true. has_mcv 는 histogram_init_reader_from_lhs 가 클래스 캐시에서 blob 을 읽고 name 노드에 parser-arena
+ * 사본을 붙이는 경로에 의존한다 — 히스토그램 fetch 가 일시 실패한 클라이언트는 같은 문장을 비후보로 컴파일할 수 있다(플래그는 캐시 엔트리에 남음).
+ * 바뀐 것: 신설 +56줄. 전역 2개는 develop 동일 패턴(클라이언트 단일 스레드 전제).
+ * [지적 F4]
+ * [지적 F6]
+ * [지적 F8]
+ * [지적 F20]
+ */
 bool
 histogram_bind_watch_candidate (PARSER_CONTEXT *parser, PT_NODE *statement)
 {

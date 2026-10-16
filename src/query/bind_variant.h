@@ -153,6 +153,18 @@ struct bind_variant_reply
  *
  * A predicate unknown on either side is skipped too: there is nothing to compare it by.
  */
+/*
+ * [리뷰] bind_fingerprint_distance — bind_variant_nearest 가 레코드마다 부르는 거리 함수: 두 fingerprint 의 같은 슬롯끼리 큰/작은
+ * 비율(fold) 의 최댓값을 돌려준다. terms 가 다르거나 0 이면 DBL_MAX, unknown(음수) 슬롯과 양쪽 floor 미만 슬롯은 건너뛰고, 한쪽이 0 이면 DBL_MAX(0
+ * 나눗셈 방어), 비교한 것이 없으면 초기값 1.0.
+ * develop: develop 에 없음(bind_variant.h 신설).
+ * 이 PR: 위 동작. 호출자는 클라이언트 db_bind_variant_step(BIND_WATCH_BAND 1.5·ROW_FLOOR 1000 고정) 과 서버
+ * xcache_bind_variant(req->band/floor).
+ * 바뀐 것: 신설 static inline. rows 는 bind_term_add 가 MAX(1.0, …) 로 만들어 0 분기는 네트워크 유입값 방어용. 비교 가능 항 0건 → 1.0 반환이 F9
+ * 의 질문.
+ * [지적 F9]
+ * [지적 F25]
+ */
 static inline double
 bind_fingerprint_distance (const BIND_FINGERPRINT * a, const BIND_FINGERPRINT * b, double floor)
 {
@@ -189,6 +201,14 @@ bind_fingerprint_distance (const BIND_FINGERPRINT * a, const BIND_FINGERPRINT * 
 }
 
 /* true when at least one predicate of the fingerprint was priced */
+/*
+ * [리뷰] bind_fingerprint_known — db_bind_variant_step 이 fingerprint 를 만든 직후 부르는 검사: 슬롯 중 하나라도 가격된(≥0) 것이 있으면
+ * true. false 면 그 실행은 변이 선택을 건너뛰고 들고 있는 플랜을 그대로 쓴다.
+ * develop: develop 에 없음.
+ * 이 PR: 위 동작. '어느 슬롯' 인지는 보지 않으므로 두 fp 가 각각 known 이어도 같은 슬롯이 known 이라는 보장은 없다(F9).
+ * 바뀐 것: 신설 static inline, 루프 1개.
+ * [지적 F9]
+ */
 static inline bool
 bind_fingerprint_known (const BIND_FINGERPRINT * fp)
 {
@@ -208,6 +228,15 @@ bind_fingerprint_known (const BIND_FINGERPRINT * fp)
  * bind_variant_nearest () - the record whose fingerprint is nearest to fp
  * return        : index into records, -1 when there are none
  * out_dist (out): its distance
+ */
+/*
+ * [리뷰] bind_variant_nearest — 클라이언트(db_bind_variant_step 2곳, db_bind_variant_nearest) 와 서버(xcache_bind_variant
+ * CHECK) 가 부르는 최근접 탐색: records 를 선형으로 돌며 거리가 가장 작은 인덱스와 그 거리를 돌려준다. n_records==0 이면 -1.
+ * develop: develop 에 없음.
+ * 이 PR: 위 동작. 첫 레코드는 거리 불문 best 가 되고 동률은 앞 인덱스 유지 — 임계가 필요한 호출자는 out_dist 를 직접
+ * 검사한다(xcache_bind_variant·db_bind_variant_step WATCH 는 검사, SELECT/FROZEN 은 설계상 거리 불문).
+ * 바뀐 것: 신설 static inline. O(n_records × terms), n ≤ 32·terms ≤ 32 라 최대 1024 회 비교로 상한이 고정.
+ * [지적 F25]
  */
 static inline int
 bind_variant_nearest (const BIND_VARIANT_RECORD * records, int n_records, const BIND_FINGERPRINT * fp,

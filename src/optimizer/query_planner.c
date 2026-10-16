@@ -12149,6 +12149,13 @@ qo_between_range_arg_value (QO_ENV * env, PT_NODE * arg)
     }
 }
 
+/*
+ * [리뷰] qo_plan_sig_mix — qo_plan_signature 전용 해시 결합 단계(boost hash_combine 형: sig ^= v + 0x9e37… + (sig<<6) +
+ * (sig>>2)). 순서 민감.
+ * develop: develop 에 없음.
+ * 이 PR: static UINT64 (UINT64, UINT64).
+ * 바뀐 것: 신설 +6줄.
+ */
 static UINT64
 qo_plan_sig_mix (UINT64 sig, UINT64 v)
 {
@@ -12165,6 +12172,18 @@ qo_plan_sig_mix (UINT64 sig, UINT64 v)
  * The shape is what the plan does: plan types, the join order, join and scan methods and the
  * index each scan uses, plus the plan-level optimizations. Costs and row estimates are left out,
  * so two compiles of one query that chose the same plan under different values sign alike.
+ */
+/*
+ * [리뷰] qo_plan_signature — pt_plan_query(xasl_generation.c:18570) 가 서브쿼리마다 parser->bind_plan_sig 에 접어 넣는다. 그
+ * 값은 variant 컴파일의 REGISTER 요청(db_vdb.c:663)에 실려 xasl_cache.c:2954 에서 등록된 variant 의 plan_sig 와 비교돼 '같은 플랜이면
+ * variant 추가 안 함'을 결정한다. 비용·행 추정·term 집합·sort key 는 제외(F23 판정: 용도에 맞음).
+ * develop: develop 에 없음.
+ * 이 PR: plan_type/parallel/MRO/orderby-skip/iscan-desc/sort-limit 공통 + SCAN(method, node idx,
+ * equi/cover/iss/loose, 인덱스 이름 바이트) / SORT(sort_type, subplan) / JOIN(join_type, method, outer, inner) /
+ * FOLLOW(head, path term idx). default(WORST 등)는 plan_type 만. `(UINT64)(… : -1)` 은 정의된 변환.
+ * 바뀐 것: 신설 +59줄. query_planner.h 에 extern 선언 추가.
+ * [지적 F23]
+ * [지적 F26]
  */
 UINT64
 qo_plan_signature (QO_PLAN * plan, UINT64 sig)
@@ -12245,6 +12264,16 @@ qo_plan_signature (QO_PLAN * plan, UINT64 sig)
  * arg1_val (in)   : lower bound value (the only bound for one-sided operators)
  * arg2_val (in)   : upper bound value, NULL for one-sided operators
  * out_sel (out)   : selectivity in [0,1]
+ */
+/*
+ * [리뷰] qo_between_range_histogram_selectivity — qo_between_selectivity / qo_range_selectivity (옵티마이저) 와, 이 PR
+ * 부터 histogram_cl.cpp 의 bind_card_range_selectivity 가 같은 between-range 연산자를 같은 식으로 가격하려고 부른다. 두 one-sided
+ * probe 의 차를 [0,1] 로 클램프해 돌려준다.
+ * develop: 기준 rev query_planner.c:12171-12247 에 static 으로 동일 본문 존재(클램프 12244 포함). 주석의 sel_le/sel_lt 와 인자 대응은
+ * histogram_get_comp_selectivity(lhs, val, is_ge, include_equal) 기준으로 네 분기 모두 일관.
+ * 이 PR: `static` 제거만. 본문 변경 없음 — 클램프 주석도 develop 동일.
+ * 바뀐 것: 가시성 변경 1줄(static→extern, query_planner.h:482 선언).
+ * [지적 F5]
  */
 bool
 qo_between_range_histogram_selectivity (PT_NODE * lhs, PT_OP_TYPE op_type, DB_VALUE * arg1_val,

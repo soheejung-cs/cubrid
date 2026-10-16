@@ -71,6 +71,14 @@ static struct net_request net_Requests[NET_SERVER_REQUEST_END];
  * net_server_init () -
  *   return:
  */
+/*
+ * [리뷰] net_server_init — net_Requests[] 테이블에 요청 코드별 핸들러·속성을 등록하는 서버 초기화. 여기서 NET_SERVER_QM_BIND_VARIANT →
+ * sqmgr_bind_variant 를 등록한다.
+ * develop: 기준 rev 484-497: DROP_ALL_PLANS/DROP_SHA1_PLANS/DUMP_PLANS/DUMP_CACHE 네 항목, 모두 action_attribute 없음
+ * 이 PR: +3줄: 493-494 에 BIND_VARIANT 등록, action_attribute 없음(IN_TRANSACTION 미설정 — xcache 를 만지는 인접 DROP_*/DUMP_*
+ * 와 같은 형태). network.h 에는 NET_SERVER_QM_BIND_VARIANT 가 열거 끝(295행) 에 추가돼 기존 코드 번호를 밀지 않는다.
+ * 바뀐 것: 테이블 항목 추가 (3파일 계약: network.h 상수 + cl 스텁 + sr 핸들러 모두 있음)
+ */
 static void
 net_server_init (void)
 {

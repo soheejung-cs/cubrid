@@ -6641,6 +6641,16 @@ sqmgr_drop_all_query_plans (THREAD_ENTRY *thread_p, unsigned int rid, char *requ
  *   request(in): packed BIND_VARIANT_REQUEST
  *   reqlen(in):
  */
+/*
+ * [리뷰] sqmgr_bind_variant — NET_SERVER_QM_BIND_VARIANT 의 서버 핸들러. 요청을 풀어 fp.terms 를 0..BIND_WATCH_MAX_TERMS 로
+ * 클램프한 뒤 xcache_bind_variant 를 부르고, 오류면 return_error_to_client 뒤에도 status+전체 reply 를 고정 길이로
+ * 보낸다(sqmgr_end_query@6564·sqmgr_drop_all_query_plans@6610 과 같은 패턴).
+ * develop: develop 에 없음 (기준 rev sqmgr_* 는 8개, 6613 drop_all 다음이 6649 drop_by_sha1)
+ * 이 PR: +62줄 신설. limit/op/variant 는 클램프하지 않고 xcache_bind_variant 가 limit 1..32, variant 0..next_variant-1 로
+ * 검사한다.
+ * 바뀐 것: 신설 핸들러; n_records 밖 레코드는 -1/0/0.0 으로 채워 보냄
+ * [지적 F28]
+ */
 void
 sqmgr_bind_variant (THREAD_ENTRY *thread_p, unsigned int rid, char *request, int reqlen)
 {

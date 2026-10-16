@@ -429,6 +429,13 @@ xcache_finalize (THREAD_ENTRY * thread_p)
 }
 
 // *INDENT-OFF*
+/*
+ * [리뷰] xasl_cache_ent::xasl_cache_ent — lock-free hashmap 이 freelist_node_data 안의 entry 를 생성할 때 불리는 C++ 생성자.
+ * 뮤텍스·클론 캐시를 초기화한다.
+ * develop: develop(dbb986faf:417-421): mutex init + init_clone_cache.
+ * 이 PR: bind_dir = NULL 한 줄 추가.
+ * 바뀐 것: 필드 초기화 +1줄.
+ */
 xasl_cache_ent::xasl_cache_ent ()
 {
   pthread_mutex_init (&cache_clones_mutex, NULL);
@@ -436,6 +443,12 @@ xasl_cache_ent::xasl_cache_ent ()
   init_clone_cache ();
 }
 
+/*
+ * [리뷰] xasl_cache_ent::~xasl_cache_ent — entry 소멸자. 클론 배열이 비었는지 assert 하고 뮤텍스를 파괴한다.
+ * develop: develop(dbb986faf:423-427): assert + mutex destroy.
+ * 이 PR: bind_dir 이 남아 있으면 free_and_init.
+ * 바뀐 것: 해제 분기 +4줄.
+ */
 xasl_cache_ent::~xasl_cache_ent ()
 {
   assert (cache_clones == NULL || cache_clones == &one_clone);
@@ -462,6 +475,13 @@ xasl_cache_ent::init_clone_cache ()
  *
  * return : Pointer to allocated memory.
  */
+/*
+ * [리뷰] xcache_entry_alloc — LF_ENTRY_DESCRIPTOR.f_alloc. entry 를 malloc 하고 클론 캐시·뮤텍스·list_ht_no 를 초기화해
+ * 돌려준다(소유권은 freelist 로).
+ * develop: develop(dbb986faf:445-459): malloc, init_clone_cache, mutex init, list_ht_no=-1.
+ * 이 PR: bind_dir = NULL 추가.
+ * 바뀐 것: 필드 초기화 +1줄. 자동 finding gate-imbalance +1 은 빌더 반환(오탐).
+ */
 static void *
 xcache_entry_alloc (void)
 {
@@ -484,6 +504,12 @@ xcache_entry_alloc (void)
  *
  * return     : NO_ERROR.
  * entry (in) : XASL cache entry pointer.
+ */
+/*
+ * [리뷰] xcache_entry_free — LF_ENTRY_DESCRIPTOR.f_free. 클론 배열 잔존 확인, 뮤텍스 파괴, entry free.
+ * develop: develop(dbb986faf:467-481): 클론 assert/free, mutex destroy, free.
+ * 이 PR: bind_dir 잔존 시 free_and_init 추가(uninit 이 먼저 지우므로 보통 NULL).
+ * 바뀐 것: 해제 분기 +4줄.
  */
 static int
 xcache_entry_free (void *entry)
@@ -510,6 +536,14 @@ xcache_entry_free (void *entry)
  *
  * return     : NO_ERROR.
  * entry (in) : XASL cache entry pointer.
+ */
+/*
+ * [리뷰] xcache_entry_init — LF_ENTRY_DESCRIPTOR.f_init. freelist 에서 claim 된 entry 의 필드를
+ * 리셋한다(related_objects·sql_info·xasl_id·stream·free_data_on_uninit·mem_size).
+ * develop: develop(dbb986faf:489-512): 위 필드 리셋 + initialized=true.
+ * 이 PR: bind_dir = NULL 추가(@533). reclaim 때 uninit 이 항상 먼저 돌므로(lockfree_freelist.hpp:523-530 reclaim →
+ * available list) 중복이지만 안전.
+ * 바뀐 것: 필드 초기화 +1줄.
  */
 static int
 xcache_entry_init (void *entry)
@@ -591,6 +625,16 @@ xcache_stat_entry_deleted (THREAD_ENTRY * thread_p, bool at_cleanup)
  *
  * return     : NO_ERROR.
  * entry (in) : XASL cache entry pointer.
+ */
+/*
+ * [리뷰] xcache_entry_uninit — LF_ENTRY_DESCRIPTOR.f_uninit. erase 된 entry 가 lock-free reclaim 될 때 불려
+ * free_data_on_uninit 에 따라 데이터(related_objects·sql_hash_text·클론·stream) 를 해제하거나 포인터만 끊는다.
+ * develop: develop(dbb986faf:570-646): free_data_on_uninit 분기 두 갈래, bind_dir 없음.
+ * 이 PR: 두 갈래 공통으로 @670-674 에서 bind_dir 을 free_and_init(락 없음). 변형 디렉터리는 base entry 와 함께 사라지고 다음 실행이 다시 학습한다 —
+ * 예약 슬롯이 사라지는 유일한 자리(F1).
+ * 바뀐 것: 해제 분기 +5줄. 락 없는 free 의 안전 근거는 F27 (fix 0 + lf tran 밖에서만 reclaim).
+ * [지적 F1]
+ * [지적 F27]
  */
 static int
 xcache_entry_uninit (void *entry)
@@ -2202,6 +2246,18 @@ xcache_drop_all (THREAD_ENTRY * thread_p)
  * thread_p (in) : Thread entry.
  * fp (out)	 : Output.
  */
+/*
+ * [리뷰] xcache_dump — xqmgr_dump_query_plans(cubrid plandump) 가 부른다. 캐시 통계·메모리·entry 별 정보를 fp 에 쓴다. fix 없이
+ * iterator(lf tran) 로 읽는다.
+ * develop: develop(dbb986faf:2175-2284): 통계·메모리·entry(xasl_id·fix_count·flags·ref_count·clone count·sql
+ * info·OID list).
+ * 이 PR: entry 마다 bind_dir 이 있으면 cache_clones_mutex 안에서
+ * plans/next_variant(compiles)/n_records(fingerprints)/checks 를 한 줄 출력(@2289-2299, 락 밖 1차 검사 + 락 안 재검사).
+ * pending 은 출력하지 않음(F1 C). 변형 entry 는 sql hash text 에 키가 붙어 SQL_ID 가 다르게 보임(F13).
+ * 바뀐 것: 출력 분기 +11줄.
+ * [지적 F1]
+ * [지적 F13]
+ */
 void
 xcache_dump (THREAD_ENTRY * thread_p, FILE * fp)
 {
@@ -2842,6 +2898,24 @@ xcache_uses_clones (void)
  *
  * A base entry of another generation (recompiled, or dropped and inserted again) is not the
  * one the client's variants belong to: NOT_FOUND, and the client starts over.
+ */
+/*
+ * [리뷰] xcache_bind_variant — 신설. sqmgr_bind_variant(CS) / qmgr_bind_variant(SA 직결) 가 부른다. base entry 를
+ * sha1+time_stored 로 찾아 fix 한 뒤 entry 의 bind_dir(없으면 malloc) 에 대해 CHECK(가장 가까운 fingerprint 가 band 안이면 MATCH,
+ * 아니면 limit·MAX 안에서 슬롯 예약 COMPILE, 아니면 FROZEN) 또는 REGISTER(예약 슬롯을 resolved 로, plan_sig 중복이면 SAME_PLAN 아니면 NEW;
+ * fingerprint 기록) 를 처리하고 디렉터리 스냅샷·state 를 reply 로 돌려준다.
+ * develop: develop 에 없음.
+ * 이 PR: fix/unfix 3경로 짝 맞음(@2874 NULL, @2880 세대 불일치, @2903 OOM, @3006 정상). 뮤텍스 lock/unlock 짝 맞음. dir malloc 은
+ * entry 로 소유권 이전(자동 gate-imbalance +1 오탐). 죽은 쓰기 @2939(F17), REGISTER 범위 밖은 NOT_FOUND(F18), limit 은 요청값(F10),
+ * 예약 슬롯 회수 없음(F1), 변형 엔트리 존재를 보지 않음(F12).
+ * 바뀐 것: 신설 +164줄.
+ * [지적 F1]
+ * [지적 F3]
+ * [지적 F10]
+ * [지적 F12]
+ * [지적 F17]
+ * [지적 F18]
+ * [지적 F30]
  */
 int
 xcache_bind_variant (THREAD_ENTRY * thread_p, const BIND_VARIANT_REQUEST * req, BIND_VARIANT_REPLY * reply)

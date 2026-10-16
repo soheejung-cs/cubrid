@@ -18458,6 +18458,24 @@ pt_add_null_filter_for_min_max_opt (PARSER_CONTEXT * parser, PT_NODE * select_no
  *   parser(in): context
  *   select_node(in): of PT_SELECT type
  */
+/*
+ * [리뷰] pt_plan_query — parser_generate_xasl_proc 가 PT_SELECT 노드마다 부르는 SELECT 플랜 생성기: qo_optimize_query 로
+ * QO_PLAN 을 고르고(힌트 실패 시 힌트를 지우고 재시도) buildlist/buildvalue XASL 로 바꾼 뒤 플랜 덤프·트레이스·sql_plan_text 를 남기고 XASL 을
+ * 돌려준다. 최상위 SELECT 뿐 아니라 모든 부질의 SELECT 가 여기를 지난다.
+ * develop: develop(dbb986faf 18449-): 같은 흐름. XASL 생성 뒤 `!set_host_var && host_var_count > 0 &&
+ * histogram_stmt_has_hv_predicate` 이면 HV_PRED_PLAN_UNPEEKED 를 세우는 블록(기준 18535-18544)까지 있고, 그 다음은 바로
+ * qo_get_optimization_param.
+ * 이 PR: UNPEEKED 블록 뒤에 두 블록 추가 — (1) `histogram_bind_watch_candidate (parser, select_node)` 가 참이면
+ * xasl->header.xasl_flag |= BIND_WATCH_CANDIDATE (set_host_var 와 무관, 구조적 판정), (2) `xasl && plan` 이면
+ * `parser->bind_plan_sig = qo_plan_signature (plan, parser->bind_plan_sig)` 로 이 컴파일의 플랜 서명을 누적. plan 은 그 뒤
+ * exit: 에서 discard 되므로 서명 시점에 살아 있다.
+ * 바뀐 것: 분기 2개 추가(+14줄). 시그니처·자료구조 변경 없음. plan==NULL 이면 서명을 접지 않아 qo_plan_signature 의 NULL 분기는 이 호출자에서 닿지 않는다.
+ * bind_plan_sig 의 초기화는 변이 컴파일 직전 db_vdb.c 에서 0 으로 두는 것뿐이고 그 외 컴파일에서는 값이 누적되지만 읽는 곳이 REGISTER 뿐이라 무해.
+ * [지적 F7]
+ * [지적 F20]
+ * [지적 F21]
+ * [지적 F26]
+ */
 static XASL_NODE *
 pt_plan_query (PARSER_CONTEXT * parser, PT_NODE * select_node)
 {
@@ -21987,6 +22005,21 @@ pt_to_upd_del_query (PARSER_CONTEXT * parser, PT_NODE * select_names, PT_NODE * 
  *   parser(in): context
  *   statement(in): delete parse tree
  */
+/*
+ * [리뷰] pt_to_delete_xasl — do_prepare_delete·build_xasl_for_server_delete 가 부르는 서버측 DELETE XASL 생성기: 문장을 aptr
+ * SELECT 로 바꿔 pt_make_aptr_parent_node(→ parser_generate_xasl → pt_plan_query) 로 플랜을 얻고 DELETE_PROC 에 붙인 뒤
+ * limit·TDE 플래그를 옮기고 aptr 트리를 해제하고 XASL 을 돌려준다.
+ * develop: develop(dbb986faf 21964-): 성공 경로 끝에 aptr_statement 해제 → UNPEEKED 블록(statement 를 다시 걷는
+ * histogram_stmt_has_hv_predicate) → return xasl. error_return 은 해제 + 에러 변환.
+ * 이 PR: UNPEEKED 블록 뒤에 `xasl && histogram_bind_watch_candidate (parser, statement)` 면 BIND_WATCH_CANDIDATE 를
+ * 세우는 블록 추가. 성공 경로 전용(error_return 은 지나지 않음). bind_plan_sig 는 여기서 접지 않으며 aptr SELECT 의 pt_plan_query 가 이미
+ * 접었다(F26).
+ * 바뀐 것: 분기 1개 추가(+5줄). 걷는 대상은 statement(원본 DELETE 트리) 이고 해제된 aptr_statement 는 pt_to_upd_del_query 가
+ * parser_copy_tree_list 로 만든 사본이라 해제 뒤 걷기는 안전(기준과 같은 패턴).
+ * [지적 F7]
+ * [지적 F24]
+ * [지적 F26]
+ */
 XASL_NODE *
 pt_to_delete_xasl (PARSER_CONTEXT * parser, PT_NODE * statement)
 {
@@ -22692,6 +22725,18 @@ pt_check_dblink_trigger (PARSER_CONTEXT * parser, PT_NODE * statement)
  *   parser(in): context
  *   statement(in): update parse tree
  *   non_null_attrs(in):
+ */
+/*
+ * [리뷰] pt_to_update_xasl — do_prepare_update·update_at_server·statement_to_update_xasl 이 부르는 서버측 UPDATE XASL
+ * 생성기: 대입 목록·스펙을 aptr SELECT 로 바꿔 pt_make_aptr_parent_node 로 플랜을 얻고 UPDATE_PROC 에 붙이며, cleanup: 라벨에서 aptr 해제와
+ * 에러 판정(pt_has_error/error → xasl=NULL) 을 한 뒤 XASL 을 돌려준다.
+ * develop: develop(dbb986faf 22665-): cleanup: 뒤 에러 판정 다음에 UNPEEKED 블록(xasl != NULL 가드) → return xasl. DELETE
+ * 와 달리 에러 goto 로 와도 에러가 없으면 블록을 지난다 — 이 비대칭은 기준에도 그대로 있다.
+ * 이 PR: UNPEEKED 블록 뒤에 BIND_WATCH_CANDIDATE 블록 추가(xasl != NULL 가드). 위치·가드 모두 기준의 UNPEEKED 와 같다.
+ * 바뀐 것: 분기 1개 추가(+5줄). 시그니처 변경 없음. 서명은 aptr SELECT 의 pt_plan_query 가 접는다(F26).
+ * [지적 F7]
+ * [지적 F24]
+ * [지적 F26]
  */
 XASL_NODE *
 pt_to_update_xasl (PARSER_CONTEXT * parser, PT_NODE * statement, PT_NODE ** non_null_attrs)
