@@ -24,6 +24,8 @@
 
 #include "xasl_cache.h"
 
+#include "bind_variant.h"
+
 #include "binaryheap.h"
 #include "compile_context.h"
 #include "config.h"
@@ -65,6 +67,19 @@
 
 #define XCACHE_PTR_TO_KEY(ptr) ((XASL_ID *) ptr)
 #define XCACHE_PTR_TO_ENTRY(ptr) ((XASL_CACHE_ENTRY *) ptr)
+
+/* the plan variants of one query, kept on its base entry (see bind_variant.h) */
+struct xcache_bind_dir
+{
+  int checks;			/* times a client found nothing suitable in its directory (statistics) */
+  int plans;			/* registered variants: distinct plans */
+  int next_variant;		/* variants reserved so far: the compiles the query has made */
+  int n_records;
+  BIND_VARIANT_RECORD records[BIND_VARIANT_MAX_COMPILES];
+  bool registered[BIND_VARIANT_MAX_COMPILES];	/* the variant is a plan of the query */
+  bool resolved[BIND_VARIANT_MAX_COMPILES];	/* its compile came back, as a new plan or a known one */
+  UINT64 plan_sig[BIND_VARIANT_MAX_COMPILES];
+};
 
 /* xcache statistics. */
 typedef struct xcache_stats XCACHE_STATS;
@@ -414,15 +429,33 @@ xcache_finalize (THREAD_ENTRY * thread_p)
 }
 
 // *INDENT-OFF*
+/*
+ * [리뷰] xasl_cache_ent::xasl_cache_ent — lock-free hashmap 이 freelist_node_data 안의 entry 를 생성할 때 불리는 C++ 생성자.
+ * 뮤텍스·클론 캐시를 초기화한다.
+ * develop: develop(dbb986faf:417-421): mutex init + init_clone_cache.
+ * 이 PR: bind_dir = NULL 한 줄 추가.
+ * 바뀐 것: 필드 초기화 +1줄.
+ */
 xasl_cache_ent::xasl_cache_ent ()
 {
   pthread_mutex_init (&cache_clones_mutex, NULL);
+  bind_dir = NULL;
   init_clone_cache ();
 }
 
+/*
+ * [리뷰] xasl_cache_ent::~xasl_cache_ent — entry 소멸자. 클론 배열이 비었는지 assert 하고 뮤텍스를 파괴한다.
+ * develop: develop(dbb986faf:423-427): assert + mutex destroy.
+ * 이 PR: bind_dir 이 남아 있으면 free_and_init.
+ * 바뀐 것: 해제 분기 +4줄.
+ */
 xasl_cache_ent::~xasl_cache_ent ()
 {
   assert (cache_clones == NULL || cache_clones == &one_clone);
+  if (bind_dir != NULL)
+    {
+      free_and_init (bind_dir);
+    }
   pthread_mutex_destroy (&cache_clones_mutex);
 }
 
@@ -442,6 +475,13 @@ xasl_cache_ent::init_clone_cache ()
  *
  * return : Pointer to allocated memory.
  */
+/*
+ * [리뷰] xcache_entry_alloc — LF_ENTRY_DESCRIPTOR.f_alloc. entry 를 malloc 하고 클론 캐시·뮤텍스·list_ht_no 를 초기화해
+ * 돌려준다(소유권은 freelist 로).
+ * develop: develop(dbb986faf:445-459): malloc, init_clone_cache, mutex init, list_ht_no=-1.
+ * 이 PR: bind_dir = NULL 추가.
+ * 바뀐 것: 필드 초기화 +1줄. 자동 finding gate-imbalance +1 은 빌더 반환(오탐).
+ */
 static void *
 xcache_entry_alloc (void)
 {
@@ -452,6 +492,7 @@ xcache_entry_alloc (void)
     }
   xcache_entry->init_clone_cache ();
   pthread_mutex_init (&xcache_entry->cache_clones_mutex, NULL);
+  xcache_entry->bind_dir = NULL;
 
   xcache_entry->list_ht_no = -1;
 
@@ -464,6 +505,12 @@ xcache_entry_alloc (void)
  * return     : NO_ERROR.
  * entry (in) : XASL cache entry pointer.
  */
+/*
+ * [리뷰] xcache_entry_free — LF_ENTRY_DESCRIPTOR.f_free. 클론 배열 잔존 확인, 뮤텍스 파괴, entry free.
+ * develop: develop(dbb986faf:467-481): 클론 assert/free, mutex destroy, free.
+ * 이 PR: bind_dir 잔존 시 free_and_init 추가(uninit 이 먼저 지우므로 보통 NULL).
+ * 바뀐 것: 해제 분기 +4줄.
+ */
 static int
 xcache_entry_free (void *entry)
 {
@@ -475,6 +522,10 @@ xcache_entry_free (void *entry)
       assert (false);
       free (xcache_entry->cache_clones);
     }
+  if (xcache_entry->bind_dir != NULL)
+    {
+      free_and_init (xcache_entry->bind_dir);
+    }
   pthread_mutex_destroy (&xcache_entry->cache_clones_mutex);
   free (entry);
   return NO_ERROR;
@@ -485,6 +536,14 @@ xcache_entry_free (void *entry)
  *
  * return     : NO_ERROR.
  * entry (in) : XASL cache entry pointer.
+ */
+/*
+ * [리뷰] xcache_entry_init — LF_ENTRY_DESCRIPTOR.f_init. freelist 에서 claim 된 entry 의 필드를
+ * 리셋한다(related_objects·sql_info·xasl_id·stream·free_data_on_uninit·mem_size).
+ * develop: develop(dbb986faf:489-512): 위 필드 리셋 + initialized=true.
+ * 이 PR: bind_dir = NULL 추가(@533). reclaim 때 uninit 이 항상 먼저 돌므로(lockfree_freelist.hpp:523-530 reclaim →
+ * available list) 중복이지만 안전.
+ * 바뀐 것: 필드 초기화 +1줄.
  */
 static int
 xcache_entry_init (void *entry)
@@ -505,6 +564,7 @@ xcache_entry_init (void *entry)
 
   xcache_entry->free_data_on_uninit = false;
   xcache_entry->mem_size = 0;
+  xcache_entry->bind_dir = NULL;
   xcache_entry->initialized = true;
 
   assert (xcache_entry->n_cache_clones == 0);
@@ -565,6 +625,16 @@ xcache_stat_entry_deleted (THREAD_ENTRY * thread_p, bool at_cleanup)
  *
  * return     : NO_ERROR.
  * entry (in) : XASL cache entry pointer.
+ */
+/*
+ * [리뷰] xcache_entry_uninit — LF_ENTRY_DESCRIPTOR.f_uninit. erase 된 entry 가 lock-free reclaim 될 때 불려
+ * free_data_on_uninit 에 따라 데이터(related_objects·sql_hash_text·클론·stream) 를 해제하거나 포인터만 끊는다.
+ * develop: develop(dbb986faf:570-646): free_data_on_uninit 분기 두 갈래, bind_dir 없음.
+ * 이 PR: 두 갈래 공통으로 @670-674 에서 bind_dir 을 free_and_init(락 없음). 변형 디렉터리는 base entry 와 함께 사라지고 다음 실행이 다시 학습한다 —
+ * 예약 슬롯이 사라지는 유일한 자리(F1).
+ * 바뀐 것: 해제 분기 +5줄. 락 없는 free 의 안전 근거는 F27 (fix 0 + lf tran 밖에서만 reclaim).
+ * [지적 F1]
+ * [지적 F27]
  */
 static int
 xcache_entry_uninit (void *entry)
@@ -640,6 +710,11 @@ xcache_entry_uninit (void *entry)
       XASL_ID_SET_NULL (&xcache_entry->xasl_id);
 
       assert (xcache_entry->n_cache_clones == 0);
+    }
+  if (xcache_entry->bind_dir != NULL)
+    {
+      /* the query's plan variants go with its base entry: the next execution starts over */
+      free_and_init (xcache_entry->bind_dir);
     }
   xcache_entry->initialized = false;
   return NO_ERROR;
@@ -2171,6 +2246,18 @@ xcache_drop_all (THREAD_ENTRY * thread_p)
  * thread_p (in) : Thread entry.
  * fp (out)	 : Output.
  */
+/*
+ * [리뷰] xcache_dump — xqmgr_dump_query_plans(cubrid plandump) 가 부른다. 캐시 통계·메모리·entry 별 정보를 fp 에 쓴다. fix 없이
+ * iterator(lf tran) 로 읽는다.
+ * develop: develop(dbb986faf:2175-2284): 통계·메모리·entry(xasl_id·fix_count·flags·ref_count·clone count·sql
+ * info·OID list).
+ * 이 PR: entry 마다 bind_dir 이 있으면 cache_clones_mutex 안에서
+ * plans/next_variant(compiles)/n_records(fingerprints)/checks 를 한 줄 출력(@2289-2299, 락 밖 1차 검사 + 락 안 재검사).
+ * pending 은 출력하지 않음(F1 C). 변형 entry 는 sql hash text 에 키가 붙어 SQL_ID 가 다르게 보임(F13).
+ * 바뀐 것: 출력 분기 +11줄.
+ * [지적 F1]
+ * [지적 F13]
+ */
 void
 xcache_dump (THREAD_ENTRY * thread_p, FILE * fp)
 {
@@ -2254,6 +2341,17 @@ xcache_dump (THREAD_ENTRY * thread_p, FILE * fp)
       if (xcache_uses_clones ())
 	{
 	  fprintf (fp, "  clone count = %d \n", xcache_entry->n_cache_clones);
+	}
+      if (xcache_entry->bind_dir != NULL)
+	{
+	  pthread_mutex_lock (&xcache_entry->cache_clones_mutex);
+	  if (xcache_entry->bind_dir != NULL)
+	    {
+	      fprintf (fp, "  bind variants: plans = %d, compiles = %d, fingerprints = %d, server checks = %d \n",
+		       xcache_entry->bind_dir->plans, xcache_entry->bind_dir->next_variant,
+		       xcache_entry->bind_dir->n_records, xcache_entry->bind_dir->checks);
+	    }
+	  pthread_mutex_unlock (&xcache_entry->cache_clones_mutex);
 	}
       fprintf (fp, "  sql info: \n");
 
@@ -2787,4 +2885,199 @@ bool
 xcache_uses_clones (void)
 {
   return xcache_Max_clones > 0;
+}
+
+/*
+ * xcache_bind_variant () - find or reserve the plan variant of a query that suits a fingerprint
+ *   nothing in the client's directory suited, or register the plan a reserved variant compiled
+ *   to (see bind_variant.h)
+ * return	: error code
+ * thread_p (in): thread entry
+ * req (in)	: the request; req->sha1 and req->time_stored name the query's base entry
+ * reply (out)	: the outcome, how far the query has learned, and the whole directory
+ *
+ * A base entry of another generation (recompiled, or dropped and inserted again) is not the
+ * one the client's variants belong to: NOT_FOUND, and the client starts over.
+ */
+/*
+ * [리뷰] xcache_bind_variant — 신설. sqmgr_bind_variant(CS) / qmgr_bind_variant(SA 직결) 가 부른다. base entry 를
+ * sha1+time_stored 로 찾아 fix 한 뒤 entry 의 bind_dir(없으면 malloc) 에 대해 CHECK(가장 가까운 fingerprint 가 band 안이면 MATCH,
+ * 아니면 limit·MAX 안에서 슬롯 예약 COMPILE, 아니면 FROZEN) 또는 REGISTER(예약 슬롯을 resolved 로, plan_sig 중복이면 SAME_PLAN 아니면 NEW;
+ * fingerprint 기록) 를 처리하고 디렉터리 스냅샷·state 를 reply 로 돌려준다.
+ * develop: develop 에 없음.
+ * 이 PR: fix/unfix 3경로 짝 맞음(@2874 NULL, @2880 세대 불일치, @2903 OOM, @3006 정상). 뮤텍스 lock/unlock 짝 맞음. dir malloc 은
+ * entry 로 소유권 이전(자동 gate-imbalance +1 오탐). 죽은 쓰기 @2939(F17), REGISTER 범위 밖은 NOT_FOUND(F18), limit 은 요청값(F10),
+ * 예약 슬롯 회수 없음(F1), 변형 엔트리 존재를 보지 않음(F12).
+ * 바뀐 것: 신설 +164줄.
+ * [지적 F1]
+ * [지적 F3]
+ * [지적 F10]
+ * [지적 F12]
+ * [지적 F17]
+ * [지적 F18]
+ * [지적 F30]
+ */
+int
+xcache_bind_variant (THREAD_ENTRY * thread_p, const BIND_VARIANT_REQUEST * req, BIND_VARIANT_REPLY * reply)
+{
+  XASL_CACHE_ENTRY *xcache_entry = NULL;
+  struct xcache_bind_dir *dir;
+  int error_code = NO_ERROR;
+  int limit, pending, i;
+
+  assert (req != NULL && reply != NULL);
+
+  reply->result = BIND_VARIANT_NOT_FOUND;
+  reply->variant = -1;
+  reply->state = BIND_VARIANT_STATE_WATCH;
+  reply->compiles = 0;
+  reply->plans = 0;
+  reply->n_records = 0;
+
+  if (!xcache_Enabled)
+    {
+      return NO_ERROR;
+    }
+
+  error_code = xcache_find_sha1 (thread_p, &req->sha1, XASL_CACHE_SEARCH_GENERIC, &xcache_entry, NULL);
+  if (error_code != NO_ERROR)
+    {
+      ASSERT_ERROR ();
+      return error_code;
+    }
+  if (xcache_entry == NULL)
+    {
+      return NO_ERROR;
+    }
+  if (!CACHE_TIME_EQ (&xcache_entry->xasl_id.time_stored, &req->time_stored))
+    {
+      xcache_unfix (thread_p, xcache_entry);
+      return NO_ERROR;
+    }
+
+  limit = req->limit;
+  if (limit > BIND_VARIANT_MAX_COMPILES)
+    {
+      limit = BIND_VARIANT_MAX_COMPILES;
+    }
+  if (limit < 1)
+    {
+      limit = 1;
+    }
+
+  pthread_mutex_lock (&xcache_entry->cache_clones_mutex);
+
+  dir = xcache_entry->bind_dir;
+  if (dir == NULL)
+    {
+      dir = (struct xcache_bind_dir *) malloc (sizeof (struct xcache_bind_dir));
+      if (dir == NULL)
+	{
+	  pthread_mutex_unlock (&xcache_entry->cache_clones_mutex);
+	  xcache_unfix (thread_p, xcache_entry);
+	  er_set (ER_ERROR_SEVERITY, ARG_FILE_LINE, ER_OUT_OF_VIRTUAL_MEMORY, 1, sizeof (struct xcache_bind_dir));
+	  return ER_OUT_OF_VIRTUAL_MEMORY;
+	}
+      memset (dir, 0, sizeof (struct xcache_bind_dir));
+      xcache_entry->bind_dir = dir;
+    }
+
+  pending = 0;
+  for (i = 0; i < dir->next_variant; i++)
+    {
+      if (!dir->resolved[i])
+	{
+	  pending++;
+	}
+    }
+
+  if (req->op == BIND_VARIANT_OP_CHECK)
+    {
+      double dist = DBL_MAX;
+      int nearest;
+
+      dir->checks++;
+      nearest = bind_variant_nearest (dir->records, dir->n_records, &req->fp, req->floor, &dist);
+      if (nearest >= 0 && dist < req->band)
+	{
+	  /* another client added the variant these values call for */
+	  reply->result = BIND_VARIANT_MATCH;
+	  reply->variant = dir->records[nearest].variant;
+	}
+      else if (dir->plans + pending < limit && dir->next_variant < BIND_VARIANT_MAX_COMPILES)
+	{
+	  /* still learning: compile. Compiles still in flight count as plans, so concurrent
+	   * clients cannot overshoot the limit together. */
+	  reply->result = BIND_VARIANT_COMPILE;
+	  reply->variant = dir->next_variant++;
+	  pending++;
+	}
+      else
+	{
+	  reply->result = BIND_VARIANT_FROZEN;
+	}
+    }
+  else if (req->op == BIND_VARIANT_OP_REGISTER && req->variant >= 0 && req->variant < dir->next_variant)
+    {
+      int same = -1;
+
+      dir->resolved[req->variant] = true;
+
+      for (i = 0; i < dir->next_variant; i++)
+	{
+	  if (dir->registered[i] && dir->plan_sig[i] == req->plan_sig)
+	    {
+	      same = i;
+	      break;
+	    }
+	}
+      if (same >= 0)
+	{
+	  /* the compile found a plan the query already has: no new variant, only another
+	   * fingerprint that reaches it */
+	  reply->result = BIND_VARIANT_SAME_PLAN;
+	  reply->variant = same;
+	}
+      else
+	{
+	  dir->registered[req->variant] = true;
+	  dir->plan_sig[req->variant] = req->plan_sig;
+	  dir->plans++;
+	  reply->result = BIND_VARIANT_NEW;
+	  reply->variant = req->variant;
+	}
+      if (dir->n_records < BIND_VARIANT_MAX_COMPILES)
+	{
+	  dir->records[dir->n_records].variant = reply->variant;
+	  dir->records[dir->n_records].fp = req->fp;
+	  dir->n_records++;
+	}
+    }
+
+  reply->compiles = dir->next_variant;
+  reply->plans = dir->plans;
+  reply->pending = 0;
+  for (i = 0; i < dir->next_variant; i++)
+    {
+      if (!dir->resolved[i])
+	{
+	  reply->pending++;
+	}
+    }
+  if ((dir->plans >= limit || dir->next_variant >= BIND_VARIANT_MAX_COMPILES) && reply->pending == 0)
+    {
+      /* done learning -- final only once every reserved variant came back: a client that
+       * settled while the last compile was in flight would never see that plan */
+      reply->state = (dir->plans <= 1) ? BIND_VARIANT_STATE_DONE : BIND_VARIANT_STATE_SELECT;
+    }
+  reply->n_records = dir->n_records;
+  for (i = 0; i < dir->n_records; i++)
+    {
+      reply->records[i] = dir->records[i];
+    }
+
+  pthread_mutex_unlock (&xcache_entry->cache_clones_mutex);
+  xcache_unfix (thread_p, xcache_entry);
+
+  return NO_ERROR;
 }

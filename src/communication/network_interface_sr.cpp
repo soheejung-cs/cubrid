@@ -6630,6 +6630,91 @@ sqmgr_drop_all_query_plans (THREAD_ENTRY *thread_p, unsigned int rid, char *requ
 }
 
 /*
+ * sqmgr_bind_variant - Process a NET_SERVER_QM_BIND_VARIANT request: find or reserve the plan
+ *   variant of a cached query that suits a fingerprint, or register the plan a reserved variant
+ *   compiled to.
+ *   This function is a counter part to qmgr_bind_variant().
+ *
+ * return:
+ *
+ *   rid(in):
+ *   request(in): packed BIND_VARIANT_REQUEST
+ *   reqlen(in):
+ */
+/*
+ * [리뷰] sqmgr_bind_variant — NET_SERVER_QM_BIND_VARIANT 의 서버 핸들러. 요청을 풀어 fp.terms 를 0..BIND_WATCH_MAX_TERMS 로
+ * 클램프한 뒤 xcache_bind_variant 를 부르고, 오류면 return_error_to_client 뒤에도 status+전체 reply 를 고정 길이로
+ * 보낸다(sqmgr_end_query@6564·sqmgr_drop_all_query_plans@6610 과 같은 패턴).
+ * develop: develop 에 없음 (기준 rev sqmgr_* 는 8개, 6613 drop_all 다음이 6649 drop_by_sha1)
+ * 이 PR: +62줄 신설. limit/op/variant 는 클램프하지 않고 xcache_bind_variant 가 limit 1..32, variant 0..next_variant-1 로
+ * 검사한다.
+ * 바뀐 것: 신설 핸들러; n_records 밖 레코드는 -1/0/0.0 으로 채워 보냄
+ * [지적 F28]
+ */
+void
+sqmgr_bind_variant (THREAD_ENTRY *thread_p, unsigned int rid, char *request, int reqlen)
+{
+  BIND_VARIANT_REQUEST req;
+  BIND_VARIANT_REPLY reply;
+  OR_ALIGNED_BUF (OR_INT_SIZE + OR_BIND_VARIANT_REPLY_SIZE) a_reply;
+  char *reply_buf = OR_ALIGNED_BUF_START (a_reply);
+  char *ptr;
+  INT64 sig = 0;
+  int status, i, j;
+
+  memset (&req, 0, sizeof (req));
+  memset (&reply, 0, sizeof (reply));
+
+  ptr = or_unpack_sha1 (request, &req.sha1);
+  OR_UNPACK_CACHE_TIME (ptr, &req.time_stored);
+  ptr = or_unpack_int (ptr, &req.op);
+  ptr = or_unpack_int (ptr, &req.limit);
+  ptr = or_unpack_int (ptr, &req.variant);
+  ptr = or_unpack_int (ptr, &req.fp.terms);
+  ptr = or_unpack_int64 (ptr, &sig);
+  req.plan_sig = (UINT64) sig;
+  ptr = or_unpack_double (ptr, &req.band);
+  ptr = or_unpack_double (ptr, &req.floor);
+  for (i = 0; i < BIND_WATCH_MAX_TERMS; i++)
+    {
+      ptr = or_unpack_double (ptr, &req.fp.rows[i]);
+    }
+  if (req.fp.terms < 0 || req.fp.terms > BIND_WATCH_MAX_TERMS)
+    {
+      req.fp.terms = 0;
+    }
+
+  status = xcache_bind_variant (thread_p, &req, &reply);
+  if (status != NO_ERROR)
+    {
+      (void) return_error_to_client (thread_p, rid);
+    }
+
+  ptr = or_pack_int (reply_buf, status);
+  ptr = or_pack_int (ptr, reply.result);
+  ptr = or_pack_int (ptr, reply.variant);
+  ptr = or_pack_int (ptr, reply.state);
+  ptr = or_pack_int (ptr, reply.compiles);
+  ptr = or_pack_int (ptr, reply.plans);
+  ptr = or_pack_int (ptr, reply.pending);
+  ptr = or_pack_int (ptr, reply.n_records);
+  for (i = 0; i < BIND_VARIANT_MAX_COMPILES; i++)
+    {
+      ptr = or_pack_int (ptr, (i < reply.n_records) ? reply.records[i].variant : -1);
+      ptr = or_pack_int (ptr, (i < reply.n_records) ? reply.records[i].fp.terms : 0);
+    }
+  for (i = 0; i < BIND_VARIANT_MAX_COMPILES; i++)
+    {
+      for (j = 0; j < BIND_WATCH_MAX_TERMS; j++)
+	{
+	  ptr = or_pack_double (ptr, (i < reply.n_records) ? reply.records[i].fp.rows[j] : 0.0);
+	}
+    }
+
+  css_send_data_to_client (thread_p->conn_entry, rid, reply_buf, OR_ALIGNED_BUF_SIZE (a_reply));
+}
+
+/*
  * sqmgr_drop_query_plans_by_sha1 - Process a NET_SERVER_QM_QUERY_DROP_SHA1_PLANS request
  *
  * return:
