@@ -1035,6 +1035,15 @@ qdata_clear_value_array (DB_VALUE *values, int count)
  * of qdata_evaluate_aggregate_list () so that a page batch (qdata_evaluate_aggregate_batch ())
  * and a parallel worker settle the program the same way.
  */
+/*
+ * [리뷰] qdata_agg_operand_prog_ensure — 집계 피연산자 프로그램을 이 실행의 바인드 타입에 맞게 보장한다(없으면 컴파일, 서명/공유 불일치면 재컴파일) 후 공유
+ * accumulator 링크를 실행 stamp 당 한 번 갱신, 프로그램 포인터(또는 NULL)를 돌려준다. 호출: qdata_evaluate_aggregate_list(1490), px
+ * task::initialize, qexec_intprt_fnc.
+ * develop: develop 에 없음 — 같은 로직이 qdata_evaluate_aggregate_list 본문(c966fabc6 1278-1318)에 인라인돼 있었다.
+ * 이 PR: 그 블록을 함수로 추출(compiled_now 지역화). 로직·stamp 조건(1077) 동일. 배치 경로와 px 워커 initialize 가 행 평가 없이 프로그램만 준비할 수 있게
+ * 하기 위한 분리.
+ * 바뀐 것: 추출(신설 ≈46줄), 의미 변화 없음
+ */
 EXPR_PROG *
 qdata_agg_operand_prog_ensure (cubthread::entry *thread_p, cubxasl::aggregate_list_node *agg_list_p,
 			       val_descr *val_desc_p)
@@ -1088,6 +1097,13 @@ qdata_agg_operand_prog_ensure (cubthread::entry *thread_p, cubxasl::aggregate_li
  *   return: NO_ERROR, or an error code
  *   node(in): its state is a QDATA_AGG_CHUNK_STATE
  */
+/*
+ * [리뷰] qdata_agg_chunk_consume — 청크 체인의 끝 노드(EXPR_CHUNK_NODE) 콜백 — state 의 agg_list/vd/skip_optimized 로
+ * qdata_evaluate_aggregate_batch 를 부른다.
+ * develop: develop 에 없음.
+ * 이 PR: 신설 7줄. state 는 query_executor.c:12457(직렬, skip=true)·px_scan_task.cpp:839(워커, skip=false)에서 스택에 만든다.
+ * 바뀐 것: 신설
+ */
 int
 qdata_agg_chunk_consume (cubthread::entry *thread_p, EXPR_CHUNK_NODE *node, EXPR_BATCH_PLAN *plan, EXPR_BATCH *batch)
 {
@@ -1114,6 +1130,17 @@ qdata_agg_chunk_consume (cubthread::entry *thread_p, EXPR_CHUNK_NODE *node, EXPR
  * -- happens here on the first value of the page the same way, as a DB_VALUE; the values
  * after it go straight into the word accumulator (expr_batch_agg_sum_rest ()).  MIN/MAX take
  * the page's extreme value in that one call; COUNT takes a count.
+ */
+/*
+ * [리뷰] qdata_evaluate_aggregate_batch — 한 페이지 배치(EXPR_BATCH)의 선택 행 전체를 집계별로 한 번에 누적한다 — COUNT(*) 는 n_sel,
+ * COUNT 는 비NULL 수, SUM/AVG 는 첫 값만 행 경로로 시드한 뒤 sum_rest 로 word accumulator 에, MIN/MAX 는 배치 극값 하나를 행 경로로.
+ * alt_acc_list 가 있으면 해시 GROUP BY 그룹의 accumulator 에.
+ * develop: develop 에 없음(행 경로 qdata_evaluate_aggregate_list 만).
+ * 이 PR: 신설 ≈117줄. 행 경로와의 등가: COUNT 의 (curr_cnt<1 ? 0 : value)+cnt 는 qdata_aggregate_value_to_accumulator
+ * 535-556 의 첫값=1/증가와 같고, SUM/AVG 첫 값은 같은 함수로 시드(621-651)되며 이후 sum_acc 만 갱신, MIN/MAX 극값은
+ * expr_batch_agg_extremum(int64 벡터만, 첫 동값 유지)으로 뽑아 cmpval 경로로 넣는다. skip_optimized 가 false(px 워커)면
+ * agg_optimized/is_ended 도 누적 — 워커의 행 경로(1505)와 다르다(G5-02).
+ * 바뀐 것: 신설
  */
 int
 qdata_evaluate_aggregate_batch (cubthread::entry *thread_p, cubxasl::aggregate_list_node *agg_list_p,
@@ -1468,6 +1495,14 @@ qdata_agg_operand_prog_compile (cubthread::entry *thread_p, cubxasl::aggregate_l
     }
 }
 
+/*
+ * [리뷰] qdata_evaluate_aggregate_list — 한 행의 집계 리스트를 누적하는 행 경로. 피연산자 프로그램을 먼저 평가한 뒤 집계별로 accumulator 에 넣는다.
+ * develop: develop(c966fabc6 1261-1330): 프로그램 보장 로직(compile/서명 검사/재컴파일/공유 링크)이 본문 1278-1318 에 인라인, 그 뒤
+ * expr_prog_eval(1319-1324), 루프.
+ * 이 PR: 보장 로직을 qdata_agg_operand_prog_ensure 호출 한 줄(1490)로 대체; expr_prog_eval 위치·에러 처리·루프(1500 이하)는 동일.
+ * compiled_now 지역 변수 제거.
+ * 바뀐 것: 본문 ≈-40줄(추출), 의미 동일
+ */
 int
 qdata_evaluate_aggregate_list (cubthread::entry *thread_p, cubxasl::aggregate_list_node *agg_list_p,
 			       val_descr *val_desc_p, cubxasl::aggregate_accumulator *alt_acc_list,
@@ -3148,6 +3183,13 @@ exit_on_error:
  *   val_cnt(in): size of key
  *   alloc_vals(in): if true will allocate dbvalues
  */
+/*
+ * [리뷰] qdata_alloc_agg_hkey — 비슬랩 해시 키(aggregate_hash_key + values 배열)를 사설 힙에 만든다. temp_key·copy_agg_hkey·px
+ * merge 가 쓴다.
+ * develop: develop(c966fabc6 2979-3010): 같은 본문, in_slab 필드 없음.
+ * 이 PR: `key->in_slab = false` 한 줄 추가. 에러 경로(3167 key free 후 NULL)는 그대로.
+ * 바뀐 것: +1줄 필드 초기화
+ */
 aggregate_hash_key *
 qdata_alloc_agg_hkey (cubthread::entry *thread_p, int val_cnt, bool alloc_vals)
 {
@@ -3187,6 +3229,14 @@ qdata_alloc_agg_hkey (cubthread::entry *thread_p, int val_cnt, bool alloc_vals)
  * qdata_free_agg_hkey () - free hash aggregate key
  *   thread_p(in): thread
  *   key(in): aggregate hash key
+ */
+/*
+ * [리뷰] qdata_free_agg_hkey — 해시 키 해제. 슬랩 키면 값 내용만 clear 하고 블록은 value 쪽 해제(qdata_slab_release)에 맡긴다.
+ * develop: develop(c966fabc6 3018-3045): in_slab 분기 없이 values 해제 후 구조체 free.
+ * 이 PR: 3200-3208 in_slab 분기 추가(pr_clear_value 만). 나머지 동일. 블록의 첫 8바이트가 free_list 링크로 쓰이므로 value 보다 먼저 불려야
+ * in_slab 을 바르게 읽는다(G5-01).
+ * 바뀐 것: 분기 +9줄
+ * [지적 A29]
  */
 void
 qdata_free_agg_hkey (cubthread::entry *thread_p, aggregate_hash_key *key)
@@ -3232,6 +3282,12 @@ qdata_free_agg_hkey (cubthread::entry *thread_p, aggregate_hash_key *key)
  * qdata_alloc_agg_hkey () - allocate new hash aggregate key
  *   returns: pointer to new structure or NULL on error
  *   thread_p(in): thread
+ */
+/*
+ * [리뷰] qdata_alloc_agg_hvalue — 비슬랩 해시 값(accumulator 배열 + DB_VALUE 쌍)을 사설 힙에 만들고 g_agg_list 로 초기화한다.
+ * develop: develop(c966fabc6 3054-3125): batch_slot/slab 필드 없음, 나머지 동일(두 번째 루프가 func_cnt 로 제한되지 않는 점도 동일).
+ * 이 PR: `value->batch_slot = -1; value->slab = NULL;` 2줄 추가(3270-3271).
+ * 바뀐 것: +2줄 필드 초기화
  */
 aggregate_hash_value *
 qdata_alloc_agg_hvalue (cubthread::entry *thread_p, int func_cnt, cubxasl::aggregate_list_node *g_agg_list)
@@ -3313,6 +3369,12 @@ static void qdata_slab_release (cubthread::entry *thread_p, aggregate_hash_value
  * qdata_free_agg_hkey () - free hash aggregate key
  *   thread_p(in): thread
  *   key(in): aggregate hash key
+ */
+/*
+ * [리뷰] qdata_free_agg_hvalue — 해시 값 해제. 슬랩 값이면 qdata_slab_release 로 위임(값 clear·넘친 tuple free·블록 반납).
+ * develop: develop(c966fabc6 3131-3165): slab 분기 없이 accumulators/tuple/구조체 free.
+ * 이 PR: 3326-3330 slab 분기 추가. 나머지 동일.
+ * 바뀐 것: 분기 +5줄
  */
 void
 qdata_free_agg_hvalue (cubthread::entry *thread_p, aggregate_hash_value *value)
@@ -3438,6 +3500,15 @@ struct agg_group_slab
   void *free_list;		/* a freed block's first word links the next */
 };
 
+/*
+ * [리뷰] qdata_slab_create — 그룹 하나(키 헤더+키 포인터+키 값+값 헤더+accumulator+값 쌍+inline tuple)를 담는 고정 크기 블록의 오프셋 표를 계산해 슬랩
+ * 디스크립터를 calloc 한다. 호출: qexec_hash_gby_agg_tuple(첫 새 그룹에서 1회).
+ * develop: develop 에 없음.
+ * 이 PR: 신설 ≈29줄. calloc 실패 시 er_set 없이 NULL — 호출자(query_executor.c 4777-4779)는 NULL 이면 비슬랩 경로로 조용히 내려가므로 에러가
+ * 아니다(관찰 질문 3 의 답). 전역 힙 선택은 G5-05.
+ * 바뀐 것: 신설
+ * [지적 A31]
+ */
 agg_group_slab *
 qdata_slab_create (int n_keys, int n_funcs, int inline_cap)
 {
@@ -3468,6 +3539,13 @@ qdata_slab_create (int n_keys, int n_funcs, int inline_cap)
   return slab;
 }
 
+/*
+ * [리뷰] qdata_slab_destroy — 슬랩의 chunk 전부와 디스크립터를 free. 호출: qexec_free_agg_hash_context(mht_clear 뒤).
+ * develop: develop 에 없음.
+ * 이 PR: 신설 16줄. 블록 단위 값 clear 는 하지 않는다 — 모든 그룹이 mht_clear(qdata_free_agg_hentry)로 먼저 정리된다는 전제(query_executor.c
+ * 31277→31283).
+ * 바뀐 것: 신설
+ */
 void
 qdata_slab_destroy (agg_group_slab *slab)
 {
@@ -3485,6 +3563,16 @@ qdata_slab_destroy (agg_group_slab *slab)
   free (slab);
 }
 
+/*
+ * [리뷰] qdata_slab_block — 블록 하나를 준다 — free_list 가 있으면 pop, 없으면 bump 포인터, chunk 가 차면 256KB(또는 block_size) chunk
+ * 를 malloc 하고 chunks 배열을 2배 realloc.
+ * develop: develop 에 없음.
+ * 이 PR: 신설 ≈41줄. 실패 경로: realloc 실패는 기존 chunks 유지, malloc 실패는 n_chunks 증가 전 반환(누수 없음). 3499 의 끝 너머 포인터 비교는
+ * G5-06.
+ * 바뀐 것: 신설
+ * [지적 A31]
+ * [지적 A32]
+ */
 static char *
 qdata_slab_block (agg_group_slab *slab)
 {
@@ -3531,6 +3619,18 @@ qdata_slab_block (agg_group_slab *slab)
  * qdata_slab_new_group () - a new group's key (a copy of key) and value (as qdata_alloc_agg_hvalue () sets it up)
  *			     in one block; a first tuple of tuple_size bytes fits the block or is allocated alone
  *   return: NO_ERROR, or ER_OUT_OF_VIRTUAL_MEMORY / the copy's error
+ */
+/*
+ * [리뷰] qdata_slab_new_group — 블록 하나에 키(값 복제)+값(accumulator 초기화, g_agg_list 의 shared_from 상속)+첫 tuple
+ * 공간(inline_cap 이내면 블록 안, 넘으면 db_private_alloc)을 배치해 out_key/out_value 로 돌려준다. 호출: qexec_hash_gby_agg_tuple 새
+ * 그룹.
+ * develop: develop 에 없음 — 대응 코드는 qdata_copy_agg_hkey + qdata_alloc_agg_hvalue + db_private_alloc(tuple) 세 번의
+ * 할당(c966fabc6 query_executor.c 4811-4840 부근).
+ * 이 PR: 신설 ≈89줄. 초기화는 alloc_hvalue 와 같은 규칙(COUNT 0, GROUPBY_NUM 건너뜀). pr_clone_value 실패 분기(3560)는 도달
+ * 불가(G5-04). 실패 시 블록을 free_list 로 돌리는 두 경로(3566, 3612)가 키 헤더를 덮는다(G5-01).
+ * 바뀐 것: 신설
+ * [지적 A29]
+ * [지적 A30]
  */
 int
 qdata_slab_new_group (cubthread::entry *thread_p, agg_group_slab *slab, aggregate_hash_key *key,
@@ -3624,6 +3724,14 @@ qdata_slab_new_group (cubthread::entry *thread_p, agg_group_slab *slab, aggregat
 
 /* a group's block back to its slab: what its values hold of their own freed (the key's values were cleared by
  * qdata_free_agg_hkey () before), a first tuple allocated alone freed */
+/*
+ * [리뷰] qdata_slab_release — 슬랩 값 해제 — accumulator 값 clear, 넘친 tuple 만 db_private_free, 블록을 free_list 에 push.
+ * 호출: qdata_free_agg_hvalue.
+ * develop: develop 에 없음.
+ * 이 PR: 신설 21줄. 키 값(kv[])은 여기서 clear 하지 않는다 — qdata_free_agg_hkey 가 먼저 했다는 전제. 3645 의 링크 쓰기가 키 헤더를 덮는다(G5-01).
+ * 바뀐 것: 신설
+ * [지적 A29]
+ */
 static void
 qdata_slab_release (cubthread::entry *thread_p, aggregate_hash_value *value)
 {
@@ -3674,6 +3782,15 @@ qdata_free_agg_hentry (const void *key, void *data, void *args)
  * qdata_key_sketch_add () - note a GROUP BY key in a distinct-key sketch (HyperLogLog: a register per hash prefix
  *			      keeps the longest run of leading zeros after it)
  */
+/*
+ * [리뷰] qdata_key_sketch_add — HyperLogLog 레지스터(1024개, p=10)에 키를 넣는다 — 키 해시를 다시 섞어 상위 10비트로 레지스터, 하위 22비트의 선행 0
+ * run(최대 23)으로 rank. 호출: qexec_hash_gby_agg_tuple 매 행(프로브 전).
+ * develop: develop 에 없음.
+ * 이 PR: 신설 ≈24줄. QDATA_KEY_SKETCH_REGS=1024(query_aggregate.hpp:78)라 h>>22 인덱스가 맞고 rank≤23 은 unsigned char 에
+ * 들어간다(관찰 질문 9 의 답). 행당 추가 해시 비용은 G5-03.
+ * 바뀐 것: 신설
+ * [지적 A16]
+ */
 void
 qdata_key_sketch_add (unsigned char *regs, const aggregate_hash_key *key)
 {
@@ -3699,6 +3816,13 @@ qdata_key_sketch_add (unsigned char *regs, const aggregate_hash_key *key)
     }
 }
 
+/*
+ * [리뷰] qdata_key_sketch_merge — 레지스터별 max 로 다른 스케치를 합친다. 호출: px write_finalize(m_result_mutex 아래,
+ * px_scan_result_handler.cpp 463).
+ * develop: develop 에 없음.
+ * 이 PR: 신설 13줄. HLL 의 레지스터 max 병합은 단일 처리와 동일(DS-05 충족), 직렬·워커가 같은 해시(DS-03 충족).
+ * 바뀐 것: 신설
+ */
 void
 qdata_key_sketch_merge (unsigned char *regs, const unsigned char *other)
 {
@@ -3714,6 +3838,14 @@ qdata_key_sketch_merge (unsigned char *regs, const unsigned char *other)
 }
 
 /* the distinct keys a sketch saw, about: the harmonic mean of the registers, linear counting while few are set */
+/*
+ * [리뷰] qdata_key_sketch_estimate — 표준 HLL 추정(alpha_m·m²/Σ2^-r, 소범위 선형 카운팅, 대범위 2^32 보정)으로 distinct 그룹 수를 돌려준다.
+ * 호출: qexec_gby_hash_merge(병렬 degree·fold 판단, 7155).
+ * develop: develop 에 없음.
+ * 이 PR: 신설 ≈23줄. 대범위 보정의 2^32 는 해시 전체 폭(인덱스 10비트+rank 22비트) 기준이라 맞다(관찰 질문 10 의 답). 추정값은 휴리스틱 입력이라 오차가 결과에 닿지
+ * 않는다.
+ * 바뀐 것: 신설
+ */
 double
 qdata_key_sketch_estimate (const unsigned char *regs)
 {
@@ -4170,6 +4302,13 @@ end:
  *   value(out): accumulators
  *   key_dom(in): key domains
  *   acc_dom(in): accumulator domains
+ */
+/*
+ * [리뷰] qdata_load_agg_hkey_from_tuple — 리스트 파일 tuple 에서 키 컬럼만 key->values 에 읽는다(값은 clear 후 walk read, NULL 이면
+ * db_make_null). 호출: qexec_gby_merge_split_list·qexec_gby_px_split_list(query_executor.c 6292, 6679).
+ * develop: develop 에 없음 — 같은 루프가 qdata_load_agg_hvalue_from_tuple 본문(c966fabc6 3595-3610)에 있었다.
+ * 이 PR: 키 부분만 따로 쓰는 함수로 추출(walk 를 val_count 로 초기화). 로직 동일.
+ * 바뀐 것: 추출(신설 24줄)
  */
 int
 qdata_load_agg_hkey_from_tuple (cubthread::entry *thread_p, QFILE_TUPLE tuple, int hdr_size, aggregate_hash_key *key,

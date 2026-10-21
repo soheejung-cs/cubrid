@@ -4696,6 +4696,13 @@ struct hjoin_runtime_filter
   INT64 dropped;
 };
 
+/*
+ * [리뷰] hjoin_rtf_hash — hjoin_rtf_build/pass 가 INT64 키를 개방주소 표 인덱스로 바꿀 때 쓰는 64비트 해시(황금비 곱 + xor-shift 29).
+ * mask 와 AND 해서 슬롯이 된다
+ * develop: develop 에 없음
+ * 이 PR: x = v*0x9E3779B97F4A7C15; return x ^ (x>>29)
+ * 바뀐 것: 신설 6줄 (static)
+ */
 static UINT64
 hjoin_rtf_hash (INT64 v)
 {
@@ -4704,6 +4711,15 @@ hjoin_rtf_hash (INT64 v)
 }
 
 /* the key as an integer: 1, or 0 for NULL, or -1 for a type the filter does not compare */
+/*
+ * [리뷰] hjoin_rtf_key — DB_VALUE 를 비교용 INT64 로 바꾼다. 0 = NULL, 1 = 키 추출, -1 = 필터가 비교하지 않는 종류(DATE 와 정수가 섞인 경우·그
+ * 밖의 타입). build 는 -1 을 NULL 처럼 건너뛰고(4946), pass 는 -1 을 통과시킨다(4988)
+ * develop: develop 에 없음
+ * 이 PR: SHORT/INTEGER/BIGINT 는 is_date 가 false 일 때만 1, DATE 는 is_date 일 때만 1(db_get_date 의 unsigned int 일수),
+ * default -1
+ * 바뀐 것: 신설 25줄 (static)
+ * [지적 A18]
+ */
 static int
 hjoin_rtf_key (const DB_VALUE * v, bool is_date, INT64 * out)
 {
@@ -4730,6 +4746,13 @@ hjoin_rtf_key (const DB_VALUE * v, bool is_date, INT64 * out)
     }
 }
 
+/*
+ * [리뷰] hjoin_rtf_type_ok — hjoin_rtf_build 가 첫 입력 리스트 칼럼 도메인(4884)과 대상 outptr 도메인(4900)에 대해 필터 가능
+ * 타입(SHORT/INTEGER/BIGINT/DATE)인지 판정하고 DATE 여부를 돌려준다
+ * develop: develop 에 없음
+ * 이 PR: 4개 타입 OR, *is_date = (t == DB_TYPE_DATE). NUMERIC·문자열·DATETIME/TIMESTAMP 는 거부
+ * 바뀐 것: 신설 6줄 (static)
+ */
 static bool
 hjoin_rtf_type_ok (DB_TYPE t, bool * is_date)
 {
@@ -4739,6 +4762,17 @@ hjoin_rtf_type_ok (DB_TYPE t, bool * is_date)
 
 /* the cell of target's value list that the outermost scan fetches list column col into, and its position; NULL
  * when the column is anything else (an expression, a nested scan's value, a hidden column) */
+/*
+ * [리뷰] hjoin_rtf_target_cell — hjoin_rtf_first_input/hjoin_rtf_build 가 대상 XASL 의 col 번째(숨김 제외) 출력 칼럼이 '단일
+ * TARGET_CLASS 스펙이 TYPE_ATTR_ID 로 직접 채우는 상수 셀'인지 확인하고 그 DB_VALUE 와 val_list 위치를 돌려준다. 아니면 NULL(필터 없음)
+ * develop: develop 에 없음
+ * 이 PR: spec 1개·TARGET_CLASS·parts==NULL 조건 → outptr 에서 숨김 제외 col 번째 TYPE_CONSTANT → val_list 에서 위치 n →
+ * cls_regu_list_pred/rest 중 vfetch_to == cell 인 TYPE_ATTR_ID 가 있을 때만 성공. 숨김 칼럼을 건너뛰는 세기는 리스트 파일
+ * 작성(qdata_get_valptr_type_list·qdata_copy_valptr_list_to_tuple)과 같은 규칙. parts 는 스캔 open 시점에야 채워져 build 시점엔 항상
+ * NULL(G10-2)
+ * 바뀐 것: 신설 58줄 (static)
+ * [지적 A13]
+ */
 static DB_VALUE *
 hjoin_rtf_target_cell (XASL_NODE * target, int col, int *val_index)
 {
@@ -4799,6 +4833,13 @@ hjoin_rtf_target_cell (XASL_NODE * target, int col, int *val_index)
 }
 
 /* the target's rows may be dropped one by one: nothing in it counts, numbers or groups them */
+/*
+ * [리뷰] hjoin_rtf_target_ok — hjoin_rtf_first_input 이 후보 대상이 필터를 받아도 되는 단순 BUILDLIST(초기 상태, group
+ * by·집계·instnum·ordbynum·limit·connect by·regu 링크 없음)인지 판정한다
+ * develop: develop 에 없음
+ * 이 PR: 8개 조건 AND
+ * 바뀐 것: 신설 8줄 (static)
+ */
 static bool
 hjoin_rtf_target_ok (XASL_NODE * target)
 {
@@ -4808,6 +4849,16 @@ hjoin_rtf_target_ok (XASL_NODE * target)
     && target->connect_by_ptr == NULL && !XASL_IS_FLAGED (target, XASL_LINK_TO_REGU_VARIABLE);
 }
 
+/*
+ * [리뷰] hjoin_rtf_first_input — qexec_execute_mainblock_internal 의 aptr 루프 앞(19631)에서 불려 먼저 실행할 입력(키를 만드는 쪽)과
+ * 필터를 받을 대상을 고른다. 부적격이면 NULL·*target=NULL·hj->rtf_keys=-1(트레이스 '안 만듦')
+ * develop: develop 에 없음
+ * 이 PR: ls_column_cnt==1, hj->rtf==NULL, INNER/SEMI 만. INNER 는 inner 먼저 → outer 가 대상 부적격이면 outer 먼저/inner 대상으로
+ * 한 번 뒤집음. SEMI 는 inner 먼저·outer 대상 고정. LEFT/RIGHT/ANTI 는 default 로 NULL
+ * 바뀐 것: 신설 46줄, 공개 함수(query_hash_join.h:518, SERVER/SA 가드 안)
+ * [지적 A18]
+ * [지적 A25]
+ */
 XASL_NODE *
 hjoin_rtf_first_input (XASL_NODE * hashjoin_xasl, XASL_NODE ** target)
 {
@@ -4855,6 +4906,18 @@ hjoin_rtf_first_input (XASL_NODE * hashjoin_xasl, XASL_NODE ** target)
   return first;
 }
 
+/*
+ * [리뷰] hjoin_rtf_build — 첫 입력이 실행된 뒤(19636) 그 리스트 파일을 훑어 정수 키 집합(개방주소, cap=2^k >= 2*tuple_cnt, 최소 16)을 만들고
+ * hj->rtf 와 대상 XASL 의 rtf/rtf_val 에 건다. 오류만 돌려주고 '필터를 만들지 않음'(빈 입력·1<<20 초과·타입 불일치·할당 실패)은 NO_ERROR
+ * develop: develop 에 없음
+ * 이 PR: calloc/malloc/calloc → qfile_open_list_scan → 행마다 qfile_slot_read_column_value(copy=false, 비소유) →
+ * NULL/-1 건너뜀 → 선형 탐사 삽입. open 실패는 닫을 것 없이 fail(qfile_copy_list_id 가 자기 실패 시 domp 를 free, 다른 호출부
+ * 6094·6165·6284 와 같은 규약), read 실패는 close 후 fail. 성공 시 소유권은 hj->rtf 로 이전
+ * 바뀐 것: 신설 121줄, 공개 함수(query_hash_join.h:520)
+ * [지적 A2]
+ * [지적 A18]
+ * [지적 A25]
+ */
 int
 hjoin_rtf_build (THREAD_ENTRY * thread_p, XASL_NODE * hashjoin_xasl, XASL_NODE * first, XASL_NODE * target)
 {
@@ -4977,6 +5040,16 @@ fail:
   return error;
 }
 
+/*
+ * [리뷰] hjoin_rtf_pass — 대상 스캔의 행마다(qexec_intprt_fnc 12821, px_scan_task.cpp row_body 967) 키 셀을 보고 통과 여부를 돌려준다:
+ * 비교 불가(-1) → true, 키가 표에 있음 → true, 없음/NULL → false. rows/dropped 를 relaxed 원자 증가
+ * develop: develop 에 없음
+ * 이 PR: 선형 탐사는 cap >= 2*n_keys 라 반드시 빈 슬롯에서 끝남(HJOIN_RTF_MAX_KEYS = 1<<20 → cap <= 2^21). 행당 원자 RMW 1~2회가 조회
+ * 필드와 같은 라인(G10-1)
+ * 바뀐 것: 신설 27줄, 공개 함수(핫패스)
+ * [지적 A14]
+ * [지적 A18]
+ */
 bool
 hjoin_rtf_pass (HJOIN_RUNTIME_FILTER * rtf, const DB_VALUE * key)
 {
@@ -5005,6 +5078,15 @@ hjoin_rtf_pass (HJOIN_RUNTIME_FILTER * rtf, const DB_VALUE * key)
   return false;
 }
 
+/*
+ * [리뷰] hjoin_rtf_bind_clone — px_scan_task::initialize(122) 가 clone_xasl 직후 불러 워커 클론의 rtf 에 원본 필터를 공유 포인터로 넣고
+ * rtf_val 을 클론 val_list 의 val_index 번째 셀로 묶는다. 원본에 필터가 없으면 둘 다 NULL
+ * develop: develop 에 없음
+ * 이 PR: clone->rtf/rtf_val = NULL 초기화 후 orig->rtf 가 있고 val_list 를 val_index 만큼 걸을 수 있을 때만 바인딩. 소유권 없음(클론의
+ * qexec_clear_xasl 은 BUILDLIST 라 release 에 닿지 않음)
+ * 바뀐 것: 신설 22줄, 공개 함수
+ * [지적 A2]
+ */
 void
 hjoin_rtf_bind_clone (XASL_NODE * clone, const XASL_NODE * orig)
 {
@@ -5028,6 +5110,17 @@ hjoin_rtf_bind_clone (XASL_NODE * clone, const XASL_NODE * orig)
     }
 }
 
+/*
+ * [리뷰] hjoin_rtf_release — qexec_clear_xasl(2336, HASHJOIN_PROC) 과 qexec_end_mainblock_iterations(18887, 해시 조인
+ * 직전) 에서 불려 카운터를 hj 에 옮기고 양쪽 입력 XASL 의 rtf/rtf_val 을 지운 뒤 표를 free 한다. hj->rtf 가 NULL 이면 no-op(두 번 불려도 안전)
+ * develop: develop 에 없음
+ * 이 PR: 두 호출 모두 대상 스캔이 닫힌 뒤(워커 drain 뒤)라 plain read·free 가 안전(G10-4 주석 제안). XASL 언팩은 hj 를 memset
+ * 0(stream_to_xasl.c:3294), xasl->rtf/rtf_val 을 NULL(264-265·2465-2466)로 두므로 캐시된 XASL 첫 실행에서도 쓰레기 포인터 없음
+ * 바뀐 것: 신설 27줄, 공개 함수
+ * [지적 A2]
+ * [지적 A26]
+ * [지적 A38]
+ */
 void
 hjoin_rtf_release (XASL_NODE * hashjoin_xasl)
 {

@@ -119,6 +119,16 @@ namespace parallel_scan
       }
   }
 
+  /*
+   * [리뷰] trace_handler::add_expr_compile_dump — 워커가 ;plan detail 일 때 자기 XASL 클론의 EXPR_COMPILE 리스팅을 렌더링해
+   * trace_handler 의 한 슬롯(첫 워커만)에 넣는다.
+   * develop: develop(c966fabc6 px_scan_trace_handler.cpp 120-165): 인자 xasl 하나, qdump_print_expr_compile_text 만
+   * 렌더링.
+   * 이 PR: SCAN_ID *scan_id 인자 추가; S_HEAP_SCAN 이고 batch_plan/batch_why_not 이 있으면 expr_batch_dump 를 같은 memstream 에
+   * 덧붙인다. 두 lock 구간(142 검사/166 대입)은 develop 과 같고 '첫 워커가 슬롯을 차지, 늦은 쪽은 렌더링 결과 폐기'가 의도(128-134 주석).
+   * open_memstream→fclose→free 짝 유지.
+   * 바뀐 것: 시그니처 +1 인자, 분기 +1(≈6줄)
+   */
   void trace_handler::add_expr_compile_dump (xasl_node *xasl, SCAN_ID *scan_id)
   {
     char *buf = nullptr;

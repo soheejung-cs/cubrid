@@ -85,6 +85,25 @@ namespace parallel_scan
   }
 
   template <RESULT_TYPE result_type, SCAN_TYPE ST>
+  /*
+   * [리뷰] task<result_type, ST>::initialize — execute() 가 처음 부른다. 워커 스레드 엔트리를 부모에 맞추고, XASL 클론을 받아(clone_xasl) 사전
+   * 계산 스칼라를 주입하고, 레벨별 스캔을 열고(level 0 = 이 워커의 드라이빙 스캔, level>0 = 조인 내부), 슬롯 이터레이터·입력/결과 핸들러를 초기화한 뒤
+   * m_handlers_initialized 를 올린다. 실패 시 err_code 를 돌려주고 execute() 가 finalize 로 정리한다.
+   * develop: base 85-478: 같은 뼈대. clone_xasl 뒤 바로 사전 계산 주입(118-), 레벨 루프, m_scan_func_ptr 할당(435), 이터레이터/핸들러 초기화,
+   * write_initialize 두 갈래(BUILDVALUE_OPT / 그 외) 뒤 m_handlers_initialized=true 와 er_errid 검사.
+   * 이 PR: (1) clone_xasl 직후 hjoin_rtf_bind_clone (m_xasl, m_orig_xasl) 로 리더의 런타임 필터를 클론 val_list 셀에
+   * 묶는다(121-122). (2) BUILDVALUE_OPT+HEAP: qexec_batch_eligible 이면 qdata_agg_operand_prog_ensure →
+   * qdata_link_shared_accumulators → scan_batch_open(agg_list) 로 페이지 배치를 열고, 아니면 qexec_batch_filter_eligible 일 때
+   * scan_batch_open_rows 로 필터만 배치(m_batch_rows)(468-492). (3) MERGEABLE_LIST+HEAP: groupby 없으면 scan_batch_open,
+   * 있으면 qexec_batch_gby_map_create → scan_batch_open(g_agg_list, gby_map)==1 이면 qexec_batch_gby_create 로
+   * m_batch_gby 노드를 만들고, 노드가 없으면 batch_state=2 로 행 경로 고정; 아니면 필터만 배치(498-541).
+   * 바뀐 것: +72줄, 분기 추가. 팩이 480 에서 잘린 뒤 548 까지는 head 소스로 확인. 선재 에러 경로(237 반환값 무시, 383 S_ERROR 반환, 440 널 검사 없음)는
+   * develop 과 같다(G3G4-05). 122 의 바인딩이 finalize 에서 풀리지 않아 G3G4-01. 배치 게이트 qexec_batch_eligible 이 rtf 를 모르는 것이
+   * G3G4-02.
+   * [지적 A2]
+   * [지적 A7]
+   * [지적 A52]
+   */
   int task<result_type, ST>::initialize (cubthread::entry &thread_ref)
   {
     int err_code = NO_ERROR;
@@ -548,6 +567,19 @@ namespace parallel_scan
   }
 
   template <RESULT_TYPE result_type, SCAN_TYPE ST>
+  /*
+   * [리뷰] task<result_type, ST>::finalize — execute() 가 loop 뒤(또는 initialize 실패 뒤) 부른다. 트레이스 병합, 결과/입력 핸들러·이터레이터
+   * 마무리, 조인 체인의 spec/btid 복원, xasl_state 해제, 클론 정리 후 m_px_lock_mutex 아래서 xcache_retire_clone + xcache_unfix(또는
+   * 언팩 트리 해제), 마지막에 perfmon 통계를 리더에 넘긴다.
+   * develop: base 481-612: m_scan_func_ptr 해제 → 트레이스(add_expr_compile_dump (m_xasl)) → write_finalize/input
+   * finalize/slot finalize → spec 복원 루프 → qexec_free_xasl_state → qexec_clear_xasl 1~2회 → retire/unfix →
+   * px_stats.
+   * 이 PR: 맨 앞에 m_batch_gby 가 있으면 qexec_batch_gby_destroy 로 노드를 먼저 지운다(556-561; 노드가 해시 테이블 안을 가리키므로
+   * write_finalize 의 덤프보다 앞). add_expr_compile_dump 에 m_scan_id 를 더 넘겨 배치 플랜 덤프를 트레이스에 싣는다(584).
+   * 바뀐 것: +7줄 분기 추가, 시그니처 호출 인자 +1. m_xasl->rtf/rtf_val 을 되돌리지 않은 채 662 에서 클론을 풀에 반납 — G3G4-01 의 반쪽.
+   * hsidp->batch/batch_plan/batch_copy 는 qexec_clear_xasl → scan_close_scan(scan_manager.c:5503-5518) 이 지운다.
+   * [지적 A2]
+   */
   int task<result_type, ST>::finalize (cubthread::entry &thread_ref)
   {
     THREAD_ENTRY *main_thread_p = thread_get_main_thread (m_parent_thread_p);
@@ -785,6 +817,17 @@ namespace parallel_scan
 
   /* Shared OID-drain helper: leaf-path + late-joiner. Returns S_END on completion, S_ERROR with stop=true on terminal failure. */
   template <RESULT_TYPE result_type, SCAN_TYPE ST>
+  /*
+   * [리뷰] task<result_type, ST>::emit_row — 배치 체인의 project 노드(scan_batch_project_consume →
+   * scan_batch_project_row)와 gby 노드가 행 하나를 내보낼 때 부르는 정적 콜백. MERGEABLE_LIST 면 result_handler->write(outptr_list)
+   * 로 리스트에 쓴다. 항상 NO_ERROR.
+   * develop: develop 에 없음 (base 의 행 루프 1084 가 같은 write 호출을 인라인으로 했다)
+   * 이 PR: write 의 반환값은 버린다 — base 행 루프(1084)와 같고, write 가 실패하면 스스로 에러를 옮기고 interrupt 를 올리며 loop() 가 다음 페이지 경계에서
+   * 멈춘다(1164). gby 노드는 ctx->tuple_count 변화로 '행이 테이블에 들어갔나' 를 판단하므로(query_executor.c:12187-12191) 실패한 write 가 캐시에
+   * 잘못 들어가지 않는다.
+   * 바뀐 것: 신설 13줄. hjoin_rtf_pass 검사가 없어 project 경로는 런타임 필터를 지나친다(G3G4-02).
+   * [지적 A7]
+   */
   int task<result_type, ST>::emit_row (cubthread::entry *thread_p, void *arg)
   {
     /* the projection node's emit: the row, its value list filled, to the worker's result handler as
@@ -800,6 +843,13 @@ namespace parallel_scan
   }
 
   template <RESULT_TYPE result_type, SCAN_TYPE ST>
+  /*
+   * [리뷰] task<result_type, ST>::gby_list — qexec_batch_gby_consume 가 테이블을 덤프할 리스트를 물을 때의 콜백. MERGEABLE_LIST 면
+   * result_handler->gby_list() = tl.writer_result_p, 아니면 nullptr.
+   * develop: develop 에 없음
+   * 이 PR: 신설 8줄; 직렬 쪽 qexec_batch_gby_list_serial 의 짝.
+   * 바뀐 것: 신설
+   */
   QFILE_LIST_ID *task<result_type, ST>::gby_list (void *arg)
   {
     if constexpr (result_type == RESULT_TYPE::MERGEABLE_LIST)
@@ -810,6 +860,14 @@ namespace parallel_scan
   }
 
   template <RESULT_TYPE result_type, SCAN_TYPE ST>
+  /*
+   * [리뷰] task<result_type, ST>::gby_sync — gby 노드가 해시 컨텍스트 상태(HS_ACCEPT_ALL → 거부/덤프)를 바꾼 뒤 부르는 콜백.
+   * result_handler->gby_sync() 가 tl.agg_hash_state 를 컨텍스트의 state 로 맞춰 write() 의 분기(955 ↔ 946)가 노드의 결정과 어긋나지 않게
+   * 한다.
+   * develop: develop 에 없음
+   * 이 PR: 신설 7줄.
+   * 바뀐 것: 신설
+   */
   void task<result_type, ST>::gby_sync (void *arg)
   {
     if constexpr (result_type == RESULT_TYPE::MERGEABLE_LIST)
@@ -819,6 +877,23 @@ namespace parallel_scan
   }
 
   template <RESULT_TYPE result_type, SCAN_TYPE ST>
+  /*
+   * [리뷰] task<result_type, ST>::drain_slot_oids — loop() 가 페이지 하나를 set_page 한 뒤 부른다. 페이지의 자격 행을 모두 소비하고 S_END,
+   * 또는 stop=true 와 S_ERROR 를 돌려준다. HEAP 이고 batch_state==1 이면 먼저 페이지를 청크 단위로 모아(scan_batch_collect_chunk)
+   * evaluate → {rows | aggregate | group by | project} 체인에 밀어 넣고, 페이지가 다 소화되면 S_END; 폴백(EXPR_BATCH_FALLBACK /
+   * S_DOESNT_FIT)이면 resume_after(chunk_start) 로 그 청크 첫 슬롯부터 아래의 행 루프(next_qualified_slot_with_peek → row_body)로
+   * 넘긴다.
+   * develop: base 711-881: 행 루프 하나 — next_qualified_slot_with_peek 로 행을 받고, rtf 없이 dptr → after_join_pred →
+   * if_pred → scan_ptr 체인/write → qexec_clear_scan_all_lists 를 루프 본문에 인라인.
+   * 이 PR: 행 루프 본문이 row_body 로 추출되고(950), 앞에 배치 블록(826-924)이 붙었다. 에러 판정: S_ERROR 또는 rc ∉ {NO_ERROR, FALLBACK} 이면
+   * stop 이 아직 아닐 때만 에러를 옮긴다(rows 노드 → row_body 가 이미 옮긴 경우 중복 방지, 892-901). 트레이스: rc==NO_ERROR 인 청크만
+   * read_rows/qualified_rows 에 더해 폴백 청크를 행 경로가 다시 셀 때 이중 계산이 없다(885-890). S_END + FALLBACK(마지막 청크 폴백)은 906 이
+   * 거짓이라 행 경로로 가는 것이 맞다 — 직렬 12541-12567 과 같다. 919 의 local_cache_vpid 리셋은 cached 스캔이 rows 노드에서 페이지를 놓은
+   * 뒤(8449-8453) 행 경로가 옛 복사본을 쓰지 않게 한다.
+   * 바뀐 것: +100줄 분기 추가, 본문 추출. m_drain_stop 저장(844)은 하드닝 대상(G3G4-06). INV-4 판정은 G3G4-03.
+   * [지적 A42]
+   * [지적 A45]
+   */
   SCAN_CODE task<result_type, ST>::drain_slot_oids (cubthread::entry &thread_ref, bool &stop)
   {
     SCAN_CODE scan_code;
@@ -958,6 +1033,18 @@ namespace parallel_scan
   /* the row loop's work for one row the scan qualified, its values in the value list: S_SUCCESS (written, or
    * dropped by a join or if predicate), or S_ERROR with stop set and the error reported */
   template <RESULT_TYPE result_type, SCAN_TYPE ST>
+  /*
+   * [리뷰] task<result_type, ST>::row_body — 자격 행 하나(값 리스트가 채워진 상태)에 대한 행 루프의 일: 런타임 필터 → dptr → after_join_pred →
+   * if_pred → scan_ptr 체인 실행/결과 write → qexec_clear_scan_all_lists. S_SUCCESS(썼거나 걸러짐) 또는 stop=true 와 S_ERROR.
+   * drain 의 행 루프(950)와 rows 노드의 emit_row_body(1118) 두 곳에서 불린다.
+   * develop: base 711-881 의 루프 본문(741-877)과 같은 순서, `continue` 가 `return S_SUCCESS` 로 바뀐 것 외 동일.
+   * 이 PR: 맨 앞에 m_xasl->rtf && !hjoin_rtf_pass (rtf, rtf_val) 면 S_SUCCESS 로 바로 돌아가는 분기가 새로 붙었다(967-971). 이 자리에서
+   * qexec_clear_scan_all_lists 를 안 부르는 것은 맞다 — 이 행의 dptr/서브쿼리는 아직 실행 전이고 직전 행의 리스트는 그 행의 끝(1109) 또는 drop
+   * 분기(991/1011)에서 이미 지웠다; 직렬 12821-12825 도 같은 자리에서 continue 한다(직렬은 행마다 clear_scan_all_lists 를 부르지 않는다 — 호출처는 px
+   * 뿐).
+   * 바뀐 것: 추출 + 분기 추가 +5줄. 967 의 rtf 역참조가 G3G4-01 의 UAF 지점(병렬 쪽).
+   * [지적 A2]
+   */
   SCAN_CODE task<result_type, ST>::row_body (cubthread::entry &thread_ref, bool &stop)
   {
     SCAN_CODE xs_scan;
@@ -1111,6 +1198,15 @@ namespace parallel_scan
   }
 
   template <RESULT_TYPE result_type, SCAN_TYPE ST>
+  /*
+   * [리뷰] task<result_type, ST>::emit_row_body — rows 노드(필터만 배치)의 콜백. scan_batch_rows_consume 이 복사해 둔 행마다
+   * row_body 를 돌리고 S_ERROR 면 ER_FAILED 로 체인에 알린다(drain 이 rc != NO_ERROR 로 받아 S_ERROR 반환). stop 은 m_drain_stop 을
+   * 통해 drain 의 것을 쓴다.
+   * develop: develop 에 없음
+   * 이 PR: 신설 6줄.
+   * 바뀐 것: 신설. m_drain_stop 의존(G3G4-06).
+   * [지적 A45]
+   */
   int task<result_type, ST>::emit_row_body (cubthread::entry *thread_p, void *arg)
   {
     task<result_type, ST> *self = static_cast<task<result_type, ST> *> (arg);

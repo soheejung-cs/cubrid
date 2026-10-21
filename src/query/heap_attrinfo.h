@@ -128,6 +128,15 @@ extern DB_VALUE *heap_attrvalue_peek_lazy (HEAP_ATTRVALUE * slot, HEAP_CACHE_ATT
  * expr_batch.c); heap_file.c wraps it for the callers that hold the attribute cache. Inline
  * because the lazy read derives a layout per record on the scan's hot path.
  */
+/*
+ * [리뷰] heap_rec_layout_init_repr — 표현(representation) 상수 두 개(n_variable, fixed_length)만으로 레코드
+ * 레이아웃(offset_size·var_table·fixed_base·bound_bits)을 만든다. heap_file.c 의 heap_rec_layout_init 이 이를 감싸고,
+ * expr_batch.c eb_layout_rows 가 attribute cache 없이 직접 부른다.
+ * develop: develop 의 heap_rec_layout_init(heap_file.c, STATIC_INLINE)이 attr_info->read_classrepr 에서
+ * n_variable·fixed_length 를 꺼내 같은 네 줄을 인라인으로 계산했다.
+ * 이 PR: 네 줄을 헤더 inline 으로 추출; heap_rec_layout_init 은 assert 후 위임.
+ * 바뀐 것: 추출(이동), 동작 동일 +8줄
+ */
 STATIC_INLINE void
 heap_rec_layout_init_repr (HEAP_REC_LAYOUT * layout, const char *obj, int n_variable, int fixed_length)
 {

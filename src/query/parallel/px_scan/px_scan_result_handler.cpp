@@ -357,6 +357,14 @@ namespace parallel_scan
   }
 
   template <RESULT_TYPE result_type>
+  /*
+   * [리뷰] result_handler<result_type>::gby_list — 배치 GROUP BY 노드가 해시를 포기(abandon)할 때 테이블을 쏟아 넣을 워커의 partial
+   * 리스트(tl.writer_result_p)를 돌려주는 콜백 대상; task::gby_list(px_scan_task.cpp:803)가 qexec_batch_gby_create 에 넘긴다.
+   * develop: develop 에 없음
+   * 이 PR: MERGEABLE_LIST 외 인스턴스는 nullptr — 도달 불가(create 호출은 if constexpr MERGEABLE_LIST && HEAP 안,
+   * px_scan_task.cpp:491-521).
+   * 바뀐 것: 신설 +8줄
+   */
   QFILE_LIST_ID *result_handler<result_type>::gby_list ()
   {
     if constexpr (result_type == RESULT_TYPE::MERGEABLE_LIST)
@@ -367,6 +375,15 @@ namespace parallel_scan
   }
 
   template <RESULT_TYPE result_type>
+  /*
+   * [리뷰] result_handler<result_type>::gby_sync — 배치 노드가 qexec_hash_gby_abandon 으로 state 를 HS_REJECT_ALL 로 바꾼
+   * 직후(query_executor.c:12073-12076, st->sync), 행 경로 write() 가 보는 thread_local tl.agg_hash_state(946) 를 클론 xasl
+   * 의 agg_hash_context->state 로 맞춘다.
+   * develop: develop 에 없음
+   * 이 PR: 락 없음 — tl 은 thread_local(51), xasl 은 워커 클론(287 tl.xasl=curr_xasl), 호출은 워커 자신의 스캔
+   * 루프(qexec_batch_gby_consume) 안이라 단일 스레드.
+   * 바뀐 것: 신설 +10줄
+   */
   void result_handler<result_type>::gby_sync ()
   {
     if constexpr (result_type == RESULT_TYPE::MERGEABLE_LIST)
@@ -379,6 +396,20 @@ namespace parallel_scan
   }
 
   template <RESULT_TYPE result_type>
+  /*
+   * [리뷰] result_handler<result_type>::write_finalize — 워커가 페이지를 다 돈 뒤 task::finalize 가 부른다. MERGEABLE_LIST 면 워커의
+   * 해시 GROUP BY 테이블을 자기 part_list 로 덤프하고 리스트를 닫은 뒤 m_result_mutex 아래서 리더의 hgby_results 에 넣고 active_results 를
+   * 내린다; XASL_SNAPSHOT 이면 리스트 헤더의 vpid/valid/closed 원자 플래그를 올린다.
+   * develop: base c966fabc6 의 360-443: 같은 구조 — write_initialized 조기 반환(366-384), qdata_save_agg_htable_to_list
+   * 실패 시 append 포기(390-397), topn flush, close, 뮤텍스 아래 hgby_results.push_back + active_results-- (432-442).
+   * 이 PR: 뮤텍스 아래 append 블록에 리더의 agg_hash_context 를 꺼내 qdata_key_sketch_merge (leader->key_sketch,
+   * context->key_sketch) 로 이 워커가 본 키 스케치를 합치고, key_sketch_partial |= (워커 partial || state == HS_REJECT_ALL) 로
+   * '스케치가 불완전' 표식을 올린다(456-465).
+   * 바뀐 것: 분기 추가 +10줄(454-466): 리더 컨텍스트 참조·스케치 병합·partial 플래그. 나머지는 develop 그대로. 437-440 의 널 검사 순서는 선재(G3G4-04).
+   * 실패 경로의 part_list_id 는 qexec_clear_xasl → qexec_free_agg_hash_context(query_executor.c:31290-31295) 가 닫고 지운다
+   * — 417 주석대로.
+   * [지적 A53]
+   */
   void result_handler<result_type>::write_finalize (THREAD_ENTRY *thread_p)
   {
     if constexpr (result_type == RESULT_TYPE::MERGEABLE_LIST)

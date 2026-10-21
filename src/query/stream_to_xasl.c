@@ -210,6 +210,16 @@ stx_map_stream_to_xasl_node_header (THREAD_ENTRY * thread_p, xasl_node_header * 
  * Note: the caller is responsible for freeing the memory of
  * xasl_unpack_info_ptr. The free function is free_xasl_unpack_info().
  */
+/*
+ * [리뷰] stx_map_stream_to_xasl — qmgr_process_query / px clone_xasl 이 직렬화된 XASL 스트림을 받아 XASL_NODE 트리와 unpack
+ * info 를 돌려준다
+ * develop: develop(c966fabc6 stream_to_xasl.c:214-291) 과 동일 구조: 루트 노드의 서버 전용 필드(n_oid_list, class_oid_list,
+ * px_executor, memoize_storage …)를 NULL 로 초기화하고 domain plan 을 만든 뒤 visited ptr 와 (실패 시) unpack info 를 해제
+ * 이 PR: 루트의 `rtf`, `rtf_val`(해시조인 런타임 필터) 두 필드를 NULL 로 더 초기화(264-265). 나머지 동일
+ * 바뀐 것: +2줄. xasl==NULL 경로의 free 순서(블록 해제 → stx_free_visited_ptrs 가 해제 블록을 읽음)는 develop 그대로 — G12G13-01 (선재
+ * 결함)
+ * [지적 A50]
+ */
 int
 stx_map_stream_to_xasl (THREAD_ENTRY * thread_p, xasl_node ** xasl_tree, bool use_xasl_clone, char *xasl_stream,
 			int xasl_stream_size, XASL_UNPACK_INFO ** xasl_unpack_info_ptr)
@@ -1795,6 +1805,14 @@ stx_build_xasl_header (THREAD_ENTRY * thread_p, char *ptr, XASL_NODE_HEADER * xa
   return ptr;
 }
 
+/*
+ * [리뷰] stx_build_xasl_node — stx_restore_xasl_node 가 스트림의 한 XASL 노드를 unpack 할 때 필드를 채우고, 직렬화되지 않는 서버 측 필드를
+ * 초기화한다
+ * develop: develop 의 끝부분(2450-2468 상당)이 px_executor·memoize_storage·executed_parallelism 을 NULL/0 으로 둔다
+ * 이 PR: 같은 자리에 `rtf = NULL; rtf_val = NULL;` 추가(2465-2466). 루트는 stx_map_stream_to_xasl 에서 한 번 더 NULL 로 두는데
+ * px_executor 등 기존 필드와 같은 이중 초기화 패턴
+ * 바뀐 것: +2줄
+ */
 static char *
 stx_build_xasl_node (THREAD_ENTRY * thread_p, char *ptr, XASL_NODE * xasl)
 {

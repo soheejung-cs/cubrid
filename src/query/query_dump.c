@@ -3675,6 +3675,16 @@ qdump_print_px_subquery_stats_json (parallel_query_execute::query_executor * px_
  *   return:
  *   xasl_p(in):
  */
+/*
+ * [리뷰] qdump_print_stats_json — qexec_set_xasl_trace_to_session () 이 JSON 포맷 trace 를 만들 때 XASL 노드 하나를
+ * trace_json 객체로 바꾸고 scan_ptr·aptr·dptr 을 재귀한다. 반환값 없음(parent 에 set_new).
+ * develop: c966fabc6 query_dump.c:3679 — GROUPBY 객체는 time / hash(true|partial|false) / sort(+page, ioread) /
+ * rows / readrows 와 PARALLEL GROUPBY 만.
+ * 이 PR: sort 분기 뒤 `groupby_hash_merge_parts > 0` 이면 `hash_merge_partitions` 정수 하나 추가(3895-3899). workers / why
+ * / groups(est.) 는 넣지 않았고 HASHJOIN 은 qdump_print_hashjoin_stats_json () 에 위임하는데 그쪽에 RUNTIME FILTER 출력 없음.
+ * 바뀐 것: 분기 추가 +5줄. text 와 비대칭(G6G7-02).
+ * [지적 A11]
+ */
 void
 qdump_print_stats_json (xasl_node * xasl_p, trace_json_t * parent)
 {
@@ -4416,6 +4426,17 @@ qdump_print_expr_compile_text (FILE * fp, xasl_node * xasl_p, int indent, const 
  *   xasl_p(in):
  *   indent(in):
  */
+/*
+ * [리뷰] qdump_print_stats_text — 같은 진입점의 text 포맷 — 노드 종류별 한 줄 +
+ * FUNC/MEMOIZE/SUBQUERY_CACHE/ANALYTIC/GROUPBY/ORDERBY 줄을 찍고 자식을 재귀한다.
+ * develop: c966fabc6 query_dump.c:4415 — GROUPBY 줄은 time, hash, sort(+page, ioread), readrows, rows. BUILDLIST
+ * 계열 끝의 `#if defined (SERVER_MODE) || defined (SA_MODE)` qdump_print_expr_compile_text () 호출(base 4459)도 이미
+ * 있었다(이 PR 변경 아님, 정의부 4269 도 같은 가드 — CS 빌드엔 호출·정의 둘 다 빠지므로 INV-3 위반 아님).
+ * 이 PR: GROUPBY 줄에 `hash merge partitions: N` + `(workers: M)` 또는 `(workers: none, <why>)`, 그리고 `groups
+ * (est.): K` 추가(4651-4666). why 는 qexec_gby_px_reader_make () 의 문자열 리터럴(query_executor.c:6405-6501)이라 수명 문제
+ * 없음.
+ * 바뀐 것: 출력 분기 +16줄. HASHJOIN 줄의 `%ld`(4512)는 base 동일.
+ */
 void
 qdump_print_stats_text (FILE * fp, xasl_node * xasl_p, int indent)
 {
@@ -4762,6 +4783,18 @@ qdump_hashjoin_type_string (HASH_METHOD hash_method)
     }
 }
 
+/*
+ * [리뷰] qdump_print_hashjoin_stats_text — qdump_print_stats_text () 의 HASHJOIN_PROC case 가 부르는 static 헬퍼 —
+ * BUILD/PROBE(또는 SPLIT/PARALLEL/파티션) 줄과 입력 서브쿼리를 찍는다. 비파티션·px 없음일 때 build/probe 자식의 xasl_stats 를 stats 에 더하는
+ * 부작용은 base 동일.
+ * develop: c966fabc6 query_dump.c:4745 — 런타임 필터 줄 없음. PARALLEL_PROBE 를 허용하는 assert(4801·4903)는 base 에도 있음.
+ * 이 PR: `proc->rtf_keys > 0` 이면 BUILD/PROBE 와 같은 들여쓰기(indent+2)로 `RUNTIME FILTER (keys, rows, dropped)` 를 맨 앞에
+ * 찍는다(4792-4797). hash_method_str[24] 의 snprintf 누적은 qdump_hashjoin_type_string () 의 네
+ * 문자열(memory/hybrid/file/skip, 합 23자)로 잘림 불가 — base 동일.
+ * 바뀐 것: 출력 분기 +7줄. keys 0 필터 숨김(G6G7-03), 에러 경로 rows 0(G6G7-04).
+ * [지적 A25]
+ * [지적 A26]
+ */
 static void
 qdump_print_hashjoin_stats_text (FILE * fp, xasl_node * xasl_p, int indent)
 {

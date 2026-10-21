@@ -42,6 +42,13 @@ namespace parallel_scan
       /* the next slot walked is the one after this one (0: the page's first) */
       void resume_after (PGSLOTID slot);
       SCAN_CODE next_qualified_slot_with_peek (THREAD_ENTRY *thread_p);
+      /*
+       * [리뷰] slot_iterator::vpid — set_page 가 기억한 현재 페이지의 VPID 를 돌려준다. drain_slot_oids 가 scan_batch_collect_chunk 에
+       * 넘길 페이지로 쓴다.
+       * develop: develop 에 없음
+       * 이 PR: 신설 const 접근자 4줄.
+       * 바뀐 것: 신설
+       */
       const VPID *vpid () const
       {
 	return &m_vpid;

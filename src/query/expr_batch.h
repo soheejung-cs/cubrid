@@ -68,6 +68,13 @@ struct heap_page_row;
 struct heap_rec_layout;
 struct access_spec_node;
 struct val_descr;
+/*
+ * [리뷰] expr_batch.h forward decl aggregate_list_node — cubxasl::aggregate_list_node 전방 선언(xasl_aggregate.hpp 를
+ * 헤더에서 끌지 않기 위해)
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: cubxasl::aggregate_list_node 전방 선언(xasl_aggregate.hpp 를 헤더에서 끌지 않기 위해)
+ * 바뀐 것: 신설 +4줄
+ */
 namespace cubxasl
 {
   struct aggregate_list_node;

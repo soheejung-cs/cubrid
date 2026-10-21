@@ -3467,6 +3467,18 @@ eval_disable_lazy_read (HEAP_CACHE_ATTRINFO * attr_cache)
  * before its first page, for the same reason the operand program is settled there: the
  * batch reads the compiled form, so it must be the one this execution would use.
  */
+/*
+ * [리뷰] eval_data_filter_ensure_prog — FILTER_INFO 의 pred_expr 에 이 실행용 컴파일 술어(scan_prog)를 준비한다 — 바인드 서명이 바뀌었으면
+ * free 후 재컴파일, 거절(state 2)이면 손대지 않는다. eval_data_filter () 의 unlikely 블록과 scan_batch_open_internal ()
+ * (scan_manager.c:8233, 배치가 첫 페이지 전에 컴파일된 형태를 잡아야 해서)이 부른다. 항상 NO_ERROR.
+ * develop: develop 에 없음 — 같은 본문이 c966fabc6 query_evaluator.c:3520-3535 에 eval_data_filter () 안에 인라인으로 있었다.
+ * 이 PR: 그 본문을 그대로 추출 + NULL 가드(scan_pred/pr_eval_fnc/pred_expr). scan_prog_gen++ 는 실패(state 2)에도 증가하지만
+ * 소비자(expr_compile.c:7042-7043)는 state == 1 을 함께 보므로 무해. expr_scan_pred_free () 는 NULL
+ * 안전(expr_compile.c:3368-3372).
+ * 바뀐 것: 신설 +29줄(추출). 반환형 int 는 형식뿐(G6G7-05).
+ * [지적 A19]
+ * [지적 A36]
+ */
 int
 eval_data_filter_ensure_prog (THREAD_ENTRY * thread_p, FILTER_INFO * filterp)
 {
@@ -3497,6 +3509,17 @@ eval_data_filter_ensure_prog (THREAD_ENTRY * thread_p, FILTER_INFO * filterp)
   return NO_ERROR;
 }
 
+/*
+ * [리뷰] eval_data_filter — 힙 레코드 하나에 데이터 필터를 평가한다(lazy 속성 읽기 → 컴파일 술어 또는 pr_eval_fnc → 통과 시 regu_list fetch). 행
+ * 경로 호출자: px slot iterator, scan_next_class_attr_scan, 배치가 거절한 힙스캔.
+ * develop: c966fabc6 query_evaluator.c:3460 — 3520-3535 에 `state == 1 && !sig_ok` 면 free, `state == 0` 이면
+ * compile 이 인라인. state 2 는 비교 2회로 통과.
+ * 이 PR: 두 조건을 `unlikely (state != 1 || !sig_ok)` 하나로 합쳐 ensure_prog 호출(3561-3567). state 2 에서 매 행 호출이
+ * 생김(G6G7-01). lazy 읽기·class attr scan 의 oid NULL 전달·compiled 경로의 eval_pred 위임(expr_compile.c:3247-3340 가
+ * ctx->obj_oid 를 그대로 넘김)은 base 동일.
+ * 바뀐 것: 분기 -14/+5줄.
+ * [지적 A19]
+ */
 DB_LOGICAL
 eval_data_filter (THREAD_ENTRY * thread_p, OID * oid, RECDES * recdesp, HEAP_SCANCACHE * scan_cache,
 		  FILTER_INFO * filterp)

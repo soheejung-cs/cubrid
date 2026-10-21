@@ -8192,6 +8192,22 @@ heap_next_1page (THREAD_ENTRY * thread_p, const HFID * hfid, const VPID * vpid, 
  * snapshot (its visible version is in the log) -- hands the whole page back, so the page
  * stays fixed and every row points into it.
  */
+/*
+ * [리뷰] heap_page_collect_visible — scan_batch_collect_chunk(직렬·병렬 워커 공통)가 한 페이지의 가시 REC_HOME 레코드를 cap 개씩 PEEK
+ * 로 rows[] 에 모을 때 부른다. S_SUCCESS(cap 찼음, *slot 갱신)/S_END(페이지 끝, *n_rows 갱신)/S_DOESNT_FIT(REC_HOME 아님 또는
+ * TOO_NEW: 모은 것을 버리고 chunk 시작부터 행 경로)/S_ERROR
+ * develop: develop 에 없음. 대응 코드는 heap_next_internal 의 slot walk(7760-7780 의 헤더·NEWHOME·ASSIGN_ADDRESS·UNKNOWN
+ * skip)와 heap_scan_get_visible_version 의 REC_HOME shortcut(26420-26455), ROOTOID skip(7904-7912)
+ * 이 PR: 같은 skip 규칙·같은 snapshot_fnc 판정을 한 페이지 안에서 반복. 래치는 scan_cache->page_watcher 에 남기고 모든 반환 경로에서 해제하지
+ * 않는다(호출자 책임: scan_batch_iter_next 8714, scan_batch_rows_consume 8452, scan_batch_next_page 8340/8380/8390,
+ * scan_batch_rewind 8738, scan_end_scan 5492-5497). 자체 fix(8216, OLD_PAGE)는 watcher 가 비었을 때만 — 직렬 호출자는 항상
+ * OLD_PAGE_PREVENT_DEALLOC 으로 먼저 fix 해 둔다(8342, 8645, 8689). 매 chunk 마다 heap_page_is_bestspace(슬롯 0 읽기)를 다시 본다
+ * 바뀐 것: 신설 +105줄. 그래프의 fix-unfix=-1 은 설계(호출자 해제)
+ * [지적 A10]
+ * [지적 A42]
+ * [지적 A43]
+ * [지적 A49]
+ */
 SCAN_CODE
 heap_page_collect_visible (THREAD_ENTRY * thread_p, const VPID * vpid, const OID * class_oid,
 			   HEAP_SCANCACHE * scan_cache, PGSLOTID * slot, HEAP_PAGE_ROW * rows, int cap, int *n_rows)
@@ -10929,6 +10945,14 @@ heap_attrinfo_clear_dbvalues (HEAP_CACHE_ATTRINFO * attr_info)
 
 /* HEAP_REC_LAYOUT (heap_attrinfo.h): what the record header says about where attributes
  * live, derived once per record instead of once per attribute. */
+/*
+ * [리뷰] heap_rec_layout_init — heap_attrinfo_read_dbvalues 계열이 한 레코드의 가변 테이블·고정 영역·bound bit 위치를 한 번 계산할 때 부른다
+ * develop: develop(c966fabc6 heap_file.c:10804-10820) 은 같은 assert 뒤에
+ * offset_size·var_table·fixed_base·bound_bits 를 함수 안에서 직접 계산
+ * 이 PR: 계산 본체를 heap_attrinfo.h 의 inline heap_rec_layout_init_repr(layout, obj, n_variable, fixed_length) 로
+ * 뽑아내고 여기서는 read_classrepr 의 상수를 넘겨 호출. 배치가 attr cache 없이 같은 계산을 쓰기 위한 추출
+ * 바뀐 것: 본체 추출 -8/+2줄. assert(read_classrepr != NULL) 는 그대로(호출자 recache 전제, develop 동일)
+ */
 STATIC_INLINE void
 heap_rec_layout_init (HEAP_REC_LAYOUT * layout, const RECDES * recdes, const HEAP_CACHE_ATTRINFO * attr_info)
 {
@@ -10952,6 +10976,15 @@ heap_rec_layout_init (HEAP_REC_LAYOUT * layout, const RECDES * recdes, const HEA
  * the fixed area at location, or the variable area through the offset table at location.
  * Only the types the batch decodes qualify -- the fixed-width numbers and dates, and
  * NUMERIC, which is a variable attribute today (see heap_attrvalue_resolve_plan ()).
+ */
+/*
+ * [리뷰] heap_attrinfo_raw_locator — expr_batch.c eb_new_col_vec 이 한 속성을 레코드 바이트에서 직접 디코딩할 수 있는지 묻고, 가능하면
+ * repid·위치·타입·precision/scale·collation/codeset 을 HEAP_RAW_LOCATOR 로 받는다. ER_FAILED 는 '능력 없음'(에러 미설정)
+ * develop: develop 에 없음
+ * 이 PR: 허용 타입: SHORT/INT/BIGINT/FLOAT/DOUBLE/DATE 는 고정 영역만, NUMERIC·VARCHAR·CHAR 는 가변 영역만. is_fixed 는 클래스 표현에서
+ * 고정 영역 순번(i < n_fixed)으로 정해지므로(object_representation_sr.c:2525-2535) CHAR(n) 이 고정 영역에 놓이는 표현이면 ER_FAILED →
+ * 배치가 그 컬럼을 거절(안전 쪽). 호출자는 last_classrepr 의 repid 를 각 레코드의 repid 와 비교해 다른 표현은 행 경로로 보낸다(expr_batch.c 673-690)
+ * 바뀐 것: 신설 +57줄
  */
 int
 heap_attrinfo_raw_locator (HEAP_CACHE_ATTRINFO * attr_info, ATTR_ID attrid, HEAP_RAW_LOCATOR * out)
@@ -11022,6 +11055,14 @@ heap_attrinfo_raw_locator (HEAP_CACHE_ATTRINFO * attr_info, ATTR_ID attrid, HEAP
  *
  * For a reader that only compares a record's bytes with another record's (a page batch's GROUP BY key cache):
  * equal bytes decode to equal values, whatever the type, so no decoding rule is needed here.
+ */
+/*
+ * [리뷰] heap_attrinfo_raw_key_locator — expr_batch.c eb_build_gby(2371) 가 GROUP BY 키 컬럼의 바이트 위치와 고정
+ * 크기(tp_domain_disk_size)를 받는다 — 값을 디코딩하지 않고 바이트 동일성만 비교하는 키 캐시용
+ * develop: develop 에 없음
+ * 이 PR: 타입 화이트리스트 없음, collation/codeset 미기입(호출자는 is_fixed/location/position/size 만 읽음: 2385-2388). 고정형인데
+ * disk_size<=0(floating precision CHAR/BIT) 이면 ER_FAILED
+ * 바뀐 것: 신설 +26줄
  */
 int
 heap_attrinfo_raw_key_locator (HEAP_CACHE_ATTRINFO * attr_info, ATTR_ID attrid, HEAP_RAW_LOCATOR * out, int *disk_size)

@@ -5991,6 +5991,15 @@ db_string_fix_string_size (DB_VALUE * src_string)
  *			codeset and collation (the page batch's LIKE leaf runs it on record bytes)
  *   return: V_TRUE, V_FALSE or V_ERROR
  */
+/*
+ * [리뷰] qstr_like_match — expr_batch.c eb_raw_kid_str 이 레코드 바이트 위에서 LIKE 를 판정할 때 부르는 공개 래퍼. static
+ * qstr_eval_like 를 escape=NULL 로 호출해 V_TRUE/V_FALSE/V_ERROR 를 돌려준다
+ * develop: develop 에 없음(qstr_eval_like 는 static 이라 db_string_like 만 썼다)
+ * 이 PR: ESCAPE 없는 LIKE 전용. 호출 전제: expr_pred_term_string_info(expr_compile.c:3934) 가 `lk->esc_char != NULL` 이면
+ * 배치 리프를 만들지 않고, eb_like_pattern_ok(expr_batch.c:978-991) 가 '_' 와 '\\' 가 든 패턴을 거절하므로 escape=NULL 이 행 경로와 같은
+ * 판정이 된다
+ * 바뀐 것: 신설 +6줄(래퍼)
+ */
 int
 qstr_like_match (const char *tar, int tar_length, const char *pattern, int pattern_length, INTL_CODESET codeset,
 		 int coll_id)

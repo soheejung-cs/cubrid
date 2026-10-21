@@ -91,6 +91,15 @@ namespace parallel_scan
     return NO_ERROR;
   }
 
+  /*
+   * [리뷰] slot_iterator::resume_after — drain_slot_oids 가 배치에서 행 경로로 떨어질 때 부른다. m_cur_oid 를 (m_vpid, slot) 로 두어
+   * 다음 next_qualified_slot_with_peek 가 heap_next_1page 로 slot+1 부터 걷게 한다(slot 0 이면 OID NULL = 페이지 첫 슬롯).
+   * develop: develop 에 없음
+   * 이 PR: 신설 10줄. heap_page_collect_visible 의 *slot('마지막으로 모은 슬롯') 규약과 맞물려 chunk_start 를 넘기면 폴백 청크의 첫 행부터 다시 걷는다
+   * — 직렬의 scan_batch_page_rowmode (s_id, true, chunk_start) 와 같은 규약(scan_manager.c:8764-8776).
+   * 바뀐 것: 신설
+   * [지적 A49]
+   */
   void slot_iterator::resume_after (PGSLOTID slot)
   {
     OID_SET_NULL (&m_cur_oid);

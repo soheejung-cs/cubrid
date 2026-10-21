@@ -44,6 +44,15 @@ namespace parallel_scan
       using input_handler_t = typename scan_traits<ST>::input_handler_type;
       using slot_iterator_t = typename scan_traits<ST>::slot_iterator_type;
     public:
+      /*
+       * [리뷰] task::task — px 스캔 워커 task 의 생성자 — 리더가 넘긴 핸들러·XASL id·스캔 옵션을 멤버에 담는다(실행은 execute/initialize).
+       * develop: develop(c966fabc6 px_scan_task.hpp 47-85): 같은 인자 목록, 멤버 초기화에 m_batch_gby/m_batch_rows/m_drain_stop
+       * 없음.
+       * 이 PR: m_scan_func_ptr 와 m_pre_execution_info 사이에
+       * m_batch_gby(nullptr)·m_batch_rows(false)·m_drain_stop(nullptr) 초기화 3줄 추가. 멤버 선언 순서(hpp 116-118)와 일치해
+       * -Wreorder 없음.
+       * 바뀐 것: 초기화 목록 +3줄, 시그니처 동일
+       */
       task (THREAD_ENTRY *parent_thread_p, QMGR_QUERY_ENTRY *query_entry, result_handler<result_type> *result_handler,
 	    input_handler_t *input_handler,
 	    interrupt *interrupt, err_messages_with_lock *err_messages, val_descr *vd, trace_handler *trace_handler,

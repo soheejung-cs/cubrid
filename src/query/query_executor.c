@@ -2291,6 +2291,16 @@ qexec_clear_agg_list (THREAD_ENTRY * thread_p, XASL_NODE * xasl_p, AGGREGATE_TYP
  * and return the number of total pages deallocated.
  */
 int
+/*
+ * [리뷰] qexec_clear_xasl — XASL 노드 하나를 재귀적으로 정리한다. 호출자는 qexec_execute_query, qmgr_process_query,
+ * xcache_clone_decache, px task finalize 다. 해제한 페이지 수 pg_cnt 를 돌려준다.
+ * develop: base 2287: px_executor delete·clear_memoize_storage 뒤 바로 executed_parallelism=0. hjoin_rtf_release
+ * 호출 없음.
+ * 이 PR: 2334-2337: HASHJOIN_PROC 이면 hjoin_rtf_release(xasl) — 런타임 필터(slots/used/rtf)를 free 하고 outer/inner 스캔
+ * xasl 의 rtf 포인터를 끊는다(query_hash_join.c:5032-5059, rtf==NULL 이면 즉시 반환이라 멱등). is_final 과 무관하게 매 정리마다 — 필터는 실행마다
+ * 다시 만든다.
+ * 바뀐 것: 분기 추가 +4줄(diff 로 확인)
+ */
 qexec_clear_xasl (THREAD_ENTRY * thread_p, xasl_node * xasl, bool is_final, bool for_parallel_aptr)
 {
   int pg_cnt;
@@ -4724,6 +4734,18 @@ qexec_hash_gby_abandon_cutoff (int tuple_count)
  *   groupby_list(in): listfile containing tuples for sort-based aggregation
  *   output_tuple(out): set if tuple should be output to list file
  */
+/*
+ * [리뷰] qexec_hash_gby_agg_tuple — 해시 GROUP BY 에서 튜플 하나를 해시표에 반영한다. qexec_end_one_iteration 과 px result_handler
+ * 의 _public 래퍼가 부른다. 출력 여부는 *output_tuple 로 돌려준다.
+ * develop: base 4714-5009: 새 그룹은 항상 qdata_copy_agg_hkey + qdata_alloc_agg_hvalue + db_private_alloc 튜플(개별 할당).
+ * 예산 초과 포기 블록(4891-4906, `(int) mem_limit`)·LRU 루프·선택도 포기 블록(4913-4936)이 인라인.
+ * 이 PR: 4772 키 스케치(HLL) 갱신, 4776-4810 슬랩 경로(g_output_first_tuple 아닐 때 한 블록에 key/value/튜플), 4802·4864
+ * qfile_slot_set_tuple_ptr_and_layout, 4741-4746 REJECT_ALL 시 key_sketch_partial=true, 5008-5015 선택도 포기를
+ * helper 로.
+ * 바뀐 것: 분기·자료구조 추가(슬랩·스케치), 선택도 포기 추출. 약 +45/-20줄
+ * [지적 A16]
+ * [지적 A54]
+ */
 static int
 qexec_hash_gby_agg_tuple (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
 			  BUILDLIST_PROC_NODE * proc, QFILE_TUPLE_RECORD * tplrec, QFILE_TUPLE_DESCRIPTOR * tpldesc,
@@ -5044,6 +5066,13 @@ qexec_hash_gby_agg_tuple (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE 
  * toward the compression break-even (0.5) as the evidence accumulates.  A page batch (qexec_batch_gby_consume ())
  * asks the same question at the same tuples.
  */
+/*
+ * [리뷰] qexec_hash_gby_selectivity_abandons — 해시 집계를 포기할지 판정하는 순수 술어다. qexec_hash_gby_agg_tuple 과
+ * qexec_batch_gby_flush 가 부른다.
+ * develop: base 4913-4916 인라인 조건(state·threshold·배수·unique_ratio > cutoff).
+ * 이 PR: TUPLE_THRESHOLD 의 배수마다 group_count/tuple_count 를 튜플 수에 따라 줄어드는 cutoff 와 비교한다.
+ * 바뀐 것: 추출 7줄
+ */
 static bool
 qexec_hash_gby_selectivity_abandons (AGGREGATE_HASH_STATE state, int group_count, int tuple_count)
 {
@@ -5055,6 +5084,14 @@ qexec_hash_gby_selectivity_abandons (AGGREGATE_HASH_STATE state, int group_count
 /*
  * qexec_hash_gby_abandon () - stop hashing: dump the table to the partial list, every later tuple to the sort
  *   return: error code or NO_ERROR
+ */
+/*
+ * [리뷰] qexec_hash_gby_abandon — state=HS_REJECT_ALL 로 두고 해시표를 list file 로 덤프한다. qexec_hash_gby_agg_tuple 과
+ * qexec_batch_gby_flush 가 부른다.
+ * develop: base 4919-4929 인라인(state=HS_REJECT_ALL + qdata_save_agg_htable_to_list).
+ * 이 PR: qdata_save_agg_htable_to_list 를 호출하고 그 반환값을 돌려준다.
+ * 바뀐 것: 추출 9줄
+ * [지적 A54]
  */
 static int
 qexec_hash_gby_abandon (THREAD_ENTRY * thread_p, AGGREGATE_HASH_CONTEXT * context, QFILE_LIST_ID * groupby_list)
@@ -5593,6 +5630,14 @@ typedef enum
 } QEXEC_GBY_MERGE_RESULT;
 
 /* does the order of the groups reach the block's result (and so their sort)? */
+/*
+ * [리뷰] qexec_gby_order_reaches_result — GROUP BY 해시 병합 결과의 순서가 최종 결과에 영향을 주는지 판정한다. qexec_gby_hash_merge 가
+ * 부른다.
+ * develop: develop 에 없음 (base 의 GROUP BY 마무리는 qexec_groupby 5499 의 정렬 경로뿐)
+ * 이 PR: PRM_ID_AGG_HASH_RESPECT_ORDER 가 꺼져 있으면 false. DISTINCT 이고 ORDER BY·분석함수·GROUP BY
+ * NUM·INST_NUM·ORDERBY_NUM·LIMIT 이 없으면 false, 그 외 true.
+ * 바뀐 것: 신설 19줄
+ */
 static bool
 qexec_gby_order_reaches_result (const XASL_NODE * xasl)
 {
@@ -5614,6 +5659,12 @@ qexec_gby_order_reaches_result (const XASL_NODE * xasl)
 }
 
 /* the partition of a key: its hash, mixed again so that it does not follow the tables' own buckets */
+/*
+ * [리뷰] qexec_gby_merge_part_of — 키 해시를 n_parts 개 파티션 중 하나로 대응시킨다. merge_split_list 와 px split_list 가 부른다.
+ * develop: develop 에 없음 (base 의 GROUP BY 마무리는 qexec_groupby 5499 의 정렬 경로뿐)
+ * 이 PR: murmur 류 믹스 후 ((UINT64) h * n_parts) >> 32.
+ * 바뀐 것: 신설 12줄
+ */
 static int
 qexec_gby_merge_part_of (AGGREGATE_HASH_KEY * key, int n_parts)
 {
@@ -5629,6 +5680,13 @@ qexec_gby_merge_part_of (AGGREGATE_HASH_KEY * key, int n_parts)
 
 /* a new list with the layout of another; a partial list's also gets the tuple descriptor its entries are saved
  * through (qdata_save_agg_hentry_to_list ()) */
+/*
+ * [리뷰] qexec_gby_merge_open_list — 다른 리스트와 같은 타입·backward 플래그의 쓰기 리스트를 연다. 선택적으로 tpl_descr 값을 할당한다. 실패 시 NULL
+ * 을 돌려준다.
+ * develop: develop 에 없음 (base 의 GROUP BY 마무리는 qexec_groupby 5499 의 정렬 경로뿐)
+ * 이 PR: qfile_open_list 후 with_descr 이면 qfile_tpl_descr_alloc_values 를 하고, 실패하면 close/destroy/free 한다.
+ * 바뀐 것: 신설 19줄
+ */
 static QFILE_LIST_ID *
 qexec_gby_merge_open_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * like, QUERY_ID query_id, bool with_descr)
 {
@@ -5649,6 +5707,12 @@ qexec_gby_merge_open_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * like, QUERY_
   return list;
 }
 
+/*
+ * [리뷰] qexec_gby_merge_free_list — 리스트를 닫고 파괴한 뒤 포인터를 비운다. px_merge 정리부에서 쓴다.
+ * develop: develop 에 없음 (base 의 GROUP BY 마무리는 qexec_groupby 5499 의 정렬 경로뿐)
+ * 이 PR: close, destroy, QFILE_FREE_AND_INIT_LIST_ID 순서로 한다.
+ * 바뀐 것: 신설 10줄
+ */
 static void
 qexec_gby_merge_free_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID ** list)
 {
@@ -5676,6 +5740,12 @@ struct qexec_gby_arena
   size_t last_size;		/* the last block's size */
 };
 
+/*
+ * [리뷰] qexec_gby_arena_alloc — 블록 목록으로 범프 할당하는 아레나다. 어디서 부르냐면 mtable_add. 정렬된 n 바이트 포인터나 NULL 을 돌려준다.
+ * develop: develop 에 없음 (base 의 GROUP BY 마무리는 qexec_groupby 5499 의 정렬 경로뿐)
+ * 이 PR: 블록이 없거나 부족하면 max(n, QEXEC_GBY_ARENA_BLOCK) 크기 블록을 malloc 하고 blocks 배열을 realloc 한다.
+ * 바뀐 것: 신설 37줄
+ */
 static void *
 qexec_gby_arena_alloc (QEXEC_GBY_ARENA * a, size_t n)
 {
@@ -5715,6 +5785,12 @@ qexec_gby_arena_alloc (QEXEC_GBY_ARENA * a, size_t n)
 }
 
 /* back to empty, the first block kept */
+/*
+ * [리뷰] qexec_gby_arena_rewind — 첫 블록만 남기고 나머지를 해제해 아레나를 재사용 상태로 되돌린다.
+ * develop: develop 에 없음 (base 의 GROUP BY 마무리는 qexec_groupby 5499 의 정렬 경로뿐)
+ * 이 PR: i>=1 블록 free, n_blocks=min(n_blocks,1), used=0, last_size 재설정.
+ * 바뀐 것: 신설 13줄
+ */
 static void
 qexec_gby_arena_rewind (QEXEC_GBY_ARENA * a)
 {
@@ -5729,6 +5805,12 @@ qexec_gby_arena_rewind (QEXEC_GBY_ARENA * a)
   a->last_size = (a->n_blocks == 1) ? (size_t) QEXEC_GBY_ARENA_BLOCK : 0;
 }
 
+/*
+ * [리뷰] qexec_gby_arena_free — 아레나의 모든 블록과 블록 배열을 해제한다.
+ * develop: develop 에 없음 (base 의 GROUP BY 마무리는 qexec_groupby 5499 의 정렬 경로뿐)
+ * 이 PR: 블록 free, blocks free, memset 0.
+ * 바뀐 것: 신설 12줄
+ */
 static void
 qexec_gby_arena_free (QEXEC_GBY_ARENA * a)
 {
@@ -5761,6 +5843,12 @@ struct qexec_gby_mtable
   int n_funcs;
 };
 
+/*
+ * [리뷰] qexec_gby_mtable_hash — 병합 테이블 슬롯 위치용 해시. 파티션 해시와 다른 믹스를 쓴다.
+ * develop: develop 에 없음 (base 의 GROUP BY 마무리는 qexec_groupby 5499 의 정렬 경로뿐)
+ * 이 PR: qdata_hash_agg_hkey 에 다른 상수로 믹스한다.
+ * 바뀐 것: 신설 13줄
+ */
 static unsigned int
 qexec_gby_mtable_hash (AGGREGATE_HASH_KEY * key)
 {
@@ -5775,6 +5863,12 @@ qexec_gby_mtable_hash (AGGREGATE_HASH_KEY * key)
   return h;
 }
 
+/*
+ * [리뷰] qexec_gby_mtable_init — 개방 주소법 해시 테이블을 1024 슬롯으로 초기화한다.
+ * develop: develop 에 없음 (base 의 GROUP BY 마무리는 qexec_groupby 5499 의 정렬 경로뿐)
+ * 이 PR: calloc 실패 시 ER_OUT_OF_VIRTUAL_MEMORY 를 돌려준다.
+ * 바뀐 것: 신설 15줄
+ */
 static int
 qexec_gby_mtable_init (QEXEC_GBY_MTABLE * t, int n_keys, int n_funcs)
 {
@@ -5791,6 +5885,12 @@ qexec_gby_mtable_init (QEXEC_GBY_MTABLE * t, int n_keys, int n_funcs)
   return NO_ERROR;
 }
 
+/*
+ * [리뷰] qexec_gby_mtable_find — 선형 탐사로 키가 있는 슬롯이나 처음 만난 빈 슬롯을 돌려준다.
+ * develop: develop 에 없음 (base 의 GROUP BY 마무리는 qexec_groupby 5499 의 정렬 경로뿐)
+ * 이 PR: 해시와 qdata_agg_hkey_eq 로 비교한다. 적재율은 add 가 절반 이하로 유지한다.
+ * 바뀐 것: 신설 15줄
+ */
 static QEXEC_GBY_SLOT *
 qexec_gby_mtable_find (QEXEC_GBY_MTABLE * t, AGGREGATE_HASH_KEY * key, unsigned int h)
 {
@@ -5807,6 +5907,12 @@ qexec_gby_mtable_find (QEXEC_GBY_MTABLE * t, AGGREGATE_HASH_KEY * key, unsigned 
     }
 }
 
+/*
+ * [리뷰] qexec_gby_mtable_grow — 슬롯 배열을 2배로 키우고 재삽입한다.
+ * develop: develop 에 없음 (base 의 GROUP BY 마무리는 qexec_groupby 5499 의 정렬 경로뿐)
+ * 이 PR: calloc 실패 시 ER_OUT_OF_VIRTUAL_MEMORY. 옛 슬롯의 key 포인터를 새 배열로 옮기고 옛 배열을 free 한다.
+ * 바뀐 것: 신설 25줄
+ */
 static int
 qexec_gby_mtable_grow (QEXEC_GBY_MTABLE * t)
 {
@@ -5834,6 +5940,12 @@ qexec_gby_mtable_grow (QEXEC_GBY_MTABLE * t)
 }
 
 /* empty again: the values that hold memory of their own cleared, the arena rewound */
+/*
+ * [리뷰] qexec_gby_mtable_rewind — 모든 슬롯의 키·누적값을 pr_clear_value 하고 count=0, arena rewind 한다. 테이블 용량은 유지된다.
+ * develop: develop 에 없음 (base 의 GROUP BY 마무리는 qexec_groupby 5499 의 정렬 경로뿐)
+ * 이 PR: 슬롯 전체를 순회한다.
+ * 바뀐 것: 신설 28줄
+ */
 static void
 qexec_gby_mtable_rewind (QEXEC_GBY_MTABLE * t)
 {
@@ -5863,6 +5975,12 @@ qexec_gby_mtable_rewind (QEXEC_GBY_MTABLE * t)
   qexec_gby_arena_rewind (&t->arena);
 }
 
+/*
+ * [리뷰] qexec_gby_mtable_free — mtable 을 완전히 해제한다.
+ * develop: develop 에 없음 (base 의 GROUP BY 마무리는 qexec_groupby 5499 의 정렬 경로뿐)
+ * 이 PR: rewind, slots free, arena free, memset.
+ * 바뀐 것: 신설 11줄
+ */
 static void
 qexec_gby_mtable_free (QEXEC_GBY_MTABLE * t)
 {
@@ -5892,6 +6010,12 @@ struct qexec_gby_reader
   bool first_aggregated;	/* a new group's first tuple is aggregated at once (a worker's groups go out finished) */
 };
 
+/*
+ * [리뷰] qexec_gby_reader_init — GROUPBY_STATE 에서 병합 리더(regu 목록·집계 템플릿·임시 키)를 채운다.
+ * develop: develop 에 없음 (base 의 GROUP BY 마무리는 qexec_groupby 5499 의 정렬 경로뿐)
+ * 이 PR: first_aggregated=false 로 둔다.
+ * 바뀐 것: 신설 16줄
+ */
 static void
 qexec_gby_reader_init (GROUPBY_STATE * gbstate, QEXEC_GBY_READER * rd)
 {
@@ -5912,6 +6036,13 @@ qexec_gby_reader_init (GROUPBY_STATE * gbstate, QEXEC_GBY_READER * rd)
 /* a new group in slot s: the row's tuple copied into the arena as its first tuple, its key read from that copy
  * (the row's values fetched from it: a key that points into the row points into the copy), the value set up as
  * qdata_alloc_agg_hvalue () sets it up */
+/*
+ * [리뷰] qexec_gby_mtable_add — 새 그룹을 아레나 한 덩어리(튜플 사본·key·value·누적값)로 만들고 슬롯에 넣는다. 필요하면 grow 한다.
+ * develop: develop 에 없음 (base 의 GROUP BY 마무리는 qexec_groupby 5499 의 정렬 경로뿐)
+ * 이 PR: 첫 튜플 사본에서 키를 다시 읽는다. DB_NEED_CLEAR 이면 pr_clone_value, 아니면 얕은 복사한다. COUNT 계열만 BIGINT 0 으로 시작한다.
+ * 바뀐 것: 신설 95줄
+ * [지적 A23]
+ */
 static int
 qexec_gby_mtable_add (THREAD_ENTRY * thread_p, QEXEC_GBY_READER * rd, QEXEC_GBY_MTABLE * t, QEXEC_GBY_SLOT * s,
 		      unsigned int h, QFILE_TUPLE tpl, const QFILE_TUPLE_VALUE_TYPE_LIST * layout,
@@ -6013,6 +6144,14 @@ qexec_gby_mtable_add (THREAD_ENTRY * thread_p, QEXEC_GBY_READER * rd, QEXEC_GBY_
  * repeats no key has about as many groups as rows. */
 #define QEXEC_GBY_SAMPLE_ROWS (65536)
 
+/*
+ * [리뷰] qexec_gby_merge_sample_groups — 리스트 앞부분 QEXEC_GBY_SAMPLE_ROWS 행을 해시로 세어 그룹 수를 추정한다(Chao1 변형). 병합 방식을
+ * 고르는 입력이다.
+ * develop: develop 에 없음 (base 의 GROUP BY 마무리는 qexec_groupby 5499 의 정렬 경로뿐)
+ * 이 PR: *groups 에 d 또는 min(d + f1(f1-1)/(2(f2+1)), tuple_cnt)를 쓴다.
+ * 바뀐 것: 신설 58줄
+ * [지적 A21]
+ */
 static int
 qexec_gby_merge_sample_groups (THREAD_ENTRY * thread_p, GROUPBY_STATE * gbstate, QFILE_LIST_ID * rows, double *groups)
 {
@@ -6076,6 +6215,12 @@ qexec_gby_merge_sample_groups (THREAD_ENTRY * thread_p, GROUPBY_STATE * gbstate,
  * the group is written out, as the table's own first tuples are -- or at once, rd->first_aggregated), any other
  * row is aggregated into its group.  layout: the unsorted list's, which outlives the partition the first tuples are
  * read back after */
+/*
+ * [리뷰] qexec_gby_merge_rows — 행 리스트를 읽어 mtable 에 그룹별로 집계한다.
+ * develop: develop 에 없음 (base 의 GROUP BY 마무리는 qexec_groupby 5499 의 정렬 경로뿐)
+ * 이 PR: first_aggregated 가 false 면 새 그룹의 첫 행은 집계하지 않고 넘어간다.
+ * 바뀐 것: 신설 69줄
+ */
 static int
 qexec_gby_merge_rows (THREAD_ENTRY * thread_p, QEXEC_GBY_READER * rd, QEXEC_GBY_MTABLE * t, QFILE_LIST_ID * rows,
 		      const QFILE_TUPLE_VALUE_TYPE_LIST * layout)
@@ -6147,6 +6292,12 @@ qexec_gby_merge_rows (THREAD_ENTRY * thread_p, QEXEC_GBY_READER * rd, QEXEC_GBY_
 }
 
 /* the partial entries of a partition into the groups their first tuples made */
+/*
+ * [리뷰] qexec_gby_merge_partials — partial 항목 리스트를 읽어 mtable 의 누적값에 accumulator_to_accumulator 로 합친다.
+ * develop: develop 에 없음 (base 의 GROUP BY 마무리는 qexec_groupby 5499 의 정렬 경로뿐)
+ * 이 PR: 매칭 그룹이 없으면 ER_GENERIC_ERROR.
+ * 바뀐 것: 신설 65줄
+ */
 static int
 qexec_gby_merge_partials (THREAD_ENTRY * thread_p, QEXEC_GBY_READER * rd, QEXEC_GBY_MTABLE * t,
 			  QFILE_LIST_ID * partials)
@@ -6214,6 +6365,15 @@ qexec_gby_merge_partials (THREAD_ENTRY * thread_p, QEXEC_GBY_READER * rd, QEXEC_
 }
 
 /* the table's groups to the output, as qexec_groupby () writes them when nothing was let go; the table is emptied */
+/*
+ * [리뷰] qexec_gby_merge_write — mtable 의 각 그룹을 정렬 경로의 start_group/agg_tuple/finalize 로 흘려 결과를 쓴다. 이어서 mtable 을
+ * rewind 한다.
+ * develop: develop 에 없음 (base 의 GROUP BY 마무리는 qexec_groupby 5499 의 정렬 경로뿐)
+ * 이 PR: SORT_PUT_STOP 은 오류로 보지 않는다.
+ * 바뀐 것: 신설 23줄
+ * [지적 A46]
+ * [지적 A48]
+ */
 static int
 qexec_gby_merge_write (THREAD_ENTRY * thread_p, GROUPBY_STATE * gbstate, QEXEC_GBY_MTABLE * t)
 {
@@ -6240,6 +6400,12 @@ qexec_gby_merge_write (THREAD_ENTRY * thread_p, GROUPBY_STATE * gbstate, QEXEC_G
 
 /* the table's groups collapsed for the sort: each group's first tuple, and its accumulators when it took more rows
  * (qdata_save_agg_htable_to_list ()); the table is emptied */
+/*
+ * [리뷰] qexec_gby_merge_collapse — mtable 을 rows 와 partials 리스트로 내보낸다(partial 은 tuple_count>0 일 때만).
+ * develop: develop 에 없음 (base 의 GROUP BY 마무리는 qexec_groupby 5499 의 정렬 경로뿐)
+ * 이 PR: 끝에 rewind 한다.
+ * 바뀐 것: 신설 25줄
+ */
 static int
 qexec_gby_merge_collapse (THREAD_ENTRY * thread_p, GROUPBY_STATE * gbstate, QEXEC_GBY_MTABLE * t,
 			  QFILE_LIST_ID * rows_out, QFILE_LIST_ID * partials_out)
@@ -6267,6 +6433,13 @@ qexec_gby_merge_collapse (THREAD_ENTRY * thread_p, GROUPBY_STATE * gbstate, QEXE
 }
 
 /* one list's tuples into the partitions of their keys; partials: the list holds partial entries */
+/*
+ * [리뷰] qexec_gby_merge_split_list — 리스트를 키 해시로 n_parts 개 파티션 리스트로 나눈다. 단일 스레드용이다.
+ * develop: develop 에 없음 (base 의 GROUP BY 마무리는 qexec_groupby 5499 의 정렬 경로뿐)
+ * 이 PR: partials 이면 키를 partial 에서 읽고, 아니면 행에서 fetch 해 만든다.
+ * 바뀐 것: 신설 52줄
+ * [지적 A22]
+ */
 static int
 qexec_gby_merge_split_list (THREAD_ENTRY * thread_p, GROUPBY_STATE * gbstate, QFILE_LIST_ID * from, bool partials,
 			    int n_parts, QFILE_LIST_ID ** parts)
@@ -6321,6 +6494,12 @@ qexec_gby_merge_split_list (THREAD_ENTRY * thread_p, GROUPBY_STATE * gbstate, QF
 }
 
 /* split the unsorted rows and the partial entries by their key's partition */
+/*
+ * [리뷰] qexec_gby_merge_split — rows 와 partials 를 차례로 분할한다.
+ * develop: develop 에 없음 (base 의 GROUP BY 마무리는 qexec_groupby 5499 의 정렬 경로뿐)
+ * 이 PR: split_list 2회 호출.
+ * 바뀐 것: 신설 12줄
+ */
 static int
 qexec_gby_merge_split (THREAD_ENTRY * thread_p, GROUPBY_STATE * gbstate, QFILE_LIST_ID * rows,
 		       QFILE_LIST_ID * partials, int n_parts, QFILE_LIST_ID ** row_parts, QFILE_LIST_ID ** part_parts)
@@ -6362,6 +6541,12 @@ struct qexec_gby_px_reader
 };
 
 /* the worker's value standing for a slot of the leader's value list (orig[i] -> vals[i]) */
+/*
+ * [리뷰] qexec_gby_px_map — 원본 DB_VALUE 포인터를 워커 사본 배열의 같은 위치 포인터로 바꾼다. 없으면 NULL 이다.
+ * develop: develop 에 없음 (base 의 GROUP BY 마무리는 qexec_groupby 5499 의 정렬 경로뿐)
+ * 이 PR: 선형 탐색.
+ * 바뀐 것: 신설 14줄
+ */
 static DB_VALUE *
 qexec_gby_px_map (DB_VALUE * const *orig, DB_VALUE * vals, int n, const DB_VALUE * slot)
 {
@@ -6380,6 +6565,14 @@ qexec_gby_px_map (DB_VALUE * const *orig, DB_VALUE * vals, int n, const DB_VALUE
 /* a worker's reader (see above): false when the GROUP BY reads its tuples or aggregates in a form this does not
  * copy -- a regu that is not a tuple position, an aggregate that is not COUNT, SUM, AVG, MIN or MAX over a plain
  * column, a DISTINCT one */
+/*
+ * [리뷰] qexec_gby_px_reader_make — 워커 하나가 쓸 regu·키·집계 노드 사본을 만든다. 병렬 병합 가능 여부(집계 종류·DISTINCT·컬럼 피연산자)도 판정해 why
+ * 를 채운다.
+ * develop: develop 에 없음 (base 의 GROUP BY 마무리는 qexec_groupby 5499 의 정렬 경로뿐)
+ * 이 PR: 6개 calloc 후 실패하면 goto fail 로 해제. operand_prog 를 끄고 컬럼 직접 읽기 모드로 둔다.
+ * 바뀐 것: 신설 145줄
+ * [지적 A24]
+ */
 static bool
 qexec_gby_px_reader_make (GROUPBY_STATE * gbstate, QEXEC_GBY_PX_READER * wr, const char **why)
 {
@@ -6526,6 +6719,12 @@ fail:
   return false;
 }
 
+/*
+ * [리뷰] qexec_gby_px_reader_free — reader 의 vals 를 pr_clear_value 하고 노드 배열을 free 한다.
+ * develop: develop 에 없음 (base 의 GROUP BY 마무리는 qexec_groupby 5499 의 정렬 경로뿐)
+ * 이 PR: memset 0.
+ * 바뀐 것: 신설 19줄
+ */
 static void
 qexec_gby_px_reader_free (QEXEC_GBY_PX_READER * wr)
 {
@@ -6572,6 +6771,12 @@ struct qexec_gby_px
 };
 // *INDENT-ON*
 
+/*
+ * [리뷰] qexec_gby_px_delete — calloc+placement_new 로 만든 QEXEC_GBY_PX 를 소멸자와 free 로 정리한다.
+ * develop: develop 에 없음 (base 의 GROUP BY 마무리는 qexec_groupby 5499 의 정렬 경로뿐)
+ * 이 PR: px != NULL 일 때만.
+ * 바뀐 것: 신설 11줄
+ */
 static void
 qexec_gby_px_delete (QEXEC_GBY_PX * px)
 {
@@ -6585,6 +6790,12 @@ qexec_gby_px_delete (QEXEC_GBY_PX * px)
 }
 
 /* a worker's groups out: each first tuple, and the group's accumulators (written for every group, one to one) */
+/*
+ * [리뷰] qexec_gby_px_emit — 워커 mtable 의 각 그룹을 out_rows 와 out_partials 에 쌍으로 쓴다.
+ * develop: develop 에 없음 (base 의 GROUP BY 마무리는 qexec_groupby 5499 의 정렬 경로뿐)
+ * 이 PR: partial 을 항상 함께 쓴다.
+ * 바뀐 것: 신설 23줄
+ */
 static int
 qexec_gby_px_emit (THREAD_ENTRY * thread_p, QEXEC_GBY_MTABLE * t, QFILE_LIST_ID * out_rows,
 		   QFILE_LIST_ID * out_partials, DB_VALUE * temp_dbvals)
@@ -6610,6 +6821,12 @@ qexec_gby_px_emit (THREAD_ENTRY * thread_p, QEXEC_GBY_MTABLE * t, QFILE_LIST_ID 
 }
 
 /* a worker's failure: the first one's error goes to the leader */
+/*
+ * [리뷰] qexec_gby_px_fail — 워커 실패를 한 번만 기록한다. 현재 스레드 에러를 리더 컨텍스트로 swap 한다.
+ * develop: develop 에 없음 (base 의 GROUP BY 마무리는 qexec_groupby 5499 의 정렬 경로뿐)
+ * 이 PR: px->mutex 잠금, failed 플래그, 에러 코드가 없으면 ER_GENERIC_ERROR.
+ * 바뀐 것: 신설 17줄
+ */
 static void
 qexec_gby_px_fail (QEXEC_GBY_PX * px)
 {
@@ -6630,6 +6847,13 @@ qexec_gby_px_fail (QEXEC_GBY_PX * px)
 
 /* one list's pages, as the workers take them (a shared sector scan), each tuple to this worker's piece of its key's
  * partition; partials: the list holds partial entries (their key columns are read alone) */
+/*
+ * [리뷰] qexec_gby_px_split_list — 한 워커가 입력 리스트의 섹터 페이지를 받아 파티션별 임시 리스트로 분배한다.
+ * develop: develop 에 없음 (base 의 GROUP BY 마무리는 qexec_groupby 5499 의 정렬 경로뿐)
+ * 이 PR: overflow 페이지는 clone 리스트로 qfile_get_tuple 해서 읽는다.
+ * 바뀐 것: 신설 80줄
+ * [지적 A22]
+ */
 static int
 qexec_gby_px_split_list (THREAD_ENTRY * thread_p, QEXEC_GBY_PX * px, QEXEC_GBY_READER * rd, int w, bool partials)
 {
@@ -6713,6 +6937,14 @@ qexec_gby_px_split_list (THREAD_ENTRY * thread_p, QEXEC_GBY_PX * px, QEXEC_GBY_R
 
 /* a worker's task: the split round (every worker reads the lists' pages into its pieces), or the merge round
  * (partitions until none is left, each from every worker's piece of it) */
+/*
+ * [리뷰] qexec_gby_px_worker — px 병합 워커 본체. round 0 은 분할, round 1 은 파티션을 가져와 병합·내보내기 한다.
+ * develop: develop 에 없음 (base 의 GROUP BY 마무리는 qexec_groupby 5499 의 정렬 경로뿐)
+ * 이 PR: 스레드 상태를 리더에서 복사하고, 라운드마다 임시 키·값을 할당·해제한다.
+ * 바뀐 것: 신설 133줄
+ * [지적 A12]
+ * [지적 A22]
+ */
 static void
 qexec_gby_px_worker (THREAD_ENTRY * thread_p, QEXEC_GBY_PX * px, QEXEC_GBY_PX_READER * wr, int w)
 {
@@ -6849,6 +7081,12 @@ qexec_gby_px_worker (THREAD_ENTRY * thread_p, QEXEC_GBY_PX * px, QEXEC_GBY_PX_RE
 
 /* the leader finishes a worker's groups: each group's accumulators loaded, its first tuple's values read (it was
  * aggregated already), the group finalized as qexec_groupby () finalizes the table's own groups */
+/*
+ * [리뷰] qexec_gby_px_finish — 워커별 rows/partials 결과를 리더가 읽어 그룹 완료 처리(finalize)를 한다.
+ * develop: develop 에 없음 (base 의 GROUP BY 마무리는 qexec_groupby 5499 의 정렬 경로뿐)
+ * 이 PR: rows 와 partials 를 한 쌍씩 읽는다.
+ * 바뀐 것: 신설 57줄
+ */
 static int
 qexec_gby_px_finish (THREAD_ENTRY * thread_p, GROUPBY_STATE * gbstate, QFILE_LIST_ID * rows, QFILE_LIST_ID * partials)
 {
@@ -6909,6 +7147,16 @@ qexec_gby_px_finish (THREAD_ENTRY * thread_p, GROUPBY_STATE * gbstate, QFILE_LIS
 
 /* the leader's lists split and merged by up to n_workers workers (two rounds of tasks); *workers: how many ran
  * (0: none could be reserved, or the GROUP BY reads in a form a worker does not copy -- nothing was done) */
+/*
+ * [리뷰] qexec_gby_px_merge — 병렬 병합 오케스트레이터(SERVER_MODE). 워커를 예약하고 2라운드를 돌린 뒤 finish 와 정리를 한다. workers/why 로 결과를
+ * 돌려준다.
+ * develop:
+ * 이 PR: 워커가 2개 미만이면 직렬로 돌린다. 오류 시 end 블록에서 일괄 해제한다.
+ * 바뀐 것: 신설 156줄
+ * [지적 A4]
+ * [지적 A12]
+ * [지적 A20]
+ */
 static int
 qexec_gby_px_merge (THREAD_ENTRY * thread_p, GROUPBY_STATE * gbstate, QFILE_LIST_ID * list_id,
 		    QFILE_LIST_ID * partials, int n_parts, int n_workers, int *workers, const char **why)
@@ -7068,6 +7316,12 @@ end:
 
 #else /* SERVER_MODE */
 /* a stand-alone process has no workers: the leader merges every partition itself */
+/*
+ * [리뷰] qexec_gby_px_merge@7071 — SERVER_MODE 가 아닌 빌드용 스텁이다. workers=0 과 이유 문자열을 돌려준다.
+ * develop:
+ * 이 PR: 항상 NO_ERROR.
+ * 바뀐 것: 신설 8줄
+ */
 static int
 qexec_gby_px_merge (THREAD_ENTRY * thread_p, GROUPBY_STATE * gbstate, QFILE_LIST_ID * list_id,
 		    QFILE_LIST_ID * partials, int n_parts, int n_workers, int *workers, const char **why)
@@ -7085,6 +7339,15 @@ qexec_gby_px_merge (THREAD_ENTRY * thread_p, GROUPBY_STATE * gbstate, QFILE_LIST
  *
  * The sort of the lists gives a group its rows in their input order; a merge table aggregates a group's first
  * tuple after the rows that followed it (qexec_gby_merge_write ()), so such a group keeps the sort.
+ */
+/*
+ * [리뷰] qexec_gby_aggs_follow_row_order — qexec_gby_hash_merge(7138) 만 부른다. 집계 목록에
+ * GROUP_CONCAT·JSON_ARRAYAGG·JSON_OBJECTAGG 또는 컬렉션(시퀀스) 피연산자의 SUM 이 있으면 true — 그룹의 첫 튜플을 나머지 행 뒤에 누산하는 병합 표가
+ * 결과 순서를 바꾸는 집계이므로 병합을 포기하고 기존 정렬로 보내는 판정
+ * develop: develop(c966fabc6) 에 없음
+ * 이 PR: 신설. PT_SUM 은 qexec_node_operand_type 으로 실행 시점 피연산자 타입을 보고 TP_IS_SET_TYPE 일 때만 true(MIN/MAX/AVG 등은 순서
+ * 무관이라 제외, 7080-7087 주석)
+ * 바뀐 것: 신설 +20줄
  */
 static bool
 qexec_gby_aggs_follow_row_order (const VAL_DESCR * vd, AGGREGATE_TYPE * agg_list)
@@ -7113,6 +7376,25 @@ qexec_gby_aggs_follow_row_order (const VAL_DESCR * vd, AGGREGATE_TYPE * agg_list
  *   gbstate(in): the GROUP BY, its table empty (dumped into the lists)
  *   list_id(in/out): the unsorted list; on QEXEC_GBY_MERGE_COLLAPSED, the collapsed one
  *   result(out): what is left for the sort
+ */
+/*
+ * [리뷰] qexec_gby_hash_merge — qexec_groupby(7557) 가 해시 GROUP BY 의 잔여 두 리스트(unsorted list_id·partial list) 를 정렬
+ * 대신 키 해시 칸별 표로 접는다. *result: NONE(정렬이 그대로 받음)/DONE(출력 완료)/COLLAPSED(그룹당 한 줄로 줄인 리스트를
+ * list_id·ctx->part_list_id 에 바꿔 넣고 정렬이 받음). 그룹 수는 키 스케치 또는 64K 행 표본(Chao1) 으로 추정, 3배(병렬 1.5배) 이상 접힐 때만 수행.
+ * SERVER_MODE 에서 px_degree>1 이면 qexec_gby_px_merge 가 워커로 칸을 나눠 접는다
+ * develop: develop 에 없음 — qexec_groupby 는 잔여 리스트를 항상 sort_listfile 로 정렬·병합했다(base 5499~)
+ * 이 PR: 신설. 정리: row_parts/part_parts 는 루프 안(7263-7264) 과 end:(7318-7326) 에서 qexec_gby_merge_free_list 로 두 번
+ * 지나가지만 함수가 NULL 검사 후 QFILE_FREE_AND_INIT 하므로 안전; qfile_close_list 는 last_pgptr NULL 검사로 멱등이라
+ * 7147·7196·7292/7579 의 중복 close 안전; partials_out 은 7302 에서 ctx 로 소유권 이전 후 NULL. 결함 후보 2건: 7150 조기 return 의
+ * er_set 누락(G8b-01), COLLAPSED 복사 실패 시 list_id 의 임시 파일 이중 해제(G8b-02). INV-3: compute_parallel_degree 는
+ * SERVER_MODE 가드 안, qexec_gby_px_merge 는 비 SERVER_MODE 스텁(7072-7080) 이 있어 SA/CS 링크 문제 없음
+ * 바뀐 것: 신설 +225줄(상수 QEXEC_GBY_MERGE_*·열거 QEXEC_GBY_MERGE_RESULT 포함)
+ * [지적 A5]
+ * [지적 A12]
+ * [지적 A21]
+ * [지적 A37]
+ * [지적 A46]
+ * [지적 A48]
  */
 static int
 qexec_gby_hash_merge (THREAD_ENTRY * thread_p, GROUPBY_STATE * gbstate, XASL_NODE * xasl, QFILE_LIST_ID * list_id,
@@ -7349,6 +7631,15 @@ end:
  *
  * Note: Apply the group_by clause to the given list file to group it
  * using the specified group_by parameters.
+ */
+/*
+ * [리뷰] qexec_groupby — qexec_execute_mainblock_internal(20281) 이 부른다. BUILDLIST 의 GROUP BY 본체: 상태 초기화 → 출력 리스트
+ * open → 빈 입력/표만으로 끝나는 빠른 경로 → 표 덤프 → (신설) 해시 병합 → 부분 리스트 정렬 → unsorted 리스트 정렬·그룹 확정 → 결과를 xasl->list_id 로 복사
+ * develop: base 5499~5910: 7552-7572 의 해시 병합 블록이 없고 표 덤프(7531-7550) 뒤 바로 부분 리스트 정렬(7575) 로 갔다.
+ * plan_group_by_domains/finish(7393-7400)·groupby_list 임시 해제(7410-7413) 는 base 에도 같은 자리에 있다(base 5539-5559)
+ * 이 PR: 7552-7572 추가: hash_eligible 이면 qexec_gby_hash_merge 를 부르고 DONE 이면 정렬을 건너뛰어 wrapup; NONE/COLLAPSED 는 기존
+ * 정렬 경로가 (COLLAPSED 면 바꿔 넣은 리스트를) 받는다. groupby_stats.groupby_sort 는 DONE 일 때 false 로 되돌린다
+ * 바뀐 것: 분기 추가 +22줄, 나머지 동일
  */
 static int
 qexec_groupby (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state, QFILE_TUPLE_RECORD * tplrec)
@@ -7784,6 +8075,12 @@ exit_on_error:
  *   return: 1 iff collection has an element with a NULL in it
  *   colval(in) : DB_VALUE of a collection
  */
+/*
+ * [리뷰] qexec_collection_has_null — qexec_cmp_tpl_vals_merge(7897·7901) 가 컬렉션 비교가 DB_UNK 일 때 NULL 원소 포함 여부를 묻는다
+ * develop: base 5911~5942 와 본문 동일
+ * 이 PR: 동일(파일 안 위치만 이동)
+ * 바뀐 것: 없음 — 큰 블록 이동으로 diff 에 잡힘
+ */
 static int
 qexec_collection_has_null (DB_VALUE * colval)
 {
@@ -7841,6 +8138,14 @@ qexec_collection_has_null (DB_VALUE * colval)
  * are encountered, then it may pick either side
  * as the lessor side, that tuple will be discarded,
  * then the next comparison will discard the other side.
+ */
+/*
+ * [리뷰] qexec_cmp_tpl_vals_merge — qexec_merge_list·qexec_merge_list_outer 가 병합 컬럼 값을 튜플 슬롯에서 읽어
+ * eval_compare_values_resolved(compares[i], vd) 로 비교한다. NULL 은 왼쪽 LT/오른쪽 GT 로 정렬 규약을 따른다
+ * develop: base 5969~6050 와 본문 동일 — compares·vd 매개변수와
+ * qfile_slot_read_column_value·eval_compare_values_resolved 는 develop 선재
+ * 이 PR: 동일(이동)
+ * 바뀐 것: 없음. 수집 단계 질문(7869 clear 생략·7872 NULL·compares==NULL) 은 develop 동일이라 이 PR 의 지적 대상이 아님
  */
 static DB_VALUE_COMPARE_RESULT
 qexec_cmp_tpl_vals_merge (THREAD_ENTRY * thread_p, QFILE_TUPLE_RECORD * left, int *left_ind, TP_DOMAIN ** left_dom,
@@ -8038,6 +8343,12 @@ qexec_cmp_tpl_vals_merge (THREAD_ENTRY * thread_p, QFILE_TUPLE_RECORD * left, in
  *
  * Note: The routine assumes that the join column data types for both list
  * files are same.
+ */
+/*
+ * [리뷰] qexec_merge_list — qexec_merge_listfiles(9231) 가 INNER 병합 조인에서 두 정렬 리스트를 병합해 결과 리스트를 만든다
+ * develop: base 6166~6618 와 본문 동일(compares·vd 매개변수 선재)
+ * 이 PR: 동일(이동)
+ * 바뀐 것: 없음
  */
 static QFILE_LIST_ID *
 qexec_merge_list (THREAD_ENTRY * thread_p, QFILE_LIST_ID * outer_list_idp, QFILE_LIST_ID * inner_list_idp,
@@ -8502,6 +8813,13 @@ exit_on_error:
  *   other_outer_join_pred(in)  :
  *   xasl_state(in)     :
  *   ls_flag(in)        :
+ */
+/*
+ * [리뷰] qexec_merge_list_outer — qexec_merge_listfiles(9256) 가 LEFT/RIGHT/OUTER 병합 조인에서 두 SCAN_ID 위로 병합한다
+ * develop: base 6630~7293 와 본문 동일(compares 매개변수·vd 지역 변수 선재)
+ * 이 PR: 동일(이동)
+ * 바뀐 것: 없음. scan_start_scan 전 오류 경로가 9112 scan_end_scan 을 타는 것은 develop 동일이며 scan_end_scan 은 S_ENDED/S_CLOSED
+ * 면 즉시 반환(scan_manager.c 5470)
  */
 static QFILE_LIST_ID *
 qexec_merge_list_outer (THREAD_ENTRY * thread_p, SCAN_ID * outer_sid, SCAN_ID * inner_sid,
@@ -9180,6 +9498,14 @@ exit_on_error:
  * Note: For a direct list file merge, currently the outer and inner columns
  * should have the same data type.
  */
+/*
+ * [리뷰] qexec_merge_listfiles — qexec_end_mainblock_iterations 가 MERGELIST_PROC 에서 부른다. 두 입력 XASL 을 돌린 뒤
+ * join_type 에 따라 qexec_merge_list / qexec_merge_list_outer 를 부르고 결과를 xasl->list_id 로 복사
+ * develop: base 7307~7412 와 본문 동일(merge_compares 전달 선재)
+ * 이 PR: 동일(이동)
+ * 바뀐 것: 없음. open 실패 시 qexec_close_scan 호출은 develop 동일이며 scan_close_scan 은 S_CLOSED 면 즉시 반환(scan_manager.c
+ * 5671)
+ */
 static int
 qexec_merge_listfiles (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state)
 {
@@ -9304,6 +9630,12 @@ exit_on_error:
  *
  * Note: restricted to lock-free S_SELECT sequential heap scans; grouped scans are out of scope.
  */
+/*
+ * [리뷰] qexec_is_cached_scan_eligible — 순차 CLASS 스캔이 S_SELECT·비고정·비그룹·MVCC 락 불요일 때 캐시 스캔 대상인지 판정(호출자는 팩 밖)
+ * develop: base 7431~7436 와 본문 동일
+ * 이 PR: 동일(이동)
+ * 바뀐 것: 없음
+ */
 static bool
 qexec_is_cached_scan_eligible (ACCESS_SPEC_TYPE * specp, SCAN_OPERATION_TYPE scan_op_type,
 			       bool mvcc_select_lock_needed, int fixed, int grouped)
@@ -9322,6 +9654,13 @@ qexec_is_cached_scan_eligible (ACCESS_SPEC_TYPE * specp, SCAN_OPERATION_TYPE sca
  * row the projection or the aggregates see has then just passed this spec's data filter,
  * and an expression the filter computed for the row is current.  A BUILDVALUE output list
  * is evaluated after the scan, not per row, so only its aggregate operands take part.
+ */
+/*
+ * [리뷰] qexec_set_expr_share_spec — px_scan_task.cpp clone_xasl 이 부른다. 단일 spec + where_pred 인
+ * BUILDLIST/BUILDVALUE 에 출력 식·집계 피연산자 프로그램이 spec 을 공유하도록 포인터를 건다
+ * develop: base 7450~7465 와 본문 동일
+ * 이 PR: 동일(이동)
+ * 바뀐 것: 없음 — INV-3 질문은 develop 선재 코드
  */
 void
 qexec_set_expr_share_spec (XASL_NODE * xasl, ACCESS_SPEC_TYPE * spec)
@@ -9806,6 +10145,13 @@ exit_on_error:
  *
  * Note: This routine is used to close the access specification node scan.
  */
+/*
+ * [리뷰] qexec_close_scan — qexec_execute_mainblock_internal 등이 spec 의 스캔을 닫는다. perfmon 집계 후 파티션 정보 리셋,
+ * scan_close_scan
+ * develop: base 7933~8004 와 본문 동일
+ * 이 PR: 동일(이동)
+ * 바뀐 것: 없음
+ */
 static void
 qexec_close_scan (THREAD_ENTRY * thread_p, ACCESS_SPEC_TYPE * curr_spec)
 {
@@ -9889,6 +10235,12 @@ qexec_close_scan (THREAD_ENTRY * thread_p, ACCESS_SPEC_TYPE * curr_spec)
  *
  * Note: This routine is called for ERROR CASE scan end operation.
  */
+/*
+ * [리뷰] qexec_end_scan — spec 의 스캔을 end(S_ENDED) 한다
+ * develop: base 8016~8022 와 본문 동일
+ * 이 PR: 동일(이동)
+ * 바뀐 것: 없음
+ */
 static void
 qexec_end_scan (THREAD_ENTRY * thread_p, ACCESS_SPEC_TYPE * curr_spec)
 {
@@ -9902,6 +10254,12 @@ qexec_end_scan (THREAD_ENTRY * thread_p, ACCESS_SPEC_TYPE * curr_spec)
  * qexec_next_merge_block () -
  *   return:
  *   spec(in)   :
+ */
+/*
+ * [리뷰] qexec_next_merge_block — qexec_merge_fnc 가 부른다. spec 사슬을 따라 다음 스캔 블록을 연다; 빈 힙은 건너뛴다
+ * develop: base 8030~8078 와 본문 동일
+ * 이 PR: 동일(이동)
+ * 바뀐 것: 없음. S_ERROR 경로에 end 가 없는 것은 develop 동일
  */
 static SCAN_CODE
 qexec_next_merge_block (THREAD_ENTRY * thread_p, ACCESS_SPEC_TYPE ** spec)
@@ -9966,6 +10324,14 @@ qexec_next_merge_block (THREAD_ENTRY * thread_p, ACCESS_SPEC_TYPE ** spec)
  * specification, if any, and starts the new scan block for that
  * node. If there are no more access specification nodes left,
  * it returns S_END.
+ */
+/*
+ * [리뷰] qexec_next_scan_block — qexec_execute_scan·qexec_next_scan_block_renew_memoize 가 부른다; 현재 spec 의 다음 스캔
+ * 블록을 열고 S_SUCCESS/S_END/S_ERROR 를 돌려준다(파티션이면 qexec_init_next_partition 으로 다음 파티션 먼저)
+ * develop: develop 과 동일 — c966fabc6 src/query/query_executor.c:8094 의 같은 함수를 줄 단위로 대조(fdiff: IDENTICAL). 팩이
+ * 'changed' 로 표시한 것은 앞쪽 삽입에 의한 줄 번호 이동 때문
+ * 이 PR: 동일
+ * 바뀐 것: 변경 없음(줄 번호만 이동)
  */
 static SCAN_CODE
 qexec_next_scan_block (THREAD_ENTRY * thread_p, XASL_NODE * xasl)
@@ -10102,6 +10468,14 @@ qexec_next_scan_block (THREAD_ENTRY * thread_p, XASL_NODE * xasl)
  * (CBRD-27465). A following join after it is driven per outer row the same way, and its row
  * memo spans that partition walk (CBRD-27493).
  */
+/*
+ * [리뷰] qexec_next_scan_block_renew_memoize — qexec_next_scan_block 을 감싸 블록이 바뀌면 파티션 inner 의 memoize 저장소를 새로
+ * 만든다
+ * develop: develop 과 동일 — c966fabc6 src/query/query_executor.c:8229 의 같은 함수를 줄 단위로 대조(fdiff: IDENTICAL). 팩이
+ * 'changed' 로 표시한 것은 앞쪽 삽입에 의한 줄 번호 이동 때문
+ * 이 PR: 동일
+ * 바뀐 것: 변경 없음(줄 번호만 이동)
+ */
 static SCAN_CODE
 qexec_next_scan_block_renew_memoize (THREAD_ENTRY * thread_p, XASL_NODE * xasl)
 {
@@ -10125,6 +10499,13 @@ qexec_next_scan_block_renew_memoize (THREAD_ENTRY * thread_p, XASL_NODE * xasl)
  *   return: SCAN_CODE (S_SUCCESS, S_END, S_ERROR)
  *   xasl(in)   : XASL Tree pointer
  *
+ */
+/*
+ * [리뷰] qexec_next_scan_block_iterations — qexec_intprt_fnc·connect_by 가 부른다; 조인 사슬의 마지막 블록을 옮기고 앞 블록들을 되감는다
+ * develop: develop 과 동일 — c966fabc6 src/query/query_executor.c:8253 의 같은 함수를 줄 단위로 대조(fdiff: IDENTICAL). 팩이
+ * 'changed' 로 표시한 것은 앞쪽 삽입에 의한 줄 번호 이동 때문
+ * 이 PR: 동일
+ * 바뀐 것: 변경 없음(줄 번호만 이동)
  */
 static SCAN_CODE
 qexec_next_scan_block_iterations (THREAD_ENTRY * thread_p, XASL_NODE * xasl)
@@ -10315,6 +10696,15 @@ qexec_next_scan_block_iterations (THREAD_ENTRY * thread_p, XASL_NODE * xasl)
  * block iteration moves a following join on to its partition.  Other inners
  * keep the normal current-block reset.
  */
+/*
+ * [리뷰] qexec_reset_sa_inner_scan_block —
+ * qexec_execute_scan/nljoin_with_memoize/sa_anti_survive·block_iterations 가 부른다; 외부 행마다 도는 semi/anti inner(또는
+ * 뒤따르는 조인)를 첫 파티션으로 되감는다
+ * develop: develop 과 동일 — c966fabc6 src/query/query_executor.c:8442 의 같은 함수를 줄 단위로 대조(fdiff: IDENTICAL). 팩이
+ * 'changed' 로 표시한 것은 앞쪽 삽입에 의한 줄 번호 이동 때문
+ * 이 PR: 동일
+ * 바뀐 것: 변경 없음(줄 번호만 이동)
+ */
 SCAN_CODE
 qexec_reset_sa_inner_scan_block (THREAD_ENTRY * thread_p, XASL_NODE * inner)
 {
@@ -10390,6 +10780,13 @@ qexec_reset_sa_inner_scan_block (THREAD_ENTRY * thread_p, XASL_NODE * inner)
  * chain (CBRD-26872).  Reached from the real scan on S_END and from a memoized
  * "no match" (CBRD-27465).
  */
+/*
+ * [리뷰] qexec_execute_sa_anti_survive — ANTI inner 가 짝을 못 찾은 외부 행을 살려 뒤 스캔으로 넘긴다(상관 부질의 정리 포함)
+ * develop: develop 과 동일 — c966fabc6 src/query/query_executor.c:8517 의 같은 함수를 줄 단위로 대조(fdiff: IDENTICAL). 팩이
+ * 'changed' 로 표시한 것은 앞쪽 삽입에 의한 줄 번호 이동 때문
+ * 이 PR: 동일
+ * 바뀐 것: 변경 없음(줄 번호만 이동)
+ */
 static SCAN_CODE
 qexec_execute_sa_anti_survive (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
 			       QFILE_TUPLE_RECORD * ignore, XASL_SCAN_FNC_PTR next_scan_fnc)
@@ -10459,6 +10856,14 @@ qexec_execute_sa_anti_survive (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_S
  * accesses in nested loop join operations.
  */
 
+/*
+ * [리뷰] qexec_execute_nljoin_with_memoize — qexec_execute_scan 이 memoize 저장소가 있을 때 부른다; 캐시된 결과를 재생하거나 S_END 를
+ * 돌려준다
+ * develop: develop 과 동일 — c966fabc6 src/query/query_executor.c:8586 의 같은 함수를 줄 단위로 대조(fdiff: IDENTICAL). 팩이
+ * 'changed' 로 표시한 것은 앞쪽 삽입에 의한 줄 번호 이동 때문
+ * 이 PR: 동일
+ * 바뀐 것: 변경 없음(줄 번호만 이동)
+ */
 static SCAN_CODE
 qexec_execute_nljoin_with_memoize (THREAD_ENTRY * thread_p, bool * is_memoize_succeed,
 				   XASL_NODE * xasl, XASL_STATE * xasl_state,
@@ -10600,6 +11005,13 @@ qexec_execute_nljoin_with_memoize (THREAD_ENTRY * thread_p, bool * is_memoize_su
   return S_SUCCESS;
 }
 
+/*
+ * [리뷰] qexec_execute_scan_ptr — px 워커(row_body) 가 부르는 진입점; 스캔 함수 포인터 배열을 채우고 qexec_execute_scan 으로
+ * develop: develop 과 동일 — c966fabc6 src/query/query_executor.c:8727 의 같은 함수를 줄 단위로 대조(fdiff: IDENTICAL). 팩이
+ * 'changed' 로 표시한 것은 앞쪽 삽입에 의한 줄 번호 이동 때문
+ * 이 PR: 동일
+ * 바뀐 것: 변경 없음(줄 번호만 이동)
+ */
 SCAN_CODE
 qexec_execute_scan_ptr (THREAD_ENTRY * thread_p, xasl_node * xasl, XASL_STATE * xasl_state, void *scan_func_ptr)
 {
@@ -10638,6 +11050,13 @@ qexec_execute_scan_ptr (THREAD_ENTRY * thread_p, xasl_node * xasl, XASL_STATE * 
  * path of the scan procedure blocks.
  *
  * Note: This function is the general scan block interpretation function.
+ */
+/*
+ * [리뷰] qexec_execute_scan — 조인 사슬의 한 블록을 한 행 전진시킨다; 술어·bptr/fptr/dptr 평가, 뒤 블록 호출, memoize put
+ * develop: develop 과 동일 — c966fabc6 src/query/query_executor.c:8766 의 같은 함수를 줄 단위로 대조(fdiff: IDENTICAL). 팩이
+ * 'changed' 로 표시한 것은 앞쪽 삽입에 의한 줄 번호 이동 때문
+ * 이 PR: 동일
+ * 바뀐 것: 변경 없음(줄 번호만 이동)
  */
 static SCAN_CODE
 qexec_execute_scan (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state, QFILE_TUPLE_RECORD * ignore,
@@ -10983,6 +11402,13 @@ qexec_execute_scan (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl
  * return : void
  * list (in) : regu variable list
  */
+/*
+ * [리뷰] qexec_reset_regu_variable_list — REGU_VARIABLE_LIST 의 각 변수에 qexec_reset_regu_variable
+ * develop: develop 과 동일 — c966fabc6 src/query/query_executor.c:9110 의 같은 함수를 줄 단위로 대조(fdiff: IDENTICAL). 팩이
+ * 'changed' 로 표시한 것은 앞쪽 삽입에 의한 줄 번호 이동 때문
+ * 이 PR: 동일
+ * 바뀐 것: 변경 없음(줄 번호만 이동)
+ */
 static void
 qexec_reset_regu_variable_list (REGU_VARIABLE_LIST list)
 {
@@ -10999,6 +11425,13 @@ qexec_reset_regu_variable_list (REGU_VARIABLE_LIST list)
  * qexec_reset_pred_expr () - reset value cache for a pred expr
  * return : void
  * pred (in) : pred expr
+ */
+/*
+ * [리뷰] qexec_reset_pred_expr — 술어 트리의 regu 변수 캐시를 재귀로 초기화
+ * develop: develop 과 동일 — c966fabc6 src/query/query_executor.c:9127 의 같은 함수를 줄 단위로 대조(fdiff: IDENTICAL). 팩이
+ * 'changed' 로 표시한 것은 앞쪽 삽입에 의한 줄 번호 이동 때문
+ * 이 PR: 동일
+ * 바뀐 것: 변경 없음(줄 번호만 이동)
  */
 static void
 qexec_reset_pred_expr (PRED_EXPR * pred)
@@ -11061,6 +11494,13 @@ qexec_reset_pred_expr (PRED_EXPR * pred)
  * return : void
  * var (in) : regu variable
  */
+/*
+ * [리뷰] qexec_reset_regu_variable — 속성 regu 의 cache_dbvalp·cache_slot 을 NULL 로
+ * develop: develop 과 동일 — c966fabc6 src/query/query_executor.c:9188 의 같은 함수를 줄 단위로 대조(fdiff: IDENTICAL). 팩이
+ * 'changed' 로 표시한 것은 앞쪽 삽입에 의한 줄 번호 이동 때문
+ * 이 PR: 동일(cache_slot 줄은 base 에도 있음)
+ * 바뀐 것: 변경 없음(줄 번호만 이동)
+ */
 static void
 qexec_reset_regu_variable (REGU_VARIABLE * var)
 {
@@ -11104,6 +11544,14 @@ qexec_reset_regu_variable (REGU_VARIABLE * var)
  * spec (in) :
  * vd (in) :
  * scan_op_type (in) :
+ */
+/*
+ * [리뷰] qexec_prune_spec — qexec_execute_selupd_list_find_class·스캔 시작 경로가 부른다; 파티션 pruning 뒤 각 파티션에 IS/IX
+ * lock_subclass
+ * develop: develop 과 동일 — c966fabc6 src/query/query_executor.c:9232 의 같은 함수를 줄 단위로 대조(fdiff: IDENTICAL). 팩이
+ * 'changed' 로 표시한 것은 앞쪽 삽입에 의한 줄 번호 이동 때문
+ * 이 PR: 동일
+ * 바뀐 것: 변경 없음(줄 번호만 이동)
  */
 static int
 qexec_prune_spec (THREAD_ENTRY * thread_p, ACCESS_SPEC_TYPE * spec, VAL_DESCR * vd, SCAN_OPERATION_TYPE scan_op_type)
@@ -11583,6 +12031,15 @@ qexec_init_next_partition (THREAD_ENTRY * thread_p, ACCESS_SPEC_TYPE * spec, XAS
  * hierarchy, the single-tuple stop -- keeps the block on the row path.  The scan and the
  * aggregates themselves are judged by scan_batch_open () and the plan it builds.
  */
+/*
+ * [리뷰] qexec_batch_eligible — qexec_intprt_fnc·px task::initialize 가 부른다; 이 블록이 페이지 배치 루프(qexec_batch_scan)를 탈
+ * 수 있는지(BUILDVALUE 집계 / BUILDLIST 투영·해시 GROUP BY, 단일 힙 스캔, 뒤 블록·술어 리스트·instnum·CONNECT BY 없음) 를 돌려준다
+ * develop: develop 에 없음
+ * 이 PR: 신설 51줄
+ * 바뀐 것: 신설
+ * [지적 A7]
+ * [지적 A10]
+ */
 bool
 qexec_batch_eligible (const XASL_NODE * xasl)
 {
@@ -11639,6 +12096,14 @@ qexec_batch_eligible (const XASL_NODE * xasl)
  * qexec_batch_filter_eligible () - can the block's driving heap scan run its filter a chunk at a time while its rows
  *				     go on one by one (scan_batch_open_filter ())?
  *   return: a sequential heap scan of a SELECT with a data filter; what the block does per row is the row loop's
+ */
+/*
+ * [리뷰] qexec_batch_filter_eligible — 조인·부질의 아래 스캔이 필터만 배치로 돌릴 수 있는지(where_pred 있음, 단일 힙 스캔, S_SELECT)
+ * develop: develop 에 없음
+ * 이 PR: 신설 11줄
+ * 바뀐 것: 신설
+ * [지적 A10]
+ * [지적 A27]
  */
 bool
 qexec_batch_filter_eligible (const XASL_NODE * xasl)
@@ -11731,6 +12196,12 @@ struct qexec_batch_gby
   int *order;			/* a flush's entries, in first-row order */
 };
 
+/*
+ * [리뷰] qexec_gby_hash_bytes — qexec_batch_gby_consume 이 키 바이트의 FNV-1a 해시를 얻는다
+ * develop: develop 에 없음
+ * 이 PR: 신설 12줄
+ * 바뀐 것: 신설
+ */
 static unsigned int
 qexec_gby_hash_bytes (const unsigned char *p, int len)
 {
@@ -11744,6 +12215,12 @@ qexec_gby_hash_bytes (const unsigned char *p, int len)
   return h;
 }
 
+/*
+ * [리뷰] qexec_gby_cache_find — consume 이 키 바이트로 캐시 항목을 찾는다(선형 탐사, 빈 슬롯에서 NULL)
+ * develop: develop 에 없음
+ * 이 PR: 신설 23줄
+ * 바뀐 것: 신설
+ */
 static QEXEC_GBY_ENTRY *
 qexec_gby_cache_find (QEXEC_BATCH_GBY * st, const unsigned char *key, int len, unsigned int h)
 {
@@ -11768,6 +12245,13 @@ qexec_gby_cache_find (QEXEC_BATCH_GBY * st, const unsigned char *key, int len, u
     }
 }
 
+/*
+ * [리뷰] qexec_gby_cache_clear — consume·flush(포기 시)·destroy 가 부른다; 모든 항목의 bytes·key 를 해제하고 비운다
+ * develop: develop 에 없음
+ * 이 PR: 신설 26줄
+ * 바뀐 것: 신설
+ * [지적 A17]
+ */
 static void
 qexec_gby_cache_clear (THREAD_ENTRY * thread_p, QEXEC_BATCH_GBY * st)
 {
@@ -11796,6 +12280,14 @@ qexec_gby_cache_clear (THREAD_ENTRY * thread_p, QEXEC_BATCH_GBY * st)
 }
 
 /* drop the entry in slot i, then shift the entries of its probe run back so lookups still find them */
+/*
+ * [리뷰] qexec_gby_cache_remove — qexec_gby_cache_evicted 가 부른다; 선형 탐사 표의 backward-shift 삭제(옮긴 항목의
+ * value->batch_slot 갱신)
+ * develop: develop 에 없음
+ * 이 PR: 신설 36줄
+ * 바뀐 것: 신설
+ * [지적 A1]
+ */
 static void
 qexec_gby_cache_remove (THREAD_ENTRY * thread_p, QEXEC_BATCH_GBY * st, unsigned int i)
 {
@@ -11834,6 +12326,14 @@ qexec_gby_cache_remove (THREAD_ENTRY * thread_p, QEXEC_BATCH_GBY * st, unsigned 
 }
 
 /* the group the row path just put the row in (context->temp_key holds its key), under the row's bytes */
+/*
+ * [리뷰] qexec_gby_cache_add — consume 이 행 경로가 표에 넣은 행의 키 바이트를 캐시에 넣는다(반쯤 차면 전체 clear, mht_get 으로 그룹을 찾고
+ * bytes·key 복사)
+ * develop: develop 에 없음
+ * 이 PR: 신설 61줄
+ * 바뀐 것: 신설
+ * [지적 A17]
+ */
 static void
 qexec_gby_cache_add (THREAD_ENTRY * thread_p, QEXEC_BATCH_GBY * st, AGGREGATE_HASH_CONTEXT * ctx,
 		     const unsigned char *key, int len, unsigned int h)
@@ -11897,6 +12397,13 @@ qexec_gby_cache_add (THREAD_ENTRY * thread_p, QEXEC_BATCH_GBY * st, AGGREGATE_HA
 }
 
 /* the cache entries of the groups a row-path call evicted: the first n of the LRU head noted before it */
+/*
+ * [리뷰] qexec_gby_cache_evicted — consume 이 새 그룹이 LRU 머리를 밀어낸 뒤 부른다; 적어둔 (value, slot) 로 축출 그룹의 항목을 지운다
+ * develop: develop 에 없음
+ * 이 PR: 신설 17줄
+ * 바뀐 것: 신설
+ * [지적 A1]
+ */
 static void
 qexec_gby_cache_evicted (THREAD_ENTRY * thread_p, QEXEC_BATCH_GBY * st, AGGREGATE_HASH_VALUE ** note_val,
 			 const int *note_slot, int n)
@@ -11915,6 +12422,12 @@ qexec_gby_cache_evicted (THREAD_ENTRY * thread_p, QEXEC_BATCH_GBY * st, AGGREGAT
     }
 }
 
+/*
+ * [리뷰] qexec_batch_gby_reserve — consume 이 청크 행 수만큼 네 스크래치 배열을 키운다
+ * develop: develop 에 없음
+ * 이 PR: 신설 37줄
+ * 바뀐 것: 신설
+ */
 static int
 qexec_batch_gby_reserve (QEXEC_BATCH_GBY * st, int n)
 {
@@ -11954,6 +12467,13 @@ qexec_batch_gby_reserve (QEXEC_BATCH_GBY * st, int n)
 }
 
 /* rows to the row path, in order: the chunk's selection from position from on */
+/*
+ * [리뷰] qexec_batch_gby_rows — consume 이 캐시를 끈 뒤(off) 남은 선택 행을 행 경로(scan_batch_project_row →
+ * qexec_end_one_iteration)로 보낸다
+ * develop: develop 에 없음
+ * 이 PR: 신설 15줄
+ * 바뀐 것: 신설
+ */
 static int
 qexec_batch_gby_rows (THREAD_ENTRY * thread_p, QEXEC_BATCH_GBY * st, EXPR_BATCH * batch, int from)
 {
@@ -11974,6 +12494,13 @@ qexec_batch_gby_rows (THREAD_ENTRY * thread_p, QEXEC_BATCH_GBY * st, EXPR_BATCH 
  * row-path call: the counts, each group's rows in row order, the sizes, the LRU in last-row order, and the
  * selectivity check where its tuple count falls.  *done: the pending rows taken (n, or fewer when the check
  * abandoned the table after the last of them -- the rest go to the row path). */
+/*
+ * [리뷰] qexec_batch_gby_flush — consume 이 miss 직전·청크 끝에 부른다; 모인 행을 그룹별로 재배열해 qdata_evaluate_aggregate_batch 로
+ * 그룹 누산기에 누산하고, 선택도 검사를 행 경로와 같은 tuple_count 에서 돌리며, LRU 를 마지막 행 순서로 touch 한다
+ * develop: develop 에 없음
+ * 이 PR: 신설 106줄
+ * 바뀐 것: 신설
+ */
 static int
 qexec_batch_gby_flush (THREAD_ENTRY * thread_p, QEXEC_BATCH_GBY * st, EXPR_BATCH_PLAN * plan, EXPR_BATCH * batch,
 		       int n, int *done)
@@ -12086,6 +12613,17 @@ qexec_batch_gby_flush (THREAD_ENTRY * thread_p, QEXEC_BATCH_GBY * st, EXPR_BATCH
  *   return: NO_ERROR, or an error
  *   node(in): its state is a QEXEC_BATCH_GBY
  *   plan(in), batch(in): the chunk, its filter and operand steps run
+ */
+/*
+ * [리뷰] qexec_batch_gby_consume — 청크 체인의 끝 노드(expr_chunk_push 가 부름). 청크의 선택 행을 키 바이트로 캐시에 찾아 아는 그룹은 모아 두었다가
+ * flush 로 그룹별 벡터 누산, 모르는 키는 행 경로(scan_batch_project_row → qexec_end_one_iteration → qexec_hash_gby_agg_tuple)로
+ * 보내고 그 결과(새 그룹·LRU 덤프·상태 전환)를 캐시에 반영한다. NO_ERROR 또는 에러.
+ * develop: develop 에 없음
+ * 이 PR: 118줄 신설. 상태 HS_ACCEPT_ALL 가 아니면 off 로 전환해 전부 행 경로(12098-12106); row-path 호출 전 LRU 머리 8개를 메모해 덤프된 그룹만
+ * 캐시에서 제거, 그 밖의 변화는 캐시 전체 비움(12153-12191).
+ * 바뀐 것: 신설 +118
+ * [지적 A3]
+ * [지적 A17]
  */
 int
 qexec_batch_gby_consume (THREAD_ENTRY * thread_p, EXPR_CHUNK_NODE * node, EXPR_BATCH_PLAN * plan, EXPR_BATCH * batch)
@@ -12206,6 +12744,13 @@ qexec_batch_gby_consume (THREAD_ENTRY * thread_p, EXPR_CHUNK_NODE * node, EXPR_B
   return NO_ERROR;
 }
 
+/*
+ * [리뷰] qexec_batch_gby_create — qexec_batch_scan(직렬)과 px_scan_task::initialize(워커)가 부름. GROUP BY 노드
+ * 상태(QEXEC_BATCH_GBY)를 calloc 해 행 투영 상태·xasl·vd·덤프 리스트/동기 콜백을 채워 돌려준다(소유권 이전).
+ * develop: develop 에 없음
+ * 이 PR: 19줄 신설, calloc + er_set(OOM).
+ * 바뀐 것: 신설 +19
+ */
 QEXEC_BATCH_GBY *
 qexec_batch_gby_create (XASL_NODE * xasl, val_descr * vd, const SCAN_BATCH_PROJECT * row,
 			QFILE_LIST_ID * (*list) (void *arg), void (*sync) (void *arg), void *arg)
@@ -12226,6 +12771,12 @@ qexec_batch_gby_create (XASL_NODE * xasl, val_descr * vd, const SCAN_BATCH_PROJE
   return st;
 }
 
+/*
+ * [리뷰] qexec_batch_gby_destroy — create 의 짝. 캐시 항목(bytes·key 복사본)을 비우고 다섯 배열과 자신을 free.
+ * develop: develop 에 없음
+ * 이 PR: 30줄 신설; NULL 허용.
+ * 바뀐 것: 신설 +30
+ */
 void
 qexec_batch_gby_destroy (THREAD_ENTRY * thread_p, QEXEC_BATCH_GBY * st)
 {
@@ -12267,6 +12818,14 @@ qexec_batch_gby_destroy (THREAD_ENTRY * thread_p, QEXEC_BATCH_GBY * st)
  * compiled program root, or a plain column of the scan, and the domain the tuple casts it into.  A key is the
  * projection column at its GROUP BY position, which must be a plain column of the scan.  An aggregate fed by a
  * hidden column (evaluated afresh per row) does not map.  *why_not says why a map was not made (the scan's trace).
+ */
+/*
+ * [리뷰] qexec_batch_gby_map_create — qexec_intprt_fnc 와 px 워커가 scan_batch_open 직전에 부름. 집계 피연산자·GROUP BY 키를 스캔
+ * 튜플의 보이는 컬럼(TYPE_CONSTANT dbvalptr)에 대응시킨 EXPR_BATCH_GBY_MAP 을 한 calloc 블록으로 만들고, 못 하면 why_not 과 NULL.
+ * develop: develop 에 없음
+ * 이 PR: 149줄 신설. 블록 안 6개 배열을 수동 8바이트 정렬(+64 여유). expr_batch_plan_build(eb_build_gby, expr_batch.c:2346-2420) 가
+ * 내용을 플랜으로 복사하므로 open 직후 destroy 해도 안전 — 관찰 질문 (a) 의 답.
+ * 바뀐 것: 신설 +149
  */
 EXPR_BATCH_GBY_MAP *
 qexec_batch_gby_map_create (THREAD_ENTRY * thread_p, XASL_NODE * xasl, val_descr * vd, const char **why_not)
@@ -12418,12 +12977,24 @@ no_map:
   return NULL;
 }
 
+/*
+ * [리뷰] qexec_batch_gby_map_destroy — map_create 의 짝(free).
+ * develop: develop 에 없음
+ * 이 PR: 5줄 신설.
+ * 바뀐 것: 신설 +5
+ */
 void
 qexec_batch_gby_map_destroy (EXPR_BATCH_GBY_MAP * map)
 {
   free (map);
 }
 
+/*
+ * [리뷰] qexec_batch_gby_list_serial — 직렬 경로의 덤프 리스트 콜백: xasl->list_id 를 돌려준다(px 워커는 result_handler::gby_list).
+ * develop: develop 에 없음
+ * 이 PR: 5줄 신설.
+ * 바뀐 것: 신설 +5
+ */
 static QFILE_LIST_ID *
 qexec_batch_gby_list_serial (void *arg)
 {
@@ -12442,6 +13013,14 @@ struct qexec_batch_emit
 static SCAN_CODE qexec_batch_scan_chain (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
 					 QFILE_TUPLE_RECORD * tplrec, EXPR_CHUNK_NODE * chain);
 
+/*
+ * [리뷰] qexec_batch_emit_row — SCAN_BATCH_PROJECT 의 emit 콜백: 행 경로의 qexec_end_one_iteration 을 그대로 부른다(투영
+ * 노드·GROUP BY 노드의 row-path 호출 공통).
+ * develop: develop 에 없음
+ * 이 PR: 7줄 신설.
+ * 바뀐 것: 신설 +7
+ * [지적 A7]
+ */
 static int
 qexec_batch_emit_row (THREAD_ENTRY * thread_p, void *arg)
 {
@@ -12450,6 +13029,14 @@ qexec_batch_emit_row (THREAD_ENTRY * thread_p, void *arg)
   return qexec_end_one_iteration (thread_p, e->xasl, e->xasl_state, e->tplrec);
 }
 
+/*
+ * [리뷰] qexec_batch_scan — qexec_intprt_fnc 가 scan_batch_open==1 일 때 부름. 블록 종류에 따라 끝 노드(집계/GROUP BY/투영)와 평가 노드를
+ * 체인으로 묶고 qexec_batch_scan_chain 을 돌린다; trace 면 체인 전체의 fetch/ioread/시간 차분을 scan_stats 에 더한다. S_END 또는 S_ERROR.
+ * develop: develop 에 없음
+ * 이 PR: 56줄 신설. gby 생성 실패 시 S_ERROR; 모든 경로에서 destroy.
+ * 바뀐 것: 신설 +56
+ * [지적 A9]
+ */
 static SCAN_CODE
 qexec_batch_scan (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state, QFILE_TUPLE_RECORD * tplrec)
 {
@@ -12508,6 +13095,17 @@ qexec_batch_scan (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_s
 }
 
 /* qexec_batch_scan ()'s loop, with its chain built */
+/*
+ * [리뷰] qexec_batch_scan_chain — 페이지 단위 루프: scan_batch_next_page 로 페이지를 잡고 scan_batch_collect_chunk 로 청크를 모아
+ * 체인에 밀어 넣는다. 청크가 S_DOESNT_FIT(REC_HOME 아님·이전 버전) 이거나 체인이 EXPR_BATCH_FALLBACK 을 돌려주면 그 청크부터 페이지 끝까지
+ * scan_batch_page_rowmode + scan_next_scan/qexec_end_one_iteration 의 행 경로로 돌린다.
+ * develop: develop 에 없음
+ * 이 PR: 73줄 신설. 통계 read_rows/qualified_rows/batch_pages/batch_pages_rowpath 갱신. FALLBACK 은 eval
+ * 노드(expr_batch_run)에서만 나오고 끝 노드 호출 전이므로 12564 주석대로 누산 전 — 관찰 질문 (e) 의 직접 답은 '모순 없음'; 다만 행 경로 페이지가 GROUP BY
+ * 노드의 캐시를 낡게 만드는 것이 G9b-01.
+ * 바뀐 것: 신설 +73
+ * [지적 A3]
+ */
 static SCAN_CODE
 qexec_batch_scan_chain (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
 			QFILE_TUPLE_RECORD * tplrec, EXPR_CHUNK_NODE * chain)
@@ -12593,6 +13191,18 @@ qexec_batch_scan_chain (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * 
  * Note: This function is the main function used to interpret an XASL
  * tree block. That is, it assumes a general format XASL block
  * with all possible representations.
+ */
+/*
+ * [리뷰] qexec_intprt_fnc — 스캔 블록 해석기. 각 스캔 블록을 열고 행마다 bptr/dptr/after_join/if/fptr/instnum 을 평가해
+ * qexec_end_one_iteration 으로 넘긴다.
+ * develop: base 9711-: 블록을 열면 바로 scan_next_scan 행 루프(9845). 배치·런타임 필터 없음.
+ * 이 PR: 블록 열기 직후 qexec_batch_eligible 이면 (BUILDVALUE: 피연산자 프로그램 확보 / GROUP BY: 맵 생성) scan_batch_open 을 시도해 1
+ * 이면 qexec_batch_scan 으로 블록 전체를 처리하고 continue(12735-12768; continue 가 건너뛰는 것은 ls_scan 검사뿐 — 12763 이 대신한다). 아니면
+ * qexec_batch_filter_eligible 일 때 scan_batch_open_filter(12770-12774). 행 루프 안에 해시 조인 런타임 필터 검사(12821-12825)
+ * 추가: xasl->rtf 가 있고 키가 build 쪽에 없으면 bptr/dptr 전에 행을 버린다(INNER·SEMI 의 target 에만 설정됨, hjoin_rtf_first_input).
+ * 바뀐 것: 분기 추가 +50 (12735-12774 +44, 12821-12825 +6)
+ * [지적 A7]
+ * [지적 A27]
  */
 static SCAN_CODE
 qexec_intprt_fnc (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state, QFILE_TUPLE_RECORD * tplrec,
@@ -18834,6 +19444,13 @@ exit_on_error:
  * be of type BUILDLIST_PROC, BUILDVALUE, UNION_PROC,
  * DIFFERENCE_PROC and INTERSECTION_PROC.
  */
+/*
+ * [리뷰] qexec_end_mainblock_iterations — 블록 반복이 끝난 뒤 종류별 마무리(리스트 닫기·머지·해시 조인·집계 종료).
+ * develop: base 15901-: HASHJOIN_PROC 케이스는 qexec_hash_join 호출뿐(15950-15954).
+ * 이 PR: HASHJOIN_PROC 에서 qexec_hash_join 전에 hjoin_rtf_release(18887): 두 입력이 모두 리스트가 된 시점에 런타임 필터를 해제하고 target
+ * 의 rtf/rtf_val 을 NULL 로 되돌린다. 에러 경로의 해제는 qexec_clear_xasl(2336).
+ * 바뀐 것: 호출 1줄 추가
+ */
 static int
 qexec_end_mainblock_iterations (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
 				QFILE_TUPLE_RECORD * tplrec)
@@ -19234,6 +19851,15 @@ qexec_execute_dblink_query (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STAT
  *   xasl_state(in)     : XASL state information
  *   p_class_instance_lock_info(in/out): class instance lock info
  *
+ */
+/*
+ * [리뷰] qexec_execute_mainblock_internal — 메인 블록 실행: 락·aptr(비상관 하위질의) 실행·스캔 열기·반복·종료.
+ * develop: base 16301-: aptr 루프(16688)는 머지/해시 조인의 한쪽이 비면 다른 쪽을 건너뛰는 표(INNER/LEFT/SEMI/ANTI/RIGHT)만 있었다.
+ * 이 PR: aptr 루프 앞에 해시 조인 런타임 필터 단계(19626-19642): px 가 아닌 HASHJOIN_PROC 에서 hjoin_rtf_first_input 이 고른
+ * 입력(INNER/SEMI 의 build 쪽 우선)을 먼저 qexec_execute_mainblock 으로 돌리고 hjoin_rtf_build 로 키 집합을 만들어 다른 입력의 가장 바깥
+ * 스캔(target->rtf/rtf_val)에 건다. 이미 돈 입력은 19693 의 IS_XASL_INITIAL_STATUS 로 루프가 건너뛴다(주석의 '건너뛴다' 확인). 빌드 실패는 함수
+ * 안에서 해제하므로 19639 경로에 누수 없음.
+ * 바뀐 것: 분기 추가 +18
  */
 static int
 qexec_execute_mainblock_internal (THREAD_ENTRY * thread_p, XASL_NODE * xasl, XASL_STATE * xasl_state,
@@ -30997,6 +31623,14 @@ qexec_alloc_agg_hash_context_buildlist_xasl (THREAD_ENTRY * thread_p, xasl_node 
  *   proc(in): buildlist
  *   xasl_state(in): XASL state
  */
+/*
+ * [리뷰] qexec_alloc_agg_hash_context — 해시 GROUP BY 컨텍스트 초기화: 임시 값 배열·키/누산기 도메인·부분 리스트 2개·해시표·임시 키/값.
+ * develop: base 28045-28275: 동일 구조. accumulator_domains[i] = qexec_accumulator_domain(&vd, plan_item) 도 base 에
+ * 이미 있다(28129-28131) — 관찰 질문의 '새 포인터' 는 이 PR 변경이 아니다.
+ * 이 PR: slab=NULL 초기화(31020)와 key_sketch memset/key_sketch_partial=false(31216-31217) 만 추가.
+ * 바뀐 것: 초기화 3줄 추가
+ * [지적 A51]
+ */
 static int
 qexec_alloc_agg_hash_context (THREAD_ENTRY * thread_p, BUILDLIST_PROC_NODE * proc, XASL_STATE * xasl_state,
 			      bool not_use_membuf)
@@ -31230,6 +31864,16 @@ exit_on_error:
  *                                   structures used at runtime
  *   thread_p(in): thread
  *   proc(in): buildlist
+ */
+/*
+ * [리뷰] qexec_free_agg_hash_context — qexec_clear_xasl 와 qexec_alloc_agg_hash_context(재할당 전) 에서 불려 해시 GROUP BY
+ * 컨텍스트의 자원(임시 값 배열·도메인 배열·정렬키·해시표·부분 리스트·임시 키/값·recdes)을 해제하고 카운터를 0 으로 되돌린다. 반환값 없음
+ * develop: base query_executor.c:28276 — 같은 순서로 해제하되 mht_clear/mht_destroy(28318-28319) 뒤에 슬랩 해제가 없다(slab 필드
+ * 자체가 base 에 없음)
+ * 이 PR: mht_destroy 블록 뒤에 qdata_slab_destroy (proc->agg_hash_context->slab) + slab = NULL (31282-31284).
+ * hash_table 이 NULL 이어도 무조건 호출되는데 qdata_slab_destroy 는 NULL 이면 바로 return 한다(query_aggregate.cpp:3472-3478)
+ * 바뀐 것: +3줄 (슬랩 해제 추가). 그룹 엔트리가 슬랩 블록이라 mht_clear 콜백(qdata_free_agg_hentry)이 슬랩에 되돌린 뒤 슬랩을 통째로 free 하는 순서
+ * [지적 A31]
  */
 static void
 qexec_free_agg_hash_context (THREAD_ENTRY * thread_p, BUILDLIST_PROC_NODE * proc)

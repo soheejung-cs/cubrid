@@ -404,6 +404,13 @@ static void eb_pack_dbv (const EXPR_BATCH_PLAN * plan, const EB_VEC * vec, int r
 #define EB_NULL_AT(vec, r) ((vec)->isnull[EB_IDX (vec, r)])
 
 /* a NUMERIC element as the word domain sees it */
+/*
+ * [리뷰] eb_num_get — eb_num_load/eb_pack_dbv/agg_sum_rest 가 부른다; 벡터의 r 번째 NUMERIC 요소(int64 또는 int128 계수)를
+ * NUMERIC_AGG_EXPR_VAL(계수·scale·부호)로 푼다
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: EB_N64 면 int64, 아니면 int128 을 읽고 scales 배열이 있으면 요소별 scale, 없으면 벡터 scale
+ * 바뀐 것: 신설 +10줄
+ */
 static inline void
 eb_num_get (const EB_VEC * vec, int r, NUMERIC_AGG_EXPR_VAL * out)
 {
@@ -416,6 +423,13 @@ eb_num_get (const EB_VEC * vec, int r, NUMERIC_AGG_EXPR_VAL * out)
 }
 
 /* a word-domain value into an int128 element; false when its magnitude needs the 128th bit */
+/*
+ * [리뷰] eb_num_put — eb_extract/eb_run_steps/eb_load_scalars 가 부른다; 계수가 127 비트를 넘으면 false, 아니면 부호 적용해 int128
+ * 슬롯과 scale 에 기록
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: true/false 반환으로 호출자가 폴백 결정
+ * 바뀐 것: 신설 +20줄
+ */
 static inline bool
 eb_num_put (EB_VEC * vec, int r, const NUMERIC_AGG_EXPR_VAL * val)
 {
@@ -439,6 +453,13 @@ eb_num_put (EB_VEC * vec, int r, const NUMERIC_AGG_EXPR_VAL * val)
 
 /* One cell of a column straight from its record: 1 a value, 0 NULL, -1 the chunk is for the
  * row path (a type or a stored value the batch does not reproduce). */
+/*
+ * [리뷰] eb_cell_fixed — eb_extract/eb_leaf_side/eb_raw_kid 가 부른다; 고정 영역 셀을 bound bit 로 NULL(0) /
+ * int64·double(1) / 미지원(-1) 로 디코드
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: SHORT/INTEGER/BIGINT/DATE→int64, FLOAT/DOUBLE→double
+ * 바뀐 것: 신설 +44줄
+ */
 static inline int
 eb_cell_fixed (const EB_COL * col, const HEAP_REC_LAYOUT * lay, int64_t * i, double *d)
 {
@@ -485,6 +506,14 @@ eb_cell_fixed (const EB_COL * col, const HEAP_REC_LAYOUT * lay, int64_t * i, dou
 }
 
 /* a NUMERIC in the variable area: the offset table brackets its bytes (heap_attrvalue_point_variable) */
+/*
+ * [리뷰] eb_cell_num — eb_extract/eb_num_load/eb_raw_kid 가 부른다; 가변 영역의 NUMERIC 셀을 오프셋 표로 찾아 0(NULL)/1/-1(워드
+ * 초과·scale 불일치)
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 0 반환 시 *num 미기록
+ * 바뀐 것: 신설 +18줄
+ * [지적 A8]
+ */
 static inline int
 eb_cell_num (const EB_COL * col, const HEAP_REC_LAYOUT * lay, NUMERIC_AGG_EXPR_VAL * num)
 {
@@ -505,6 +534,13 @@ eb_cell_num (const EB_COL * col, const HEAP_REC_LAYOUT * lay, NUMERIC_AGG_EXPR_V
 }
 
 /* a NUMERIC operand of an arithmetic step: 1 a value, 0 NULL, -1 the chunk is for the row path */
+/*
+ * [리뷰] eb_num_load — eb_run_steps 가 부른다; pointed 벡터면 레코드에서(eb_cell_num), 아니면 벡터에서(eb_num_get) NUMERIC 피연산자를
+ * 읽는다
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 반환 0/1/-1 을 호출자가 먼저 본다(3780, 3924)
+ * 바뀐 것: 신설 +15줄
+ */
 static inline int
 eb_num_load (const EXPR_BATCH_PLAN * plan, const EXPR_BATCH * batch, const EB_VEC * vec, int r,
 	     NUMERIC_AGG_EXPR_VAL * out)
@@ -521,6 +557,12 @@ eb_num_load (const EXPR_BATCH_PLAN * plan, const EXPR_BATCH * batch, const EB_VE
   return 1;
 }
 
+/*
+ * [리뷰] eb_elem_size — plan_build/expr_batch_init 가 부른다; 요소 타입별 바이트(8/8/8/16)
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: EB_STR 은 default(16)로 가지만 PTR 벡터라 할당되지 않음
+ * 바뀐 것: 신설 +15줄
+ */
 static int
 eb_elem_size (int etype)
 {
@@ -537,6 +579,12 @@ eb_elem_size (int etype)
     }
 }
 
+/*
+ * [리뷰] eb_grow — 빌드 중 성장 배열 전부가 부른다; 8 부터 2 배 realloc, 새 영역 0 채움
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 소유권은 plan/EB_BUILD 필드로 이전, plan_free/plan_build 가 해제
+ * 바뀐 것: 신설 +22줄
+ */
 static int
 eb_grow (void **arr, int *cap, int n, size_t elem)
 {
@@ -561,6 +609,12 @@ eb_grow (void **arr, int *cap, int n, size_t elem)
 }
 
 /* a 64-byte aligned area of at least bytes, from the plan's blocks; NULL (error set) on OOM */
+/*
+ * [리뷰] eb_arena_alloc — IN 리스트·OR 표·청크 배열(expr_batch_init)이 부른다; 64B 정렬 bump 할당, 블록은 plan->blocks 체인
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: plan_free 2711-2717 이 체인 해제
+ * 바뀐 것: 신설 +27줄
+ */
 static void *
 eb_arena_alloc (EXPR_BATCH_PLAN * plan, size_t bytes)
 {
@@ -589,6 +643,12 @@ eb_arena_alloc (EXPR_BATCH_PLAN * plan, size_t bytes)
   return p;
 }
 
+/*
+ * [리뷰] eb_decline — 빌드 함수들이 부른다; 첫 사유만 why_not 에 남기고 EXPR_BATCH_FALLBACK
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 빌드 함수들이 부른다; 첫 사유만 why_not 에 남기고 EXPR_BATCH_FALLBACK
+ * 바뀐 것: 신설 +9줄
+ */
 static int
 eb_decline (EB_BUILD * b, const char *why)
 {
@@ -599,6 +659,13 @@ eb_decline (EB_BUILD * b, const char *why)
   return EXPR_BATCH_FALLBACK;
 }
 
+/*
+ * [리뷰] eb_etype_of — 컬럼·스칼라·프로그램 스텝 타입 판정; SHORT/INTEGER/BIGINT/DATE→I64, FLOAT/DOUBLE→F64, NUMERIC→NUM
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 허용 집합이 eb_load_leaf_constants(3013) 보다 넓다
+ * 바뀐 것: 신설 +22줄
+ * [지적 A34]
+ */
 static bool
 eb_etype_of (DB_TYPE type, int *etype)
 {
@@ -622,6 +689,12 @@ eb_etype_of (DB_TYPE type, int *etype)
     }
 }
 
+/*
+ * [리뷰] eb_new_vec — 벡터 하나 추가(vecs/vsrc 병행 성장)
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 벡터 하나 추가(vecs/vsrc 병행 성장)
+ * 바뀐 것: 신설 +20줄
+ */
 static int
 eb_new_vec (EB_BUILD * b, int kind, int etype, DB_TYPE dbtype)
 {
@@ -644,6 +717,14 @@ eb_new_vec (EB_BUILD * b, int kind, int etype, DB_TYPE dbtype)
 }
 
 /* the vector of a column: one per (attribute, cache), created on first use */
+/*
+ * [리뷰] eb_new_col_vec — leaf·집계·프로그램 leaf 가 부른다; attrid 로 raw locator 를 받아 컬럼 벡터를 만들거나 기존 것을 돌려준다; 플랜의
+ * repid/n_variable/fixed_length 를 고정
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 문자열은 allow_str 일 때만 EB_STR(PTR), NUMERIC ≤18 자리는 N64; floating NUMERIC·repid 불일치 거절
+ * 바뀐 것: 신설 +86줄
+ * [지적 A15]
+ */
 static int
 eb_new_col_vec (EB_BUILD * b, HEAP_CACHE_ATTRINFO * attr_cache, ATTR_ID attrid)
 {
@@ -731,6 +812,12 @@ eb_new_col_vec (EB_BUILD * b, HEAP_CACHE_ATTRINFO * attr_cache, ATTR_ID attrid)
   return vec;
 }
 
+/*
+ * [리뷰] eb_col_of_vec — 벡터→컬럼 인덱스 역조회(선형)
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 빌드 시점만
+ * 바뀐 것: 신설 +14줄
+ */
 static int
 eb_col_of_vec (const EXPR_BATCH_PLAN * plan, int vec)
 {
@@ -746,6 +833,12 @@ eb_col_of_vec (const EXPR_BATCH_PLAN * plan, int vec)
   return -1;
 }
 
+/*
+ * [리뷰] eb_new_scalar_vec — 상수/프로그램 셀을 1 요소 벡터로
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: value 또는 cell 중 하나
+ * 바뀐 것: 신설 +13줄
+ */
 static int
 eb_new_scalar_vec (EB_BUILD * b, int etype, DB_TYPE dbtype, const DB_VALUE * value, DB_VALUE * const *cell, int conv)
 {
@@ -760,6 +853,12 @@ eb_new_scalar_vec (EB_BUILD * b, int etype, DB_TYPE dbtype, const DB_VALUE * val
   return vec;
 }
 
+/*
+ * [리뷰] eb_emit — 스텝 추가; MASK_PUSH/POP 외에는 SLOT 출력 벡터 생성
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 스텝 추가; MASK_PUSH/POP 외에는 SLOT 출력 벡터 생성
+ * 바뀐 것: 신설 +32줄
+ */
 static int
 eb_emit (EB_BUILD * b, int op, int in1, int in2, int etype, DB_TYPE result_type, int *out_vec)
 {
@@ -796,6 +895,13 @@ eb_emit (EB_BUILD * b, int op, int in1, int in2, int etype, DB_TYPE result_type,
 /* ---------------------------------------------------------------------------------------- */
 /* the scan's value-list slots: which attribute each TYPE_CONSTANT operand really reads */
 
+/*
+ * [리뷰] eb_build_slot_map — plan_build 가 부른다; cls_regu_list_pred/rest 의 TYPE_ATTR_ID→vfetch_to 슬롯을 (slot,
+ * attrid, cache) 표로
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: TARGET_CLASS 외는 빈 표
+ * 바뀐 것: 신설 +37줄
+ */
 static int
 eb_build_slot_map (EB_BUILD * b)
 {
@@ -834,6 +940,12 @@ eb_build_slot_map (EB_BUILD * b)
   return NO_ERROR;
 }
 
+/*
+ * [리뷰] eb_slot_lookup — DB_VALUE 주소로 슬롯 표 조회(선형)
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: DB_VALUE 주소로 슬롯 표 조회(선형)
+ * 바뀐 것: 신설 +16줄
+ */
 static bool
 eb_slot_lookup (const EB_BUILD * b, const DB_VALUE * slot, ATTR_ID * attrid, HEAP_CACHE_ATTRINFO ** attr_cache)
 {
@@ -856,6 +968,14 @@ eb_slot_lookup (const EB_BUILD * b, const DB_VALUE * slot, ATTR_ID * attrid, HEA
 
 /* A raw leaf for one filter term: *out the leaf's index, or -1 when the term is not one the batch runs as a leaf
  * (the compiled filter runs it per row).  NO_ERROR, or an allocation error. */
+/*
+ * [리뷰] eb_add_raw_leaf — eb_build_filter/or_leaf 가 부른다; raw info 를 leaf 로: IN→eb_add_in_leaf,
+ * 문자열→eb_add_str_leaf, 그 외 숫자/DATE/NUMERIC 상수·두 컬럼 비교; 상수가 왼쪽이면 rel_op 반전
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: out<0 이면 row term 으로 남긴다(why_not 지움)
+ * 바뀐 것: 신설 +93줄
+ * [지적 A34]
+ */
 static int
 eb_add_raw_leaf (EB_BUILD * b, const EXPR_RAW_LEAF_INFO * info, int *out)
 {
@@ -954,6 +1074,13 @@ eb_add_raw_leaf (EB_BUILD * b, const EXPR_RAW_LEAF_INFO * info, int *out)
 /* string leaves: a VARCHAR column read from the record, against a string constant */
 
 /* a VARCHAR in the variable area: 1 its bytes, 0 NULL, -1 a long or compressed string (the row path's) */
+/*
+ * [리뷰] eb_cell_str — eb_raw_kid_str/in 이 부른다; 가변 영역 문자열 셀: 0(NULL)/1(길이 접두 1 바이트)/-1(0xFF 압축 헤더·길이 불일치)
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: VARCHAR/CHAR 공통 인코딩(G1-04 참조)
+ * 바뀐 것: 신설 +20줄
+ * [지적 A15]
+ */
 static inline int
 eb_cell_str (const EB_COL * col, const HEAP_REC_LAYOUT * lay, const char **str, int *len)
 {
@@ -976,6 +1103,13 @@ eb_cell_str (const EB_COL * col, const HEAP_REC_LAYOUT * lay, const char **str, 
 }
 
 /* the pattern a LIKE leaf matches itself: literals and '%' only ('_' and the escape stay with the row path) */
+/*
+ * [리뷰] eb_like_pattern_ok — 문자열 leaf 빌드·청크 상수 로드가 부른다; '_' 또는 백슬래시가 있으면 false
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 보수적 거절, 이유 주석 없음
+ * 바뀐 것: 신설 +14줄
+ * [지적 A33]
+ */
 static bool
 eb_like_pattern_ok (const char *p, int len)
 {
@@ -992,6 +1126,15 @@ eb_like_pattern_ok (const char *p, int len)
 }
 
 /* a string leaf (expr_pred_term_string_info ()): -1 when the term stays with the row path */
+/*
+ * [리뷰] eb_add_str_leaf — eb_add_raw_leaf 가 부른다; VARCHAR/CHAR 컬럼 = / <> / [NOT] LIKE 상수 leaf(allow_str 켜고 컬럼 벡터
+ * 생성)
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 코드셋·콜레이션 일치 요구
+ * 바뀐 것: 신설 +52줄
+ * [지적 A15]
+ * [지적 A33]
+ */
 static int
 eb_add_str_leaf (EB_BUILD * b, const EXPR_RAW_LEAF_INFO * info, int *out)
 {
@@ -1047,6 +1190,13 @@ eb_add_str_leaf (EB_BUILD * b, const EXPR_RAW_LEAF_INFO * info, int *out)
 
 /* an IN leaf (expr_pred_term_in_info ()): the column, and the list's values for this execution; -1 when the term
  * stays with the row path */
+/*
+ * [리뷰] eb_add_in_leaf — eb_add_raw_leaf 가 부른다; col IN (≤1024 상수) leaf: 리스트 DB_VALUE 포인터·int64·문자열 포인터 배열을
+ * arena 에
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: set 리터럴은 set_get_element_nocopy 로 peek(플랜 수명)
+ * 바뀐 것: 신설 +104줄
+ */
 static int
 eb_add_in_leaf (EB_BUILD * b, const EXPR_RAW_LEAF_INFO * info, int *out)
 {
@@ -1154,6 +1304,12 @@ eb_add_in_leaf (EB_BUILD * b, const EXPR_RAW_LEAF_INFO * info, int *out)
 
 /* whether a string leaf's comparison ignores trailing spaces, as mr_cmpval_char () and mr_cmpval_string () decide:
  * always between two fixed-length strings (a CHAR column and a CHAR literal), else by the system parameter */
+/*
+ * [리뷰] eb_str_ti — IN 리스트·문자열 상수 로드가 부른다; trailing space 무시 여부: prm 또는 CHAR 대 CHAR
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: mr_cmpval_string(object_primitive.c 11416) 과 같은 static 관용구·규칙
+ * 바뀐 것: 신설 +7줄
+ */
 static unsigned char
 eb_str_ti (const EB_LEAF * leaf, const DB_VALUE * k)
 {
@@ -1164,6 +1320,12 @@ eb_str_ti (const EB_LEAF * leaf, const DB_VALUE * k)
 
 /* an IN leaf's list for this page: each value of the column's kind (an exact integer for an integer column, a
  * string of its codeset and collation for a string one), else the page goes to the row path */
+/*
+ * [리뷰] eb_load_in_list — 청크마다 eb_load_leaf_constants 가 부른다; IN 리스트 값을 타입별로 풀고(NULL 표시·ti 일치) SUBSTRING 위치 검증
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 불일치는 eb_fallback
+ * 바뀐 것: 신설 +80줄
+ */
 static int
 eb_load_in_list (EXPR_BATCH_PLAN * plan, EB_LEAF * leaf)
 {
@@ -1247,6 +1409,12 @@ eb_load_in_list (EXPR_BATCH_PLAN * plan, EB_LEAF * leaf)
 
 /* an IN leaf over the selection: TRUE on a value of the list, UNKNOWN on a NULL column or (no value matching) a
  * list with a NULL, FALSE otherwise -- eval_some_eval () */
+/*
+ * [리뷰] eb_raw_kid_in — eb_raw_kid 가 부른다; 선택 행마다 문자열(옵션 SUBSTRING 문자 단위)·정수 IN 비교, NULL/리스트 NULL 은 unk
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: O(rows×k_n)
+ * 바뀐 것: 신설 +82줄
+ */
 static int
 eb_raw_kid_in (EXPR_BATCH_PLAN * plan, EXPR_BATCH * batch, const EB_LEAF * leaf)
 {
@@ -1331,6 +1499,12 @@ eb_raw_kid_in (EXPR_BATCH_PLAN * plan, EXPR_BATCH * batch, const EB_LEAF * leaf)
 }
 
 /* a string leaf over the selection: the collation's comparison ("="), or the pattern; NULL is UNKNOWN */
+/*
+ * [리뷰] eb_raw_kid_str — eb_raw_kid 가 부른다; 문자열 =/<> 는 QSTR_COMPARE, LIKE 는 qstr_like_match(컬럼 콜레이션)
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 압축 문자열은 폴백
+ * 바뀐 것: 신설 +51줄
+ */
 static int
 eb_raw_kid_str (EXPR_BATCH_PLAN * plan, EXPR_BATCH * batch, const EB_LEAF * leaf)
 {
@@ -1385,6 +1559,13 @@ eb_raw_kid_str (EXPR_BATCH_PLAN * plan, EXPR_BATCH * batch, const EB_LEAF * leaf
 
 /* An OR leaf over the disjuncts' leaves (expr_pred_or_raw_leaves ()); -1 in *out, the plan as it was, when one of
  * them is not a leaf the batch runs */
+/*
+ * [리뷰] eb_add_or_leaf — eb_build_filter(_interpreted) 가 부른다; OR 의 분리항별 leaf 들을 만들고 표(or_len/or_leaf) 를 가진 상위
+ * leaf 하나로
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 한 분리항이라도 raw 가 아니면 전부 되돌림
+ * 바뀐 것: 신설 +55줄
+ */
 static int
 eb_add_or_leaf (EB_BUILD * b, const EXPR_RAW_LEAF_INFO * info, const int *len, int nd, int *out)
 {
@@ -1442,6 +1623,12 @@ eb_add_or_leaf (EB_BUILD * b, const EXPR_RAW_LEAF_INFO * info, const int *len, i
 }
 
 /* an interpreted filter: every term of its AND chain a raw leaf, or no batch (nothing runs its terms per row) */
+/*
+ * [리뷰] eb_build_filter_interpreted — 컴파일 안 된 필터: AND 체인 전부가 raw leaf(또는 raw OR) 여야 수락, 아니면 decline
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: kid_leaf malloc → plan_free 해제
+ * 바뀐 것: 신설 +48줄
+ */
 static int
 eb_build_filter_interpreted (EB_BUILD * b)
 {
@@ -1491,6 +1678,15 @@ eb_build_filter_interpreted (EB_BUILD * b)
   return NO_ERROR;
 }
 
+/*
+ * [리뷰] eb_build_filter — plan_build 가 부른다; 컴파일 필터의 루트 모양(AND 체인/단일) 을 받아 kid 마다 raw leaf 또는 row term(-1)
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: share 있으면 decline; row term 있으면 pred_attr_cache 필요
+ * 바뀐 것: 신설 +75줄
+ * [지적 A6]
+ * [지적 A10]
+ * [지적 A28]
+ */
 static int
 eb_build_filter (EB_BUILD * b)
 {
@@ -1572,6 +1768,12 @@ eb_build_filter (EB_BUILD * b)
  * reading it back -- and a NUMERIC with a single consumer, a raw leaf or an arithmetic step
  * (eb_num_load ()), whose one parse is the decode anyway.  A column more than one consumer
  * reads, or one an aggregate or another step reads, keeps its vector. */
+/*
+ * [리뷰] eb_choose_pointed — plan_build 가 부른다; leaf 에만 쓰이는(고정 컬럼) 또는 한 번만 읽히는 컬럼을 디코드 없이 레코드에서 읽는 PTR 로
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 문자열은 처음부터 PTR
+ * 바뀐 것: 신설 +52줄
+ */
 static void
 eb_choose_pointed (EXPR_BATCH_PLAN * plan)
 {
@@ -1628,6 +1830,13 @@ eb_choose_pointed (EXPR_BATCH_PLAN * plan)
 /* ---------------------------------------------------------------------------------------- */
 /* the operand program: one vector per cell, one step per typed kernel, in program order */
 
+/*
+ * [리뷰] eb_program_cell_vec — eb_build_program/aggs/gby 가 부른다; 프로그램 셀→벡터: prologue 가 채우는 셀은 스칼라(cell 주소), 와이어드
+ * 셀은 슬롯 컬럼 또는 리터럴
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: row 스텝 셀은 -1
+ * 바뀐 것: 신설 +63줄
+ */
 static int
 eb_program_cell_vec (EB_BUILD * b, int cell)
 {
@@ -1694,6 +1903,12 @@ eb_program_cell_vec (EB_BUILD * b, int cell)
 
 /* an operand vector a typed kernel consumes must carry the kernel's type: a scalar whose
  * type is only known at run time is bound to the kernel's here and checked when loaded */
+/*
+ * [리뷰] eb_bind_operand — 미정 타입 스칼라에 커널 타입을 부여하거나 타입 일치 검사(NUM 계열은 폭 무관)
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 미정 타입 스칼라에 커널 타입을 부여하거나 타입 일치 검사(NUM 계열은 폭 무관)
+ * 바뀐 것: 신설 +19줄
+ */
 static bool
 eb_bind_operand (EB_BUILD * b, int vec, DB_TYPE type, int etype)
 {
@@ -1714,6 +1929,13 @@ eb_bind_operand (EB_BUILD * b, int vec, DB_TYPE type, int etype)
   return v->dbtype == type && (v->etype == etype || (EB_IS_NUM (v->etype) && EB_IS_NUM (etype)));
 }
 
+/*
+ * [리뷰] eb_build_program — 집계 피연산자/투영 프로그램을 벡터 스텝으로: LEAF_FETCH→컬럼, ADD/SUB/MUL(+NUM_CAST), RESOLVED 상수 범위,
+ * JUMP_NULL_ARITH→MASK_PUSH/POP
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: n_shared>0·기타 스텝은 decline; step_needed 로 불필요 스텝 생략
+ * 바뀐 것: 신설 +210줄
+ */
 static int
 eb_build_program (EB_BUILD * b)
 {
@@ -1936,6 +2158,12 @@ enum eb_group
   EB_GROUP_NUMERIC
 };
 
+/*
+ * [리뷰] eb_group_of — fused tree 의 그룹(NUMERIC/INT/DOUBLE) 판정
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: FLOAT 는 0 → fused 거절
+ * 바뀐 것: 신설 +21줄
+ */
 static int
 eb_group_of (const REGU_VARIABLE * regu)
 {
@@ -1958,6 +2186,12 @@ eb_group_of (const REGU_VARIABLE * regu)
     }
 }
 
+/*
+ * [리뷰] eb_fused_leaf — eb_fused_tree 가 부른다; 슬롯 컬럼/리터럴 leaf 를 그룹 타입으로(INT2NUM, I2F 삽입)
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: eb_fused_tree 가 부른다; 슬롯 컬럼/리터럴 leaf 를 그룹 타입으로(INT2NUM, I2F 삽입)
+ * 바뀐 것: 신설 +81줄
+ */
 static int
 eb_fused_leaf (EB_BUILD * b, const REGU_VARIABLE * regu, int group, bool wrapped, int *out_vec)
 {
@@ -2040,6 +2274,12 @@ eb_fused_leaf (EB_BUILD * b, const REGU_VARIABLE * regu, int group, bool wrapped
     }
 }
 
+/*
+ * [리뷰] eb_fused_tree — eb_build_aggs 가 부른다; agg 피연산자의 +,-,* 트리를 스텝으로(CAST_WRAP 은 wrapped leaf, 나눗셈은 decline)
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: INT 그룹은 노드 도메인 결과형
+ * 바뀐 것: 신설 +66줄
+ */
 static int
 eb_fused_tree (EB_BUILD * b, const REGU_VARIABLE * regu, int group, int *out_vec)
 {
@@ -2110,6 +2350,13 @@ eb_fused_tree (EB_BUILD * b, const REGU_VARIABLE * regu, int group, int *out_vec
 /* ---------------------------------------------------------------------------------------- */
 /* the aggregates */
 
+/*
+ * [리뷰] eb_build_aggs — plan_build 가 부른다; COUNT(*)/COUNT/SUM/AVG/MIN/MAX 의 피연산자 벡터를 정한다(프로그램 루트·슬롯 컬럼·리터럴·fused
+ * 트리); gby 면 eb_build_gby 로
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: min_max_optimized/DISTINCT/정렬 거절, agg_optimized 는 유지(소비자가 건너뜀)
+ * 바뀐 것: 신설 +166줄
+ */
 static int
 eb_build_aggs (THREAD_ENTRY * thread_p, EB_BUILD * b)
 {
@@ -2280,6 +2527,12 @@ eb_build_aggs (THREAD_ENTRY * thread_p, EB_BUILD * b)
 /* The program steps a set of root cells depends on, walking back from the roots: a step whose cell is
  * needed is needed, and so are the cells it reads; a lazy-right-side jump is needed when a needed step lies
  * in the range it skips.  A projection's program also computes columns the aggregates never read. */
+/*
+ * [리뷰] eb_program_needed — eb_build_gby 가 부른다; 집계 루트에서 역방향으로 필요한 스텝 표시(JUMP 영역 포함)
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: cell 은 해제, step 은 호출자 소유
+ * 바뀐 것: 신설 +55줄
+ */
 static bool *
 eb_program_needed (const EXPR_PROG * prog, const int *roots, int n_roots)
 {
@@ -2339,6 +2592,13 @@ eb_program_needed (const EXPR_PROG * prog, const int *roots, int n_roots)
 /* A hash GROUP BY's plan: its key columns, and its aggregates' operands as the projection computes them
  * (the program's roots, or plain columns), each cast into its list column's domain (EB_OP_NUM_CAST for a
  * NUMERIC whose scale differs; any other type must already be the domain's). */
+/*
+ * [리뷰] eb_build_gby — eb_build_aggs 가 부른다; GROUP BY 키 컬럼의 raw key locator 와 집계 벡터(투영 프로그램 또는 슬롯), 투영 도메인과 타입
+ * 일치·NUMERIC 도메인 캐스트
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 키는 바이트만(콜레이션 무관 메모)
+ * 바뀐 것: 신설 +185줄
+ */
 static int
 eb_build_gby (EB_BUILD * b)
 {
@@ -2525,6 +2785,12 @@ eb_build_gby (EB_BUILD * b)
   return NO_ERROR;
 }
 
+/*
+ * [리뷰] expr_batch_key_bytes — qexec_batch_gby_consume 이 부른다; 키 컬럼의 (bound 플래그, 길이, 바이트) 를 버퍼에 직렬화
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: cap 초과면 -1
+ * 바뀐 것: 신설 +48줄
+ */
 int
 expr_batch_key_bytes (const EXPR_BATCH_PLAN * plan, const EXPR_BATCH * batch, int r, unsigned char *buf, int cap)
 {
@@ -2576,6 +2842,13 @@ expr_batch_key_bytes (const EXPR_BATCH_PLAN * plan, const EXPR_BATCH * batch, in
 
 /* ---------------------------------------------------------------------------------------- */
 
+/*
+ * [리뷰] expr_batch_plan_build — scan_batch_open_internal 이 부른다; 슬롯맵→필터→집계→재귀 깊이 검사→pointed 선택→스칼라 1 요소·마스크 깊이;
+ * 실패 시 why_not 과 NULL
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 빌드 임시 배열 4 개 전 경로 해제
+ * 바뀐 것: 신설 +122줄
+ */
 EXPR_BATCH_PLAN *
 expr_batch_plan_build (THREAD_ENTRY * thread_p, const EXPR_BATCH_INPUTS * in, const char **why_not)
 {
@@ -2699,6 +2972,12 @@ expr_batch_plan_build (THREAD_ENTRY * thread_p, const EXPR_BATCH_INPUTS * in, co
   return plan;
 }
 
+/*
+ * [리뷰] expr_batch_plan_free — scan_end_scan/plan_build 실패가 부른다; arena 블록 체인과 배열 9 개 해제
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: prog/filter 는 비소유
+ * 바뀐 것: 신설 +54줄
+ */
 void
 expr_batch_plan_free (EXPR_BATCH_PLAN * plan)
 {
@@ -2757,6 +3036,13 @@ expr_batch_plan_free (EXPR_BATCH_PLAN * plan)
 /* The chunk's arrays: the rows, the selection, every column and step vector (and a NUMERIC
  * step's scale bytes), the UNKNOWN marks and the masks.  As many rows as EXPR_BATCH_CHUNK_BYTES
  * holds at this plan's bytes per row, in whole 8-row steps (an int64 vector's cache line). */
+/*
+ * [리뷰] expr_batch_init — scan_batch_open_internal 이 한 번 부른다; 행당 바이트로 청크 용량(8 의 배수, 최소 8) 을 정하고
+ * 벡터·NULL·scale·unk·or·mask 배열을 arena 에
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 재호출 없음(batch_state 가드)
+ * 바뀐 것: 신설 +90줄
+ */
 int
 expr_batch_init (EXPR_BATCH_PLAN * plan, EXPR_BATCH * batch)
 {
@@ -2849,6 +3135,12 @@ expr_batch_init (EXPR_BATCH_PLAN * plan, EXPR_BATCH * batch)
 }
 
 /* the arrays belong to the plan's blocks: nothing to free here */
+/*
+ * [리뷰] expr_batch_final — 배치 포인터 리셋(메모리는 plan 소유)
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 배치 포인터 리셋(메모리는 plan 소유)
+ * 바뀐 것: 신설 +10줄
+ */
 void
 expr_batch_final (EXPR_BATCH * batch)
 {
@@ -2864,6 +3156,12 @@ expr_batch_final (EXPR_BATCH * batch)
 /* per page */
 
 /* a chunk for the row path, and why (the trace's last cause) */
+/*
+ * [리뷰] eb_fallback — 실행 함수들이 부른다; 사유를 plan 에 남기고 FALLBACK
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 실행 함수들이 부른다; 사유를 plan 에 남기고 FALLBACK
+ * 바뀐 것: 신설 +6줄
+ */
 static int
 eb_fallback (EXPR_BATCH_PLAN * plan, const char *why)
 {
@@ -2872,6 +3170,12 @@ eb_fallback (EXPR_BATCH_PLAN * plan, const char *why)
 }
 
 /* the scalars: a literal is the same every page, a program cell may change per execution */
+/*
+ * [리뷰] eb_load_scalars — 청크마다 expr_batch_run 이 부른다; 스칼라 벡터를 DB_VALUE(값 또는 프로그램 셀)에서 타입 확인 후 적재
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 타입 불일치는 폴백
+ * 바뀐 것: 신설 +73줄
+ */
 static int
 eb_load_scalars (EXPR_BATCH_PLAN * plan)
 {
@@ -2946,6 +3250,13 @@ eb_load_scalars (EXPR_BATCH_PLAN * plan)
   return NO_ERROR;
 }
 
+/*
+ * [리뷰] eb_load_leaf_constants — 청크마다 expr_batch_run 이 부른다; leaf 상수(문자열·NULL·NUMERIC·정수/DATE/DOUBLE) 적재
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: SHORT/FLOAT 없음(G1-06)
+ * 바뀐 것: 신설 +84줄
+ * [지적 A34]
+ */
 static int
 eb_load_leaf_constants (EXPR_BATCH_PLAN * plan)
 {
@@ -3038,6 +3349,12 @@ eb_load_leaf_constants (EXPR_BATCH_PLAN * plan)
  *     digits every column value fits in, when the comparison has one result for every row;
  *   - a constant of scale sk > sc is q + f with q = floor (K / 10^(sk - sc)), 0 <= f < 1: when
  *     f = 0 it is q; otherwise no c equals it, c < K is c <= q and c > K is c > q. */
+/*
+ * [리뷰] eb_num_leaf_constant — NUMERIC 상수를 컬럼 scale 로 맞춘다; 범위 밖이면 k_all 로 전행 판정, 자릿수 잘림이면 연산자 조정
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: NUMERIC 상수를 컬럼 scale 로 맞춘다; 범위 밖이면 k_all 로 전행 판정, 자릿수 잘림이면 연산자 조정
+ * 바뀐 것: 신설 +99줄
+ */
 static int
 eb_num_leaf_constant (EB_LEAF * leaf, const DB_VALUE * k, int col_scale)
 {
@@ -3140,6 +3457,13 @@ eb_num_leaf_constant (EB_LEAF * leaf, const DB_VALUE * k, int col_scale)
 
 /* each row's layout, once a chunk: the rows of another representation (an ALTER since the
  * plan) send the chunk to the row path, which decodes them */
+/*
+ * [리뷰] eb_layout_rows — 청크마다 expr_batch_run 이 부른다; 각 레코드의 repid 가 플랜과 같아야 하고 HEAP_REC_LAYOUT 초기화
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 다른 repid 면 폴백
+ * 바뀐 것: 신설 +18줄
+ * [지적 A15]
+ */
 static int
 eb_layout_rows (EXPR_BATCH_PLAN * plan, EXPR_BATCH * batch)
 {
@@ -3162,6 +3486,12 @@ eb_layout_rows (EXPR_BATCH_PLAN * plan, EXPR_BATCH * batch)
 /* Decode columns for the given rows: one column (only_col), or every decoded column not
  * decoded yet this chunk (-1); a pointed column is never decoded.  Record-outer, so each
  * record's bytes are touched once for its columns. */
+/*
+ * [리뷰] eb_extract — 필터·run 이 부른다; 선택 행의 (한 컬럼 또는 전부) 셀을 벡터로 디코드, decoded 표시
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: PTR 컬럼은 건너뜀
+ * 바뀐 것: 신설 +81줄
+ */
 static int
 eb_extract (EXPR_BATCH_PLAN * plan, const EXPR_BATCH * batch, const int *rows, int n, int only_col)
 {
@@ -3247,6 +3577,12 @@ eb_extract (EXPR_BATCH_PLAN * plan, const EXPR_BATCH * batch, const int *rows, i
 /* one raw term over the selection: FALSE rows leave, NULL rows stay marked UNKNOWN; NO_ERROR,
  * or EXPR_BATCH_FALLBACK for a pointed cell the batch does not read */
 /* one side of a two-column leaf for row r: 1 with its value, 0 NULL, -1 a cell the batch does not decode */
+/*
+ * [리뷰] eb_leaf_side — 두 컬럼 비교·IN 이 부른다; PTR 이면 레코드, 아니면 벡터에서 int64/double
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 두 컬럼 비교·IN 이 부른다; PTR 이면 레코드, 아니면 벡터에서 int64/double
+ * 바뀐 것: 신설 +23줄
+ */
 static int
 eb_leaf_side (const EXPR_BATCH_PLAN * plan, const EXPR_BATCH * batch, int vec, int col, int r, int64_t * i, double *d)
 {
@@ -3276,6 +3612,12 @@ static int eb_raw_kid (EXPR_BATCH_PLAN * plan, EXPR_BATCH * batch, const EB_LEAF
 /* An OR leaf over the selection, eval_pred ()'s Kleene OR: TRUE when a disjunct is, else UNKNOWN when one is, else
  * FALSE.  Each disjunct runs as an AND chain on the rows no disjunct before it made TRUE; its leaves raise no errors
  * (what they cannot decide falls the chunk back), so the order they run in shows in nothing but the result. */
+/*
+ * [리뷰] eb_raw_kid_or — eb_filter 가 부른다; OR leaf: 분리항 컬럼을 전체 선택에 대해 먼저 디코드, 분리항별로 선택을 재구성해 3 값 결과 합성
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: unk 복원
+ * 바뀐 것: 신설 +83줄
+ */
 static int
 eb_raw_kid_or (EXPR_BATCH_PLAN * plan, EXPR_BATCH * batch, const EB_LEAF * leaf)
 {
@@ -3362,6 +3704,12 @@ eb_raw_kid_or (EXPR_BATCH_PLAN * plan, EXPR_BATCH * batch, const EB_LEAF * leaf)
 
 /* a leaf comparing two columns of the row, as the fast kernel compares two values of their one type; a NULL on
  * either side is UNKNOWN */
+/*
+ * [리뷰] eb_raw_kid_cols — 두 컬럼 비교 leaf 를 행마다 평가
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 두 컬럼 비교 leaf 를 행마다 평가
+ * 바뀐 것: 신설 +62줄
+ */
 static int
 eb_raw_kid_cols (EXPR_BATCH_PLAN * plan, EXPR_BATCH * batch, const EB_LEAF * leaf)
 {
@@ -3425,6 +3773,13 @@ eb_raw_kid_cols (EXPR_BATCH_PLAN * plan, EXPR_BATCH * batch, const EB_LEAF * lea
   return NO_ERROR;
 }
 
+/*
+ * [리뷰] eb_raw_kid — eb_filter/or 가 부른다; leaf 종류별 분기 후 상수 비교(NUMERIC 은 k_op/k_all)
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: pointed NUMERIC 경로 미초기화 읽기
+ * 바뀐 것: 신설 +174줄
+ * [지적 A8]
+ */
 static int
 eb_raw_kid (EXPR_BATCH_PLAN * plan, EXPR_BATCH * batch, const EB_LEAF * leaf)
 {
@@ -3600,6 +3955,15 @@ eb_raw_kid (EXPR_BATCH_PLAN * plan, EXPR_BATCH * batch, const EB_LEAF * leaf)
   return NO_ERROR;
 }
 
+/*
+ * [리뷰] eb_filter — expr_batch_run 이 부른다; kid 순서대로 raw leaf 는 배열로, row term 은 선택 행마다 expr_scan_pred_eval_kid 로;
+ * 끝에 unk 행 제거
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: row term 평가는 페이지 fix 상태
+ * 바뀐 것: 신설 +103줄
+ * [지적 A6]
+ * [지적 A10]
+ */
 static int
 eb_filter (EXPR_BATCH_PLAN * plan, EXPR_BATCH * batch, THREAD_ENTRY * thread_p, struct val_descr *vd)
 {
@@ -3705,6 +4069,13 @@ eb_filter (EXPR_BATCH_PLAN * plan, EXPR_BATCH * batch, THREAD_ENTRY * thread_p, 
 }
 
 /* the operand steps over the selection; every typed loop mirrors its row kernel's checks */
+/*
+ * [리뷰] eb_run_steps — expr_batch_run 이 부른다; 스텝 벡터 실행(MASK, INT2NUM, NUM_CAST 반올림, I2F, +,-,*
+ * int64/double/NUMERIC) 과 오버플로 폴백
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: expr_batch_run 이 부른다; 스텝 벡터 실행(MASK, INT2NUM, NUM_CAST 반올림, I2F, +,-,* int64/double/NUMERIC) 과 오버플로 폴백
+ * 바뀐 것: 신설 +248줄
+ */
 static int
 eb_run_steps (EXPR_BATCH_PLAN * plan, const EXPR_BATCH * batch)
 {
@@ -3954,6 +4325,13 @@ eb_run_steps (EXPR_BATCH_PLAN * plan, const EXPR_BATCH * batch)
   return NO_ERROR;
 }
 
+/*
+ * [리뷰] expr_batch_run — scan_batch_iter_next/expr_chunk_eval_consume 이 청크마다 부른다; 레이아웃→필터 prologue→leaf
+ * 상수→필터→(선택 있으면) 프로그램 prologue·상수 범위→스칼라→디코드→스텝
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: prepare 는 exec_stamp 로 실행당 1 회
+ * 바뀐 것: 신설 +81줄
+ */
 int
 expr_batch_run (EXPR_BATCH_PLAN * plan, EXPR_BATCH * batch, THREAD_ENTRY * thread_p, struct val_descr *vd)
 {
@@ -4040,6 +4418,12 @@ expr_batch_run (EXPR_BATCH_PLAN * plan, EXPR_BATCH * batch, THREAD_ENTRY * threa
 /* the accumulators */
 
 /* the DB_VALUE a row of this vector would have carried on the row path */
+/*
+ * [리뷰] eb_pack_dbv — 집계 소비자가 부른다; 벡터 요소를 DB_VALUE 로(컬럼 NUMERIC 은 도메인 precision/scale, 계산값은 floating)
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 집계 소비자가 부른다; 벡터 요소를 DB_VALUE 로(컬럼 NUMERIC 은 도메인 precision/scale, 계산값은 floating)
+ * 바뀐 것: 신설 +71줄
+ */
 static void
 eb_pack_dbv (const EXPR_BATCH_PLAN * plan, const EB_VEC * vec, int r, DB_VALUE * out)
 {
@@ -4112,12 +4496,24 @@ eb_pack_dbv (const EXPR_BATCH_PLAN * plan, const EB_VEC * vec, int r, DB_VALUE *
     }
 }
 
+/*
+ * [리뷰] expr_batch_agg_covered — qdata_evaluate_aggregate_batch 가 부른다; 노드가 배치 담당인지
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: qdata_evaluate_aggregate_batch 가 부른다; 노드가 배치 담당인지
+ * 바뀐 것: 신설 +5줄
+ */
 bool
 expr_batch_agg_covered (const EXPR_BATCH_PLAN * plan, int node_ord)
 {
   return node_ord >= 0 && node_ord < plan->n_aggs && plan->aggs[node_ord].covered != 0;
 }
 
+/*
+ * [리뷰] expr_batch_agg_count — COUNT(*)/COUNT(col)
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: COUNT(*)/COUNT(col)
+ * 바뀐 것: 신설 +18줄
+ */
 int
 expr_batch_agg_count (const EXPR_BATCH_PLAN * plan, const EXPR_BATCH * batch, int node_ord)
 {
@@ -4137,6 +4533,12 @@ expr_batch_agg_count (const EXPR_BATCH_PLAN * plan, const EXPR_BATCH * batch, in
   return cnt;
 }
 
+/*
+ * [리뷰] expr_batch_agg_next_value — 첫 non-NULL 값을 DB_VALUE 로(누산기 시드용)
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: vec<0 노드에는 호출되지 않음(query_aggregate.cpp 1141-1215)
+ * 바뀐 것: 신설 +22줄
+ */
 bool
 expr_batch_agg_next_value (const EXPR_BATCH_PLAN * plan, const EXPR_BATCH * batch, int node_ord, int *pos,
 			   DB_VALUE * out)
@@ -4160,6 +4562,12 @@ expr_batch_agg_next_value (const EXPR_BATCH_PLAN * plan, const EXPR_BATCH * batc
   return false;
 }
 
+/*
+ * [리뷰] expr_batch_agg_sum_rest — pos 이후 값을 SUM_ACC 에 타입별 덧셈, qdata_sum_acc_add_dbv 와 같은 오버플로 검사
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: pos 이후 값을 SUM_ACC 에 타입별 덧셈, qdata_sum_acc_add_dbv 와 같은 오버플로 검사
+ * 바뀐 것: 신설 +77줄
+ */
 int
 expr_batch_agg_sum_rest (const EXPR_BATCH_PLAN * plan, const EXPR_BATCH * batch, int node_ord, int pos, SUM_ACC * sum,
 			 INT64 * n_added)
@@ -4238,6 +4646,12 @@ overflow:
   return ER_QPROC_OVERFLOW_ADDITION;
 }
 
+/*
+ * [리뷰] expr_batch_agg_type — 노드 피연산자 벡터의 DB_TYPE
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 노드 피연산자 벡터의 DB_TYPE
+ * 바뀐 것: 신설 +7줄
+ */
 DB_TYPE
 expr_batch_agg_type (const EXPR_BATCH_PLAN * plan, int node_ord)
 {
@@ -4246,6 +4660,12 @@ expr_batch_agg_type (const EXPR_BATCH_PLAN * plan, int node_ord)
   return (a->vec >= 0) ? (DB_TYPE) plan->vecs[a->vec].dbtype : DB_TYPE_NULL;
 }
 
+/*
+ * [리뷰] expr_batch_agg_extremum — 정수/DATE MIN/MAX 를 한 번에(첫 동값 유지)
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 정수/DATE MIN/MAX 를 한 번에(첫 동값 유지)
+ * 바뀐 것: 신설 +33줄
+ */
 int
 expr_batch_agg_extremum (const EXPR_BATCH_PLAN * plan, const EXPR_BATCH * batch, int node_ord, bool is_min,
 			 DB_VALUE * out)
@@ -4285,6 +4705,12 @@ expr_batch_agg_extremum (const EXPR_BATCH_PLAN * plan, const EXPR_BATCH * batch,
 /* ---------------------------------------------------------------------------------------- */
 /* chunks between nodes */
 
+/*
+ * [리뷰] expr_chunk_node_init — 청크 파이프라인 노드 초기화
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 청크 파이프라인 노드 초기화
+ * 바뀐 것: 신설 +11줄
+ */
 void
 expr_chunk_node_init (EXPR_CHUNK_NODE * node, const char *name, EXPR_CHUNK_CONSUME consume, void *state,
 		      EXPR_CHUNK_NODE * next)
@@ -4297,6 +4723,12 @@ expr_chunk_node_init (EXPR_CHUNK_NODE * node, const char *name, EXPR_CHUNK_CONSU
   node->rows = 0;
 }
 
+/*
+ * [리뷰] expr_chunk_push — 다음 노드의 consume 호출·통계
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 다음 노드의 consume 호출·통계
+ * 바뀐 것: 신설 +11줄
+ */
 int
 expr_chunk_push (THREAD_ENTRY * thread_p, EXPR_CHUNK_NODE * node, EXPR_BATCH_PLAN * plan, EXPR_BATCH * batch)
 {
@@ -4309,6 +4741,12 @@ expr_chunk_push (THREAD_ENTRY * thread_p, EXPR_CHUNK_NODE * node, EXPR_BATCH_PLA
   return node->consume (thread_p, node, plan, batch);
 }
 
+/*
+ * [리뷰] expr_chunk_eval_consume — expr_batch_run 뒤 선택이 남으면 다음 노드로
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: expr_batch_run 뒤 선택이 남으면 다음 노드로
+ * 바뀐 것: 신설 +11줄
+ */
 int
 expr_chunk_eval_consume (THREAD_ENTRY * thread_p, EXPR_CHUNK_NODE * node, EXPR_BATCH_PLAN * plan, EXPR_BATCH * batch)
 {
@@ -4321,12 +4759,24 @@ expr_chunk_eval_consume (THREAD_ENTRY * thread_p, EXPR_CHUNK_NODE * node, EXPR_B
   return expr_chunk_push (thread_p, node->next, plan, batch);
 }
 
+/*
+ * [리뷰] expr_batch_fallback_why — 마지막 폴백 사유
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 마지막 폴백 사유
+ * 바뀐 것: 신설 +5줄
+ */
 const char *
 expr_batch_fallback_why (const EXPR_BATCH_PLAN * plan)
 {
   return (plan != NULL) ? plan->fallback_why : NULL;
 }
 
+/*
+ * [리뷰] expr_batch_plan_note_page — 페이지·폴백 페이지 카운트
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: 페이지·폴백 페이지 카운트
+ * 바뀐 것: 신설 +9줄
+ */
 void
 expr_batch_plan_note_page (EXPR_BATCH_PLAN * plan, bool fallback)
 {
@@ -4337,6 +4787,12 @@ expr_batch_plan_note_page (EXPR_BATCH_PLAN * plan, bool fallback)
     }
 }
 
+/*
+ * [리뷰] expr_batch_dump — trace 출력 한 줄
+ * develop: develop 에 없음 (c966fabc6 에 expr_batch.c 자체가 없다)
+ * 이 PR: trace 출력 한 줄
+ * 바뀐 것: 신설 +20줄
+ */
 void
 expr_batch_dump (FILE * fp, const EXPR_BATCH_PLAN * plan, const char *why_not, int indent)
 {

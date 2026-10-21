@@ -4496,6 +4496,15 @@ numeric_agg_expr_from_dbv (const DB_VALUE * dbv, NUMERIC_AGG_EXPR_VAL * out)
  * 17-byte DB_VALUE in between: a page batch (expr_batch.c) loads a NUMERIC column
  * straight from the records into the word domain the aggregate accumulator takes.
  */
+/*
+ * [리뷰] numeric_agg_expr_from_disk — 3바이트 헤더 디스크 NUMERIC(header[0]: 부호 bit7 + 총 크기 bits0-6, header[1]: scale
+ * 부호, header[2]: scale, 이어서 big-endian 크기)을 DB_VALUE 없이 NUMERIC_AGG_EXPR_VAL 로 푼다. 유일한 호출자
+ * eb_cell_num(expr_batch.c:498)이 가변 영역 offset 표로 avail = next_off - this_off 를 넘긴다.
+ * develop: develop 에 없음(numeric_agg_expr_make 는 base numeric_opfunc.c:4449 에 있음)
+ * 이 PR: size<3·size>avail·nbytes>17 은 false; nbytes==17 이면 최상위 바이트가 0 일 때만 16바이트로 줄여 uint128 에 담는다.
+ * 바뀐 것: 신설 +43줄(extern)
+ * [지적 A47]
+ */
 bool
 numeric_agg_expr_from_disk (const unsigned char *disk, int avail, NUMERIC_AGG_EXPR_VAL * out)
 {

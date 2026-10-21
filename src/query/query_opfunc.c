@@ -539,6 +539,14 @@ qdata_release_valptr_list_prog (THREAD_ENTRY * thread_p, valptr_list_node * valp
  * resolved one, and the cast into the collation-only STRING domain leaves the value's type (gha-ci 38388019045).
  * A page batch that stands in for the projection (a hash GROUP BY's aggregate operands) casts into the same one.
  */
+/*
+ * [리뷰] qdata_valptr_column_domain — qdata_get_dbval_from_prog(606) 과 qexec_batch_gby_map_create 가 불러 valptr 한
+ * 칼럼이 이번 실행에서 갖는 도메인(노드 도메인 → VARIABLE 이면 실행 도메인 → 소비자 도메인, 없으면 now)을 돌려준다
+ * develop: base query_opfunc.c:536 qdata_get_dbval_from_prog 안의 블록(570-585)으로 인라인돼 있었다 — 같은 3단계, 같은 폴백
+ * 이 PR: 그 블록을 공개 함수로 추출. qexec_consumer_domain 이 NULL 이면 now 로 폴백하므로 호출부의 'domain==NULL 이면 검사 생략'(607-611)은
+ * now 도 NULL 일 때만 — base 와 동일한 의미
+ * 바뀐 것: 추출 13줄 (base 와 로직 동일, 호출자 1 → 2)
+ */
 TP_DOMAIN *
 qdata_valptr_column_domain (REGU_VARIABLE * regu_var_p, const val_descr * val_desc_p)
 {
@@ -557,6 +565,14 @@ qdata_valptr_column_domain (REGU_VARIABLE * regu_var_p, const val_descr * val_de
  * qdata_valptr_prog_settle () - the list's program for this execution, compiled (or recompiled for other bound
  *				  types) as the first row's qdata_valptr_prog_ensure () would, without evaluating a row
  *   return: the active program, or NULL when the list keeps the interpreted fetch
+ */
+/*
+ * [리뷰] qdata_valptr_prog_settle — qexec_batch_gby_map_create(직렬·px initialize) 가 불러 valptr 목록의 컴파일된 식 프로그램을
+ * 돌려준다. 미컴파일(state 0)이면 컴파일, 서명/공유 스펙이 어긋나면 해제 후 재컴파일, state 가 1 이 아니면 NULL
+ * develop: develop 에 없음
+ * 이 PR: qdata_valptr_prog_ensure 와 같은 재컴파일 규칙을 평가 없이(settle 만) 하는 변형. state 2(거부) 이면 매 호출 NULL 을 돌려주고 재시도하지
+ * 않는다(의도로 보임 — 거부된 목록은 인터프리터 경로)
+ * 바뀐 것: 신설 23줄, 공개 함수
  */
 void *
 qdata_valptr_prog_settle (THREAD_ENTRY * thread_p, valptr_list_node * valptr_list_p, val_descr * val_desc_p)
@@ -586,6 +602,15 @@ qdata_valptr_prog_settle (THREAD_ENTRY * thread_p, valptr_list_node * valptr_lis
  * qdata_get_dbval_from_prog () - a column's value from the evaluated program, run
  *				  through the same trailing domain enforcement as
  *				  qdata_get_dbval_from_constant_regu_variable ()
+ */
+/*
+ * [리뷰] qdata_get_dbval_from_prog — qdata_copy_valptr_list_to_tuple(714) 과 qdata_collect_tuple_values(910) 가
+ * 프로그램이 덮는 칼럼마다 불러 루트 값을 꺼내고 칼럼 도메인과 타입/NUMERIC 정밀도가 다르면 tp_value_auto_cast 로 제자리 변환. 실패 시 에러 세팅 후 NULL
+ * develop: base query_opfunc.c:536-615 — 도메인 결정 블록이 함수 안에 인라인(570-585)인 것 외에 동일. 제자리 캐스트(base
+ * 597)·CLEAR_AT_CLONE_DECACHE 힙 전환·OID assert 모두 base 와 같다
+ * 이 PR: 도메인 결정을 qdata_valptr_column_domain 호출 한 줄로 교체(606). 나머지 동일
+ * 바뀐 것: -19/+1 (추출 리팩터링). 제자리 캐스트와 CSE 공유 슬롯의 상호작용은 develop 동일(선재) — 단위 회귀 'random lists over shared columns'
+ * 가 head·base 모두 PASS
  */
 static DB_VALUE *
 qdata_get_dbval_from_prog (THREAD_ENTRY * thread_p, REGU_VARIABLE * regu_var_p, EXPR_PROG * prog, int root_idx,

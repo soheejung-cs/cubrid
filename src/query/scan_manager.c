@@ -3483,6 +3483,17 @@ scan_init_scan_id (SCAN_ID * scan_id, bool mvcc_select_lock_needed, SCAN_OPERATI
  *
  * Note: If you feel the need
  */
+/*
+ * [리뷰] scan_open_heap_scan — qexec_open_scan(query_executor.c 9449·9474)·파티션 재오픈(11354·11397)·px_scan_task 가
+ * 부른다. SCAN_ID/HEAP_SCAN_ID 를 접근 스펙 값으로 채우고 NO_ERROR 를 돌려준다
+ * develop: develop(c966fabc6 3478~) 도 cached_scan 인자와 `scan_id->cached_scan = cached_scan && (scan_type ==
+ * S_HEAP_SCAN)` 을 이미 갖고 있다; batch_* 필드는 없다
+ * 이 PR: 3546-3559 에
+ * batch_plan/batch/batch_state/batch_vpid/batch_started/batch_rowmode/batch_why_not/batch_iter/batch_page_more/batch_pos/batch_slot/batch_last_slot/batch_copy/batch_copy_cap
+ * 14개 초기화 추가. 이전 값을 free 하지 않지만 재오픈 전엔 항상 scan_end_scan(11201) 이 먼저라 안전. scan_init_scan_id(3430-3457) 는
+ * cached_scan 을 건드리지 않는다(관찰 (c) 해소)
+ * 바뀐 것: 필드 초기화 추가 +14줄
+ */
 int
 scan_open_heap_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id,
 		     /* fields of SCAN_ID */
@@ -5125,6 +5136,15 @@ exit_on_error:
  *
  * Note: If you feel the need
  */
+/*
+ * [리뷰] scan_reset_scan_block — qexec_next_scan_block_iterations·qexec_reset_sa_inner_scan_block 이 바깥 행마다 안쪽
+ * 스캔을 되감을 때 부른다. 스캔 타입별 커서 초기화 후 SCAN_CODE
+ * develop: develop 5105~: S_HEAP_SCAN 비그룹 분기는 position·curr_oid 리셋뿐. qexec_enter_temporary_scope(5112) 는 base
+ * 에도 있다
+ * 이 PR: 5149-5152: batch_started 면 scan_batch_rewind 호출(페이지 조건부 unfix + 배치 커서 리셋, batch_iter/batch_state 는 유지해
+ * 다음 되감기에도 배치를 탄다)
+ * 바뀐 것: 분기 1개 추가 +4줄
+ */
 SCAN_CODE
 scan_reset_scan_block (THREAD_ENTRY * thread_p, SCAN_ID * s_id)
 {
@@ -5449,6 +5469,18 @@ scan_next_scan_block (THREAD_ENTRY * thread_p, SCAN_ID * s_id)
  *   scan_id(in/out): Scan identifier
  *
  * Note: If you feel the need
+ */
+/*
+ * [리뷰] scan_end_scan — qexec_clear_xasl·qexec_next_scan_block·파티션 전환·px finalize 가 부른다. 스캔 자원을 놓고
+ * status=S_ENDED
+ * develop: develop 5426~: 비그룹 힙 분기는 scancache_inited 면 heap_scancache_end 만(5464)
+ * 이 PR: 5492-5497 배치가 든 페이지를 cache_last_fix_page==false 일 때만 unfix(참이면 heap_scancache_quick_end 가 놓는다) →
+ * heap_scancache_end → 5503-5523
+ * batch(expr_batch_final+free)·batch_copy(cap=0)·batch_plan(expr_batch_plan_free) 해제와
+ * state/started/rowmode/iter/page_more/pos 리셋. batch_slot/last_slot/vpid/why_not 은
+ * 남는다(open_filter·rewind·open_internal 이 다시 세팅)
+ * 바뀐 것: unfix 분기 + 해제 블록 +31줄
+ * [지적 A41]
  */
 void
 scan_end_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
@@ -6156,6 +6188,13 @@ typedef enum
  *
  * Note: If there are no more scan items, S_END is returned. If an error occurs, S_ERROR is returned.
  */
+/*
+ * [리뷰] scan_next_heap_scan — scan_next_scan_local 이 S_HEAP_SCAN 에서 부른다. batch_iter 가 아니면 행
+ * 경로(scan_next_heap_scan_rows) 그대로; 반복자면 '행 모드 페이지를 다 읽으면 끄고 scan_batch_iter_next, S_DOESNT_FIT 이면 다시 행 모드' 루프
+ * develop: develop 6105~ 의 scan_next_heap_scan 이 행 경로 본체였다(지금의 scan_next_heap_scan_rows)
+ * 이 PR: 본체를 scan_next_heap_scan_rows 로 떼고 29줄짜리 디스패처로 바꿈. 루프는 DOESNT_FIT 마다 한 페이지를 행 모드로 소비하므로 종료한다
+ * 바뀐 것: 함수 분리·디스패처 신설 +29줄
+ */
 static SCAN_CODE
 scan_next_heap_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
 {
@@ -6188,6 +6227,16 @@ scan_next_heap_scan (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
 
 /*
  * scan_next_heap_scan_rows () - the heap scan's next row, the row path: record by record, each through the filter
+ */
+/*
+ * [리뷰] scan_next_heap_scan_rows — scan_next_heap_scan 이 부른다. 한 행을 heap_next(_1page)/heap_prev 로 읽고 데이터 필터·MVCC
+ * 락·rest 값 fetch 뒤 S_SUCCESS/S_END/S_ERROR
+ * develop: develop scan_next_heap_scan(6105-6490) 과 동일 본체; 전진 분기는 heap_next 한 가지(6169)
+ * 이 PR: 6256-6273: batch_rowmode 면 heap_next_1page(&batch_vpid) 로 그 페이지만 걷고, !batch_iter &&
+ * read_mode!=LOCAL_CACHE 면 cache_last_fix_page 를 호출 동안 true 로 강제(복원 6272). 나머지 384줄은 base 와 같다(diff 로 확인). 강제
+ * 보유는 scan_id->fixed 를 보지 않는다(G11-01)
+ * 바뀐 것: 분기 1개 추가(+24줄), 나머지 동일
+ * [지적 A10]
  */
 static SCAN_CODE
 scan_next_heap_scan_rows (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
@@ -8175,6 +8224,13 @@ exit_on_error:
  * program are settled here, before any row, the way the row path settles them on its first
  * row, so the batch reads the forms this execution would use.
  */
+/*
+ * [리뷰] scan_batch_open — qexec_intprt_fnc(12758)·px_scan_task initialize 가 부른다.
+ * scan_batch_open_internal(cached_ok=false) 의 래퍼, batch_state(1 사용/2 거절) 반환
+ * develop: develop 에 없음
+ * 이 PR: 신설
+ * 바뀐 것: 신설 +6줄
+ */
 int
 scan_batch_open (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, const ACCESS_SPEC_TYPE * spec,
 		 cubxasl::aggregate_list_node * agg_list, val_descr * vd, const EXPR_BATCH_GBY_MAP * gby)
@@ -8184,6 +8240,18 @@ scan_batch_open (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, const ACCESS_SPEC_T
 
 /* scan_batch_open (); cached_ok: the scan may read its pages through a local copy (the filter iterator fixes the
  * page itself for each chunk) */
+/*
+ * [리뷰] scan_batch_open_internal — scan_batch_open/open_filter/open_rows 가 부른다. 배치 적격 7조건 검사 →
+ * eval_data_filter_ensure_prog 로 필터 컴파일 확정 → EXPR_BATCH_INPUTS 채워 expr_batch_plan_build → EXPR_BATCH
+ * malloc+init. batch_state 를 1/2 로 확정하고 그 값을 돌려준다
+ * develop: develop 에 없음
+ * 이 PR: 신설. 거절 사유는 batch_why_not 문자열. 8247 `in.is_peeking = true` 가 플랜 빌더의 '복사 스캔 거절'(expr_batch.c:2589) 을
+ * 무력화한다(G11-01). 8207 이 8212 보다 먼저 scan_cache 필드를 읽는다(G11-03). 실패 경로의 batch/batch_plan 해제는 짝이 맞는다
+ * 바뀐 것: 신설 +89줄
+ * [지적 A10]
+ * [지적 A40]
+ * [지적 A42]
+ */
 static int
 scan_batch_open_internal (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, const ACCESS_SPEC_TYPE * spec,
 			  cubxasl::aggregate_list_node * agg_list, val_descr * vd, const EXPR_BATCH_GBY_MAP * gby,
@@ -8291,6 +8359,17 @@ scan_batch_open_internal (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, const ACCE
  * pages, or in the log for this snapshot -- sends the chunk and the rest of the page to the
  * row path, before any row of the chunk is used.
  */
+/*
+ * [리뷰] scan_batch_collect_chunk — scan_batch_iter_next·qexec_batch_scan_chain·px drain_slot_oids 가 부른다.
+ * heap_page_collect_visible 로 한 페이지의 가시 행을 cap 개까지 batch->rows 에 모으고 batch_vpid 를 기록,
+ * S_SUCCESS/S_END/S_DOESNT_FIT/S_ERROR
+ * develop: develop 에 없음
+ * 이 PR: 신설. 8306 `hsidp->batch_vpid = *vpid` 는 iter_next 가 &batch_vpid 를 넘기면 자기대입(관찰 (e):
+ * heap_page_collect_visible 은 const VPID* 를 쓰기만 읽는다 — 무해), 다른 호출자는 외부 vpid 를 넘긴다. DOESNT_FIT/ERROR 면 n_rows=0
+ * 으로 청크를 버린다
+ * 바뀐 것: 신설 +19줄
+ * [지적 A49]
+ */
 SCAN_CODE
 scan_batch_collect_chunk (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, const VPID * vpid, PGSLOTID * slot)
 {
@@ -8322,6 +8401,15 @@ scan_batch_collect_chunk (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, const VPID
  * be deallocated in between (OLD_PAGE_PREVENT_DEALLOC, as heap_next_internal ()).  The page
  * stays fixed until the next step or the scan's end, whatever the scan's own fix mode: the
  * consumer that takes a batch runs nothing under it that could need the page released.
+ */
+/*
+ * [리뷰] scan_batch_next_page — scan_batch_iter_next·qexec_batch_scan_chain 이 부른다. 첫 호출은 hfid 헤더 페이지, 이후는
+ * heap_vpid_next 로 다음 페이지를 scan_cache.page_watcher 에 fix 해 두고 batch_vpid 갱신; 끝이면 unfix·S_AFTER·S_END
+ * develop: develop 에 없음
+ * 이 PR: 신설. 페이지 이동은 replace_watcher→새 fix→옛 unfix(heap_next_internal 과 같은 꼴). 8361-8372 재fix 분기는 복사 뒤 놓은 페이지에서
+ * 정상적으로 타며 주석이 그 이유를 잘못 적음(G11-02)
+ * 바뀐 것: 신설 +73줄
+ * [지적 A39]
  */
 SCAN_CODE
 scan_batch_next_page (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
@@ -8410,6 +8498,14 @@ scan_batch_next_page (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
  * the row goes to emit.  The records are peeked from the page the scan holds, as the row
  * path's are, so the values are read while it stays fixed.
  */
+/*
+ * [리뷰] scan_batch_project_consume — expr_chunk 'project' 꼬리 노드(query_executor.c 12482). 선택된 행마다
+ * scan_batch_project_row → st->emit(qexec_end_one_iteration 쪽)
+ * develop: develop 에 없음
+ * 이 PR: 신설. emit 동안 페이지를 놓지 않는다(cached 가 아닌 스캔은 페이지 래치 보유 중 SELECT 목록 평가 — G11-01 의 비반복자 경로)
+ * 바뀐 것: 신설 +16줄
+ * [지적 A10]
+ */
 int
 scan_batch_project_consume (THREAD_ENTRY * thread_p, EXPR_CHUNK_NODE * node, EXPR_BATCH_PLAN * plan, EXPR_BATCH * batch)
 {
@@ -8430,6 +8526,16 @@ scan_batch_project_consume (THREAD_ENTRY * thread_p, EXPR_CHUNK_NODE * node, EXP
 /*
  * scan_batch_rows_consume () - the rows node (scan_manager.h): copies first, then the rows one by one
  *   return: NO_ERROR, or the error a row raised
+ */
+/*
+ * [리뷰] scan_batch_rows_consume — px_scan_task(scan_batch_open_rows) 쪽 꼬리 노드. kept 레코드를 scan_batch_copy_kept 로
+ * 복사하고, cached 스캔이면 페이지를 unfix 한 뒤 행을 emit
+ * develop: develop 에 없음
+ * 이 PR: 신설. copy_kept 실패(8447) 는 페이지를 든 채 반환 — batch_started==true 라 scan_end_scan
+ * 5496/heap_scancache_quick_end 가 받는다(관찰 (d) 해소, G11-04)
+ * 바뀐 것: 신설 +30줄
+ * [지적 A41]
+ * [지적 A43]
  */
 int
 scan_batch_rows_consume (THREAD_ENTRY * thread_p, EXPR_CHUNK_NODE * node, EXPR_BATCH_PLAN * plan, EXPR_BATCH * batch)
@@ -8466,6 +8572,13 @@ scan_batch_rows_consume (THREAD_ENTRY * thread_p, EXPR_CHUNK_NODE * node, EXPR_B
  * scan_batch_project_row () - one row through the projection's tail (scan_batch_project_consume ())
  *   return: NO_ERROR, or the error the row path raises at the row
  */
+/*
+ * [리뷰] scan_batch_project_row — project_consume·rows_consume·qexec_batch_gby_consume 이 행마다 부른다.
+ * scan_batch_row_values 뒤 st->emit
+ * develop: develop 에 없음
+ * 이 PR: 신설
+ * 바뀐 것: 신설 +9줄
+ */
 int
 scan_batch_project_row (THREAD_ENTRY * thread_p, SCAN_BATCH_PROJECT * st, EXPR_BATCH_ROW * row)
 {
@@ -8481,6 +8594,15 @@ scan_batch_project_row (THREAD_ENTRY * thread_p, SCAN_BATCH_PROJECT * st, EXPR_B
  *			       predicate columns in the value list (eval_data_filter ()'s fetch after a TRUE row,
  *			       their attribute cache armed for the row), then the rest of the columns
  *   return: NO_ERROR, or the error the read raises
+ */
+/*
+ * [리뷰] scan_batch_row_values — project_row·scan_batch_iter_next 가 부른다. curr_oid 를 행의 OID 로 놓고 pred attr 를 lazy
+ * 로, rest attr 를 eager 로 읽어 두 regu 목록을 PEEK fetch — 행 경로의 eval_data_filter(query_evaluator.c 3501~) +
+ * 6518-6551 과 같은 val_list 채움
+ * develop: develop 에 없음
+ * 이 PR: 신설. pred 쪽은 val_list 가 있을 때만(행 경로의 fetch_val_list 조건 `filterp->val_list` 와 동치, 3584); rest 는
+ * rest_regu_list 만 있으면 읽는다(6518-6524 와 같음)
+ * 바뀐 것: 신설 +35줄
  */
 static int
 scan_batch_row_values (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, EXPR_BATCH_ROW * row)
@@ -8531,6 +8653,13 @@ scan_batch_row_values (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, EXPR_BATCH_RO
  * left it, as the row path fixes it again from its last OID.  A chunk the batch hands back sends the rest of its
  * page to the row path (scan_batch_page_rowmode ()).
  */
+/*
+ * [리뷰] scan_batch_open_filter — qexec_intprt_fnc(12773) 이 qexec_batch_filter_eligible 인 블록에서 부른다. 필터 있는
+ * S_HEAP_SCAN 을 cached_ok=true 로 열고 batch_iter 커서를 0 으로
+ * develop: develop 에 없음
+ * 이 PR: 신설. 성공하면 scan_next_heap_scan 이 반복자 루프를 탄다
+ * 바뀐 것: 신설 +21줄
+ */
 bool
 scan_batch_open_filter (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, const ACCESS_SPEC_TYPE * spec, val_descr * vd)
 {
@@ -8553,6 +8682,14 @@ scan_batch_open_filter (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, const ACCESS
   return true;
 }
 
+/*
+ * [리뷰] scan_batch_open_rows — px_scan_task initialize(486·534) 가 부른다. open_filter 와 같은 조건으로 열되 batch_iter 를 켜지
+ * 않는다(워커가 청크를 직접 소비)
+ * develop: develop 에 없음
+ * 이 PR: 신설
+ * 바뀐 것: 신설 +6줄
+ * [지적 A43]
+ */
 bool
 scan_batch_open_rows (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, const ACCESS_SPEC_TYPE * spec, val_descr * vd)
 {
@@ -8561,6 +8698,14 @@ scan_batch_open_rows (THREAD_ENTRY * thread_p, SCAN_ID * scan_id, const ACCESS_S
 }
 
 /* the kept rows' records copied out of the page, the rows pointed at the copies */
+/*
+ * [리뷰] scan_batch_copy_kept — iter_next·rows_consume 가 부른다. kept 행들의 recdes 를 hsidp->batch_copy(필요 시 realloc,
+ * max(need, 2*cap)) 로 옮기고 rec->data 를 거기로 돌려 페이지를 놓을 수 있게 한다
+ * develop: develop 에 없음
+ * 이 PR: 신설. batch_copy 는 HEAP_SCAN_ID 소유로 scan_end_scan 5510 에서만 free(그래프 +1 은 소유권 이전). 다음 청크의 복사가 이전 행의 포인터를
+ * 덮지만 그 전에 이전 청크 행은 전부 나간 뒤다(8619 선검사)
+ * 바뀐 것: 신설 +36줄
+ */
 static int
 scan_batch_copy_kept (SCAN_ID * scan_id)
 {
@@ -8602,6 +8747,17 @@ scan_batch_copy_kept (SCAN_ID * scan_id)
  * scan_batch_iter_next () - the filter iterator's next row (scan_batch_open_filter ())
  *   return: S_SUCCESS (a kept row, its values read), S_END, S_ERROR, or S_DOESNT_FIT: the rest of the held page
  *	     goes to the row path (scan_batch_page_rowmode () is on)
+ */
+/*
+ * [리뷰] scan_batch_iter_next — scan_next_heap_scan 이 batch_iter 에서 부른다. 남은 kept 행이 있으면 한 행 반환; 없으면 다음 페이지/재fix
+ * → collect_chunk → expr_batch_run → (FALLBACK/DOESNT_FIT 이면 페이지를 행 모드로 넘기고 S_DOESNT_FIT) → kept 가 있으면 복사 후
+ * unfix
+ * develop: develop 에 없음
+ * 이 PR: 신설. 그래프 latch_fix-unfix=+1 은 page_watcher 소유권 이전(G11-04 에서 짝 확정). chunk_start 포착과 rowmode(after_slot)
+ * 의미는 맞다(G11-05). 행은 항상 페이지를 놓은 뒤 나간다
+ * 바뀐 것: 신설 +115줄
+ * [지적 A41]
+ * [지적 A49]
  */
 static SCAN_CODE
 scan_batch_iter_next (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
@@ -8727,6 +8883,14 @@ scan_batch_iter_next (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
  * again from a null OID; the walk (scan_batch_next_page ()) keeps its own place -- the page, the slot, the chunk
  * still going out -- and, left there, would answer the new pass with its old end.
  */
+/*
+ * [리뷰] scan_batch_rewind — scan_reset_scan_block 이 batch_started 일 때 부른다. 페이지를 조건부(!cache_last_fix_page) unfix
+ * 하고 배치 커서를 처음으로; batch/batch_plan/batch_iter/batch_state 는 유지
+ * develop: develop 에 없음
+ * 이 PR: 신설. 조건이 scan_end_scan 5492 와 같다(G11-04 헬퍼 제안)
+ * 바뀐 것: 신설 +22줄
+ * [지적 A41]
+ */
 static void
 scan_batch_rewind (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
 {
@@ -8759,6 +8923,14 @@ scan_batch_rewind (THREAD_ENTRY * thread_p, SCAN_ID * scan_id)
  * A chunk the batch hands back is served by the row path from its first slot to the end of
  * its page -- the chunks before it were accumulated -- every row going through the same
  * filter, fetch and retry the row path always made.
+ */
+/*
+ * [리뷰] scan_batch_page_rowmode — scan_next_heap_scan·iter_next·qexec_batch_scan_chain 이 부른다. batch_rowmode 를
+ * 켜/끄고 curr_oid 를 (batch_vpid, after_slot) 또는 NULL 로 — heap_next_1page 가 after_slot 다음 슬롯부터 읽게
+ * develop: develop 에 없음
+ * 이 PR: 신설. after_slot==0 이면 NULL OID(페이지 첫 슬롯부터) — collect 가 슬롯 0 에서 시작하는 첫 청크와 일치
+ * 바뀐 것: 신설 +14줄
+ * [지적 A49]
  */
 void
 scan_batch_page_rowmode (SCAN_ID * scan_id, bool on, PGSLOTID after_slot)
@@ -9475,6 +9647,15 @@ scan_print_stats_json (SCAN_ID * scan_id, trace_json_t * scan_stats)
  * scan_print_stats_text () -
  * return:
  * scan_id(in):
+ */
+/*
+ * [리뷰] scan_print_stats_text — qdump_print_access_spec_stats_text 가 trace 출력을 만들 때 스캔 하나의 통계 줄(`(heap time: …
+ * readrows: … rows: …)`) 을 fp 에 쓴다
+ * develop: develop(c966fabc6 scan_manager.c:8758) 도 같은 구조. heap/list 스캔에 readrows·rows·agl 만 찍고 batch 정보는 없다
+ * 이 PR: S_HEAP_SCAN 이고 trace_plan_detail 이면 `, batch pages: N (row path: M, last: <why>)` 또는 `, batch: no
+ * (<why>)` 를 덧붙인다(9569-9589). batch_why_not 은 문자열 리터럴 또는 plan->fallback_why(리터럴)라 plan 해제 뒤 읽어도 안전
+ * 바뀐 것: 분기 추가 +21줄. S_PARALLEL_HEAP_SCAN 은 제외(워커 덤프가 따로 보여 줌). else 분기의 %s 는 바깥 조건상 non-NULL
+ * [지적 A44]
  */
 void
 scan_print_stats_text (FILE * fp, SCAN_ID * scan_id)

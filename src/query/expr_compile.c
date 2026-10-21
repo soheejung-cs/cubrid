@@ -3455,6 +3455,12 @@ expr_scan_pred_dump (FILE * fp, const void *compiled, int indent)
 /* ---- views for the page batch (expr_compile.h) ---------------------------------------- */
 
 /* the kids of a root the batch can take term by term: the single leaf itself, or the AND chain's terms */
+/*
+ * [리뷰] expr_scan_pred_kid — AND_N 루트의 kid 또는 단일 루트 자신
+ * develop: develop 에 없음 (c966fabc6 expr_compile.c 에 같은 이름 함수 없음)
+ * 이 PR: AND_N 루트의 kid 또는 단일 루트 자신
+ * 바뀐 것: 신설 +9줄
+ */
 static EXPR_PRED *
 expr_scan_pred_kid (EXPR_PRED * root, int kid)
 {
@@ -3465,6 +3471,12 @@ expr_scan_pred_kid (EXPR_PRED * root, int kid)
   return (kid == 0 && (root->kind == EXPR_PRED_COMP_FETCH || root->kind == EXPR_PRED_OR_N)) ? root : NULL;
 }
 
+/*
+ * [리뷰] expr_scan_pred_root_shape — eb_build_filter 가 부른다; 루트 모양 1(단일/OR)·2(AND 체인)·-1
+ * develop: develop 에 없음 (c966fabc6 expr_compile.c 에 같은 이름 함수 없음)
+ * 이 PR: eb_build_filter 가 부른다; 루트 모양 1(단일/OR)·2(AND 체인)·-1
+ * 바뀐 것: 신설 +23줄
+ */
 int
 expr_scan_pred_root_shape (const void *compiled, int *n_kids)
 {
@@ -3497,12 +3509,25 @@ static bool expr_pred_term_raw_info (const PRED_EXPR * pr, const val_descr * vd,
 static bool expr_scan_pred_node_raw_info (const EXPR_PRED * root, const EXPR_PRED * pred, const val_descr * vd,
 					  EXPR_RAW_LEAF_INFO * out);
 
+/*
+ * [리뷰] expr_scan_pred_has_share — 필터가 다른 프로그램과 값을 공유하는지(n_share)
+ * develop: develop 에 없음 (c966fabc6 expr_compile.c 에 같은 이름 함수 없음)
+ * 이 PR: 필터가 다른 프로그램과 값을 공유하는지(n_share)
+ * 바뀐 것: 신설 +5줄
+ * [지적 A28]
+ */
 bool
 expr_scan_pred_has_share (const void *compiled)
 {
   return compiled != NULL && ((const EXPR_PRED *) compiled)->n_share > 0;
 }
 
+/*
+ * [리뷰] expr_scan_pred_max_level — 필터 프로그램의 최대 깊이(재귀 한도 판정용)
+ * develop: develop 에 없음 (c966fabc6 expr_compile.c 에 같은 이름 함수 없음)
+ * 이 PR: 필터 프로그램의 최대 깊이(재귀 한도 판정용)
+ * 바뀐 것: 신설 +7줄
+ */
 int
 expr_scan_pred_max_level (const void *compiled)
 {
@@ -3511,6 +3536,12 @@ expr_scan_pred_max_level (const void *compiled)
   return (root != NULL && root->prog != NULL) ? root->prog->max_level : 0;
 }
 
+/*
+ * [리뷰] expr_scan_pred_kid_raw_info — kid 를 raw leaf 정보로(expr_scan_pred_node_raw_info 위임)
+ * develop: develop 에 없음 (c966fabc6 expr_compile.c 에 같은 이름 함수 없음)
+ * 이 PR: fast_type 은 INTEGER/BIGINT/DOUBLE/DATE/NUMERIC 또는 문자열·IN producer 의 것
+ * 바뀐 것: 신설 +12줄
+ */
 bool
 expr_scan_pred_kid_raw_info (const void *compiled, int kid, const val_descr * vd, EXPR_RAW_LEAF_INFO * out)
 {
@@ -3526,6 +3557,12 @@ expr_scan_pred_kid_raw_info (const void *compiled, int kid, const val_descr * vd
 
 /* A compiled OR (an OR_N node, or a term left to the interpreter whose source is an OR) of disjuncts that are raw
  * leaves or AND chains of them */
+/*
+ * [리뷰] expr_scan_pred_kid_or_leaves — OR kid 의 분리항(AND 체인 포함)을 raw leaf 배열로
+ * develop: develop 에 없음 (c966fabc6 expr_compile.c 에 같은 이름 함수 없음)
+ * 이 PR: INTERP 면 PRED_EXPR 경로
+ * 바뀐 것: 신설 +58줄
+ */
 int
 expr_scan_pred_kid_or_leaves (const void *compiled, int kid, const val_descr * vd, EXPR_RAW_LEAF_INFO * out, int cap,
 			      int *n_disj, int disj_cap)
@@ -3586,6 +3623,17 @@ expr_scan_pred_kid_or_leaves (const void *compiled, int kid, const val_descr * v
 }
 
 /* a node of the compiled filter as a raw leaf */
+/*
+ * [리뷰] expr_scan_pred_node_raw_info — 플랜 빌드(eb_build_filter → expr_scan_pred_kid_or_leaves 3562/3577,
+ * expr_scan_pred_kid_raw_info 3524)에서 컴파일된 필터 리프(EXPR_PRED) 하나를 페이지 배치가 돌릴 수 있는 모양(EXPR_RAW_LEAF_INFO)으로 분류한다:
+ * 컬럼 vs 실행 중 고정된 상수(인라인 DBVAL·pinned 리터럴·프롤로그 셀·호스트 변수), 같은 고정폭 타입의 컬럼 vs 컬럼, 또는 generic NUMERIC. false 면 그
+ * 리프는 행 경로에 남는다.
+ * develop: develop 에 없음
+ * 이 PR: INTERP/INTERP_COMP0 리프는 원본 PRED_EXPR 로 expr_pred_term_raw_info 에 넘기고, COMP_FETCH 는
+ * fast_type·need_type_guard·compiled/pinned 플래그로 네 가지 출구(col2_regu / k_cell / &pinned_rhs / k_value)를 가른다.
+ * 컴파일된 쪽은 그 스텝 구간이 전부 프롤로그(n_prologue+n_exec_prologue) 안일 때만 k_cell 로 받는다.
+ * 바뀐 것: 신설 +118줄
+ */
 static bool
 expr_scan_pred_node_raw_info (const EXPR_PRED * root, const EXPR_PRED * pred, const val_descr * vd,
 			      EXPR_RAW_LEAF_INFO * out)
@@ -3707,6 +3755,14 @@ expr_scan_pred_node_raw_info (const EXPR_PRED * root, const EXPR_PRED * pred, co
 
 /* the value a TYPE_POS_VALUE operand reads in this execution: the bound value, or the gate's
  * converted copy of it (the index rule of expr_pos_value_index ()) */
+/*
+ * [리뷰] expr_raw_pos_value — TYPE_POS_VALUE regu 가 이 실행에서 읽는 vd->dbval_ptr 슬롯을 돌려준다 — resolved_domain 이
+ * readable 이면 plan_item->ref, 아니면 val_pos. 인터프리터의 REGU_RESOLVED_VALUE(domain_resolve.h:355-360, `vd->dbval_ptr
+ * + plan_item->ref`)·fetch.c:1801 과 같은 공식.
+ * develop: develop 에 없음
+ * 이 PR: vd NULL / 인덱스 범위 밖이면 NULL.
+ * 바뀐 것: 신설 +20줄
+ */
 static const DB_VALUE *
 expr_raw_pos_value (const REGU_VARIABLE * k, const val_descr * vd)
 {
@@ -3734,6 +3790,12 @@ expr_raw_pos_value (const REGU_VARIABLE * k, const val_descr * vd)
  * loop reproduces.  Only the constants that coercion takes without loss are offered
  * (expr_numeric_cmp_const_ok ()); the batch checks the value again when a page starts, a host
  * variable being rebindable between executions. */
+/*
+ * [리뷰] expr_scan_pred_numeric_term_info — 컴파일 리프의 원본 항(fetch_src)을 expr_pred_term_numeric_info 에 넘기는 어댑터.
+ * develop: develop 에 없음
+ * 이 PR: 한 줄 위임.
+ * 바뀐 것: 신설 +5줄
+ */
 static bool
 expr_scan_pred_numeric_term_info (const EXPR_PRED * pred, const val_descr * vd, EXPR_RAW_LEAF_INFO * out)
 {
@@ -3741,6 +3803,13 @@ expr_scan_pred_numeric_term_info (const EXPR_PRED * pred, const val_descr * vd, 
 }
 
 /* the same for a term of an interpreted filter (a PRED_EXPR the compiler left alone) */
+/*
+ * [리뷰] expr_pred_term_numeric_info — 인터프리티드 비교 항 `NUMERIC 컬럼 rel_op 상수`(여섯 관계 연산자, 상수는 DBVAL 또는 호스트 변수)를 raw
+ * 리프로 받는다. 상수는 expr_numeric_cmp_const_ok 가 허용하는 것만.
+ * develop: develop 에 없음
+ * 이 PR: col_regu·col_is_lhs·fast_type=NUMERIC·rel_op·k_value 를 채운다.
+ * 바뀐 것: 신설 +68줄
+ */
 static bool
 expr_pred_term_numeric_info (const PRED_EXPR * pr, const val_descr * vd, EXPR_RAW_LEAF_INFO * out)
 {
@@ -3810,6 +3879,13 @@ expr_pred_term_numeric_info (const PRED_EXPR * pr, const val_descr * vd, EXPR_RA
   return true;
 }
 
+/*
+ * [리뷰] expr_raw_const_value — DBVAL 또는 POS_VALUE regu 의 이 실행 값; IN 리스트 원소와 SUBSTRING 의 start/len 이 상수인지 판정하는 데
+ * 쓴다(3863-3864, 3892).
+ * develop: develop 에 없음
+ * 이 PR: 그 밖의 regu 타입은 NULL.
+ * 바뀐 것: 신설 +17줄(extern)
+ */
 const DB_VALUE *
 expr_raw_const_value (const REGU_VARIABLE * k, const val_descr * vd)
 {
@@ -3830,6 +3906,14 @@ expr_raw_const_value (const REGU_VARIABLE * k, const val_descr * vd)
 
 /* "column IN (c1, c2, ...)" over an integer or string column of the scan, the list a set of literals and host
  * variables (fixed for the execution) */
+/*
+ * [리뷰] expr_pred_term_in_info — `col IN (…)` / `SUBSTRING(col, k1, k2) IN (…)`(F_SOME + R_EQ) 를 raw 리프로 받는다.
+ * 리스트는 set 리터럴(TYPE_DBVAL) 또는 상수만 담은 F_SET/F_SEQUENCE/F_MULTISET; 컬럼 타입은
+ * INTEGER/SHORT/BIGINT/DATE/VARCHAR/CHAR.
+ * develop: develop 에 없음
+ * 이 PR: k_set 에 리스트 regu 를 둔다(원소 읽기는 expr_batch.c).
+ * 바뀐 것: 신설 +76줄
+ */
 static bool
 expr_pred_term_in_info (const PRED_EXPR * pr, const val_descr * vd, EXPR_RAW_LEAF_INFO * out)
 {
@@ -3910,6 +3994,14 @@ expr_pred_term_in_info (const PRED_EXPR * pr, const val_descr * vd, EXPR_RAW_LEA
 /* A term on a VARCHAR column of the scan against a string constant: "col = 'x'", "col <> 'x'", "col [NOT] LIKE
  * 'pattern'" without an ESCAPE (a page batch compares the record's bytes with the collation's own function, and
  * matches a pattern of literals and '%' over a binary collation, expr_batch.c) */
+/*
+ * [리뷰] expr_pred_term_string_info — `VARCHAR/CHAR col = / <> 문자열 상수`, `VARCHAR col [NOT] LIKE 패턴`(ESCAPE 없음) 를
+ * raw 리프로 받는다; CHAR 컬럼 LIKE 와 NOT (col = k) 는 거절.
+ * develop: develop 에 없음
+ * 이 PR: like/negate 플래그와 k_value 를 채운다; 코드셋·콜레이션 검사는 eb_load_leaf_constants.
+ * 바뀐 것: 신설 +84줄
+ * [지적 A33]
+ */
 static bool
 expr_pred_term_string_info (const PRED_EXPR * pr, const val_descr * vd, EXPR_RAW_LEAF_INFO * out)
 {
@@ -4004,6 +4096,15 @@ expr_pred_term_string_info (const PRED_EXPR * pr, const val_descr * vd, EXPR_RAW
  * (eval_pred_comp0 () coerces the constant per row), so it stays interpreted; a page batch runs such terms as
  * raw leaves all the same (expr_scan_pred_numeric_term_info ()).
  */
+/*
+ * [리뷰] expr_pred_raw_leaves — 컴파일 트리가 없는(인터프리티드) 필터의 AND 체인을 raw 리프 배열로 편다. 호출자
+ * eb_build_filter_interpreted(expr_batch.c:1452, cap 32). 항 64개 초과·raw 가 아닌 항은 -1; OR 항은 or_src 만 채워
+ * expr_pred_or_raw_leaves 로 넘긴다.
+ * develop: develop 에 없음
+ * 이 PR: n 을 돌려주고 호출자가 kid_leaf[n] 을 만든다.
+ * 바뀐 것: 신설 +30줄(extern)
+ * [지적 A47]
+ */
 int
 expr_pred_raw_leaves (const void *pred_expr, const val_descr * vd, EXPR_RAW_LEAF_INFO * out, int cap)
 {
@@ -4036,6 +4137,13 @@ expr_pred_raw_leaves (const void *pred_expr, const val_descr * vd, EXPR_RAW_LEAF
 }
 
 /* a term of an interpreted filter as a raw leaf: a NUMERIC comparison, a string one, or an IN list */
+/*
+ * [리뷰] expr_pred_term_raw_info — 항 하나의 분류기: numeric → string → IN 순으로 시도하고 실패마다 out 을 0 으로 되돌린다. 인터프리티드
+ * 필터(4024, 4092)와 컴파일 트리의 INTERP 리프(3599, 3616) 둘 다 여기로 온다.
+ * develop: develop 에 없음
+ * 이 PR: 세 probe 의 공통 입구.
+ * 바뀐 것: 신설 +25줄
+ */
 static bool
 expr_pred_term_raw_info (const PRED_EXPR * pr, const val_descr * vd, EXPR_RAW_LEAF_INFO * out)
 {
@@ -4062,6 +4170,15 @@ expr_pred_term_raw_info (const PRED_EXPR * pr, const val_descr * vd, EXPR_RAW_LE
   return false;
 }
 
+/*
+ * [리뷰] expr_pred_or_raw_leaves — OR 항을 ≤16 디스정크트(MIN(16, disj_cap))로 펴고 각 디스정크트의 AND 항(≤32)을 raw 리프로 out[] 에
+ * 이어 붙인다; n_disj[d] 에 길이. 호출자 eb_build_filter_interpreted(expr_batch.c:1469-1471)는 len[16]·sub[32] 로 부르고 -1 이면
+ * decline.
+ * develop: develop 에 없음
+ * 이 PR: nd 반환; 중간 실패는 -1(부분 n_disj 는 버려짐).
+ * 바뀐 것: 신설 +37줄(extern)
+ * [지적 A47]
+ */
 int
 expr_pred_or_raw_leaves (const void *or_src, const val_descr * vd, EXPR_RAW_LEAF_INFO * out, int cap, int *n_disj,
 			 int disj_cap)
@@ -4101,6 +4218,15 @@ expr_pred_or_raw_leaves (const void *or_src, const val_descr * vd, EXPR_RAW_LEAF
 }
 
 /* the constants a NUMERIC column compares with exactly, whichever of the two forms the term took */
+/*
+ * [리뷰] expr_numeric_cmp_const_ok — NUMERIC 컬럼과 비교되는 상수를 배치의 정확 비교(eb_num_leaf_constant)가 받는지:
+ * SHORT/INTEGER/NUMERIC 은 받고 BIGINT 는 |k| < 10^15 만. 빌드(3801, eb_add_raw_leaf)와 실행마다(eb_num_leaf_constant) 호출.
+ * develop: develop 에 없음
+ * 이 PR: 보수적 창; 밖이면 행 경로.
+ * 바뀐 것: 신설 +16줄(extern)
+ * [지적 A35]
+ * [지적 A47]
+ */
 bool
 expr_numeric_cmp_const_ok (const DB_VALUE * k)
 {
@@ -4118,6 +4244,13 @@ expr_numeric_cmp_const_ok (const DB_VALUE * k)
     }
 }
 
+/*
+ * [리뷰] expr_scan_pred_prepare — 청크마다 필터 프로그램의 프롤로그를 정리한다(expr_prog_prepare: 실행 스탬프가 같으면 즉시 반환, 바뀌었으면 프롤로그 스텝
+ * 실행). expr_batch_run 이 eb_load_leaf_constants 보다 먼저 부르므로 k_cell 이 가리키는 프롤로그 셀이 그 뒤에 읽힌다.
+ * develop: develop 에 없음
+ * 이 PR: ctx 를 만들고 expr_ctx_arm_depth 로 재귀 한계를 arm.
+ * 바뀐 것: 신설 +19줄(extern)
+ */
 int
 expr_scan_pred_prepare (void *compiled, cubthread::entry * thread_p, val_descr * vd)
 {
@@ -4138,6 +4271,13 @@ expr_scan_pred_prepare (void *compiled, cubthread::entry * thread_p, val_descr *
   return expr_prog_prepare (root->prog, &ctx);
 }
 
+/*
+ * [리뷰] expr_scan_pred_eval_kid — 배치가 돌리지 않은 AND 체인 kid 하나를 현재 행에서 평가한다(eb_filter 의 행 경로). 프롤로그를 먼저 정리하고
+ * expr_scan_pred_eval_node 로.
+ * develop: develop 에 없음
+ * 이 PR: kid 가 없으면 assert + V_ERROR.
+ * 바뀐 것: 신설 +28줄(extern)
+ */
 DB_LOGICAL
 expr_scan_pred_eval_kid (void *compiled, int kid, cubthread::entry * thread_p, val_descr * vd, OID * obj_oid)
 {
@@ -6556,6 +6696,12 @@ expr_run_range_checked (EXPR_PROG * prog, int start, int end, EXPR_EVAL_CTX * ct
 
 /* ---- views for the page batch (expr_compile.h) ---------------------------------------- */
 
+/*
+ * [리뷰] expr_prog_cell_index — 스텝의 셀 포인터(DB_VALUE **)를 prog->cells 의 인덱스로; 프로그램 셀이 아니면(리프 홀더·pinned 값) -1.
+ * develop: develop 에 없음
+ * 이 PR: 포인터 범위 검사만.
+ * 바뀐 것: 신설 +9줄
+ */
 static int
 expr_prog_cell_index (const EXPR_PROG * prog, DB_VALUE ** cellp)
 {
@@ -6566,6 +6712,13 @@ expr_prog_cell_index (const EXPR_PROG * prog, DB_VALUE ** cellp)
   return (int) (cellp - prog->cells);
 }
 
+/*
+ * [리뷰] expr_prog_step_info — 배치 번역기(eb_build_program)가 보는 스텝 뷰: 피연산자/출력 셀 인덱스, jump_to, 프롤로그 여부, regu, 강제 변환
+ * 도메인, 커널 분류(leaf fetch·hostvar·jump-null·resolved·cast·+/-/* 의 INTEGER/BIGINT/DOUBLE/NUMERIC float family).
+ * develop: develop 에 없음
+ * 이 PR: 분류 밖 커널은 EXPR_STEP_OTHER(번역기가 거절).
+ * 바뀐 것: 신설 +63줄(extern)
+ */
 void
 expr_prog_step_info (const EXPR_PROG * prog, int step_idx, EXPR_STEP_INFO * out)
 {
@@ -6630,6 +6783,13 @@ expr_prog_step_info (const EXPR_PROG * prog, int step_idx, EXPR_STEP_INFO * out)
     }
 }
 
+/*
+ * [리뷰] expr_prog_cell_publisher — cells[cell] 에 쓰는 첫 스텝의 인덱스; eb_program_cell_vec(expr_batch.c)가 그 스텝이 프롤로그면
+ * 셀을 실행당 상수 스칼라로, 행 스텝이면 -1(순서 밖)로 처리한다.
+ * develop: develop 에 없음
+ * 이 PR: 선형 탐색(빌드 시 1회).
+ * 바뀐 것: 신설 +18줄(extern)
+ */
 int
 expr_prog_cell_publisher (const EXPR_PROG * prog, int cell)
 {
@@ -6649,6 +6809,13 @@ expr_prog_cell_publisher (const EXPR_PROG * prog, int cell)
   return -1;
 }
 
+/*
+ * [리뷰] expr_prog_run_steps — 프로그램의 [from,to) 구간을 한 번 돌린다 — expr_batch_run 이 청크마다 상수 구간(const_from/const_to)에
+ * 쓴다. 에러면 호출자가 er_clear 후 fallback.
+ * develop: develop 에 없음
+ * 이 PR: ctx 를 만들고 expr_ctx_arm_depth → expr_run_range.
+ * 바뀐 것: 신설 +13줄(extern)
+ */
 int
 expr_prog_run_steps (EXPR_PROG * prog, int from, int to, cubthread::entry * thread_p, val_descr * vd)
 {
@@ -6663,6 +6830,13 @@ expr_prog_run_steps (EXPR_PROG * prog, int from, int to, cubthread::entry * thre
   return expr_run_range (prog, from, to, &ctx);
 }
 
+/*
+ * [리뷰] expr_prog_prepare_execution — 피연산자 프로그램의 프롤로그를 이 실행에 맞춰 정리한다(expr_prog_prepare) — 행 경로가 첫 수용 행에서 하던 것을
+ * 배치가 청크 전에 한다.
+ * develop: develop 에 없음
+ * 이 PR: expr_prog_run_steps 와 같은 ctx 구성.
+ * 바뀐 것: 신설 +13줄(extern)
+ */
 int
 expr_prog_prepare_execution (EXPR_PROG * prog, cubthread::entry * thread_p, val_descr * vd)
 {

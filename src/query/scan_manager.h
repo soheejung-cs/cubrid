@@ -698,6 +698,14 @@ extern void scan_close_scan (THREAD_ENTRY * thread_p, SCAN_ID * s_id);
  * hands a chunk and the rest of its page back to the row path with scan_batch_page_rowmode ()
  * (serial) when the batch declines it */
 struct access_spec_node;
+/*
+ * [리뷰] cubxasl (namespace forward decl aggregate_list_node) — scan_batch_open () 의 agg_list 인자 타입을
+ * xasl_aggregate.hpp 를 include 하지 않고 선언하기 위한 전방 선언
+ * develop: develop 에 없음
+ * 이 PR: struct access_spec_node / cubxasl::aggregate_list_node / expr_chunk_node 전방 선언 + scan_batch_* 9개
+ * extern 과 SCAN_BATCH_PROJECT 추가, heap_scan_id·parallel_heap_scan_id 에 batch_* 필드 15개(두 레이아웃이 같은 자리에 alias) 추가
+ * 바뀐 것: 헤더 +80줄. heap_scan_id 와 parallel_heap_scan_id 의 batch 필드 순서가 같아야 한다는 제약이 주석으로만 있음(정적 assert 없음)
+ */
 namespace cubxasl
 {
   struct aggregate_list_node;
