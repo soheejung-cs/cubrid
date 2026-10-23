@@ -596,6 +596,13 @@ log3 (double n)
  *   return:
  *   env(in):
  */
+/*
+ * [리뷰] qo_plan_malloc — qo_scan_new·qo_join_new·qo_sort_new·qo_worst_new 등 모든 플랜 생성자가 부른다. 프리리스트나 malloc 에서
+ * QO_PLAN 을 꺼내 공통 필드를 초기화해 돌려준다.
+ * develop: parallel_driven 필드가 없었다. 나머지 초기화는 같다.
+ * 이 PR: 새 필드 plan->parallel_driven = false 를 초기화한다. 프리리스트에서 재사용한 플랜에 이전 값이 남지 않는다.
+ * 바뀐 것: 초기화 +1줄
+ */
 static QO_PLAN *
 qo_plan_malloc (QO_ENV * env)
 {
@@ -1694,6 +1701,14 @@ qo_plan_print_sort_spec (QO_PLAN * plan, FILE * f, int howfar)
  *   plan(in):
  *   f(in):
  *   howfar(in):
+ */
+/*
+ * [리뷰] qo_plan_print_costs — qo_plan_fprint_internal 이 플랜 덤프 끝에서 부른다. 'cost: fixed+variable card N' 한 줄을 찍는다.
+ * develop: (plan, f, howfar) 시그니처. 항상 플랜 자신의 비용을 찍었다.
+ * 이 PR: parallel_scan 인자가 생겼다. 참이면(부모 해시/merge 조인이 병렬 입력으로 계산한 스캔) variable 을 qo_parallel_cost_divisor 로 나눠
+ * 부모가 실제로 매긴 값을 찍는다.
+ * 바뀐 것: 시그니처 +bool, 분기 +5줄
+ * [지적 R-F2]
  */
 static void
 qo_plan_print_costs (QO_PLAN * plan, FILE * f, int howfar, bool parallel_scan)
@@ -2810,6 +2825,12 @@ qo_scan_fprint (QO_PLAN * plan, FILE * f, int howfar)
  *   f(in):
  *   howfar(in):
  */
+/*
+ * [리뷰] qo_scan_info — 스캔 vtbl 의 info_fn 이다. qo_plan_lite_print(간단 플랜 출력)가 부른다.
+ * develop: 스캔 한 줄 요약을 직접 찍는 본체였다.
+ * 이 PR: qo_scan_info_internal(plan, f, howfar, false) 래퍼가 되었다.
+ * 바뀐 것: 본체 이동(-120/+3)
+ */
 static void
 qo_scan_info (QO_PLAN * plan, FILE * f, int howfar)
 {
@@ -2823,6 +2844,14 @@ qo_scan_info (QO_PLAN * plan, FILE * f, int howfar)
  *   f(in):
  *   howfar(in):
  *   parallel_scan(in): the parent join counted this scan as run in parallel
+ */
+/*
+ * [리뷰] qo_scan_info_internal — qo_scan_info 와 qo_plan_lite_print_child 가 부른다. 스캔 요약 'Sequential scan(t)' 등을
+ * 찍는다.
+ * develop: develop 에 없다(본체는 develop qo_scan_info).
+ * 이 PR: parallel_scan 이 참이면 'Parallel sequential scan(' 처럼 info_string 첫 글자를 소문자로 바꾸고 'Parallel ' 을 붙인다. 나머지는
+ * develop 본체와 같다.
+ * 바뀐 것: 신설(본체 이동 + 접두 분기 +9줄), <ctype.h> include
  */
 static void
 qo_scan_info_internal (QO_PLAN * plan, FILE * f, int howfar, bool parallel_scan)
@@ -4068,6 +4097,13 @@ qo_nl_inner_memoize_is_useless (QO_PLAN * outer, QO_PLAN * inner, BITSET * key_t
  *   f(in):
  *   howfar(in):
  */
+/*
+ * [리뷰] qo_join_fprint — NL/idx 조인 vtbl 의 fprint_fn 이다. 상세 플랜 덤프에서 조인 종류·edge 를 찍고 자식을 재귀로 출력한다.
+ * develop: 자식을 qo_plan_fprint(outer/inner)로 찍었다.
+ * 이 PR: 자식을 qo_plan_fprint_internal(…, qo_plan_child_parallel_mark(plan, child))로 찍는다. 병렬 NL 블록 안의 자식에는 다시
+ * 'parallel' 을 붙이지 않는다.
+ * 바뀐 것: 호출 교체 2곳
+ */
 static void
 qo_join_fprint (QO_PLAN * plan, FILE * f, int howfar)
 {
@@ -4139,6 +4175,12 @@ qo_join_fprint (QO_PLAN * plan, FILE * f, int howfar)
  *   f(in):
  *   howfar(in):
  */
+/*
+ * [리뷰] qo_join_info — 조인 vtbl 의 info_fn 이다. qo_plan_lite_print 가 부른다.
+ * develop: 조인 한 줄 요약 본체였다.
+ * 이 PR: qo_join_info_internal(plan, f, howfar, false) 래퍼가 되었다.
+ * 바뀐 것: 본체 이동
+ */
 static void
 qo_join_info (QO_PLAN * plan, FILE * f, int howfar)
 {
@@ -4152,6 +4194,14 @@ qo_join_info (QO_PLAN * plan, FILE * f, int howfar)
  *   f(in):
  *   howfar(in):
  *   in_block(in): inside a parallel nested-loop block, already marked at its top
+ */
+/*
+ * [리뷰] qo_join_info_internal — qo_join_info 와 qo_plan_lite_print_child 가 부른다. 조인 요약 'Hash join(a=b)'·'Nested
+ * loops' 를 찍고 자식을 출력한다.
+ * develop: develop 에 없다(본체는 develop qo_join_info).
+ * 이 PR: in_block 이 아니고 qo_plan_runs_parallel 이 참이면 'Parallel …' 접두를 붙인다. 자식은 qo_plan_lite_print_child 로 넘긴다.
+ * 바뀐 것: 신설(본체 이동 + 분기)
+ * [지적 R-F2]
  */
 static void
 qo_join_info_internal (QO_PLAN * plan, FILE * f, int howfar, bool in_block)
@@ -4210,6 +4260,13 @@ qo_join_info_internal (QO_PLAN * plan, FILE * f, int howfar, bool in_block)
  *   child(in): its outer or inner
  *   f(in):
  *   howfar(in):
+ */
+/*
+ * [리뷰] qo_plan_lite_print_child — qo_join_info_internal 이 outer·inner 마다 부른다.
+ * develop: develop 에 없다(develop 은 qo_plan_lite_print 를 직접 불렀다).
+ * 이 PR: qo_plan_child_parallel_mark 결과에 따라 SCAN 이면 병렬 스캔 요약, IN_BLOCK 조인이면 표시 없는 조인 요약, 그 밖에는
+ * qo_plan_lite_print 로 출력한다.
+ * 바뀐 것: 신설 +18줄
  */
 static void
 qo_plan_lite_print_child (QO_PLAN * parent, QO_PLAN * child, FILE * f, int howfar)
@@ -4323,6 +4380,16 @@ qo_can_apply_limit_card (QO_ENV * env)
  *	 revisit the same pages across probes, so each side saturates near its own object size
  *	 (T = heap pages resp. index pages) instead of accruing per probe forever.
  */
+/*
+ * [리뷰] qo_mackert_lohman_pages — qo_iscan_cost·qo_nljoin_cost 가 반복 프로브의 누적 페이지 수(T 페이지 객체에 N 회 접근)를 구할 때 부른다.
+ * develop: b = cost_effective_cache_pages(기본 32768)만 썼다. 0 이면 '캐시 없음' 으로 퇴화했다.
+ * 이 PR: b = QO_EFFECTIVE_CACHE_PAGES = MAX(cost_effective_cache_pages, data_buffer_pages)로 바뀌었다.
+ * data_buffer_pages 는 접속 시 서버 값이다(PRM_FORCE_SERVER). 버퍼가 512M 이하면 비트까지 같고, 16G 면 100,000쪽 표가 포화된다(unitseam
+ * 확인).
+ * 바뀐 것: 매크로 의미 변경, 주석
+ * [지적 R-F3]
+ * [지적 R-F1]
+ */
 static double
 qo_mackert_lohman_pages (double T, double N)
 {
@@ -4361,6 +4428,14 @@ qo_mackert_lohman_pages (double T, double N)
  *   return: the hints, PT_HINT_NONE when unavailable
  *   plan(in):
  */
+/*
+ * [리뷰] qo_plan_select_hint — qo_scan_runs_parallel·qo_plan_drives_parallel·qo_hjoin_runs_parallel 이 부른다. 플랜이
+ * 속한 SELECT 의 hint 비트를 돌려준다(없으면 PT_HINT_NONE).
+ * develop: develop 에 없다.
+ * 이 PR: info/env/pt_tree 가 NULL 이거나 SELECT 가 아니면 NONE 을 돌려준다.
+ * 바뀐 것: 신설 +13줄
+ * [지적 R-F2]
+ */
 static PT_HINT_ENUM
 qo_plan_select_hint (QO_PLAN * plan)
 {
@@ -4379,6 +4454,13 @@ qo_plan_select_hint (QO_PLAN * plan)
  * qo_plan_list_pages () - estimated pages of the list file a plan's result is materialized into
  *   return: cardinality * projected size / page size (as qo_hjoin_cost () sizes its inputs)
  *   plan(in):
+ */
+/*
+ * [리뷰] qo_plan_list_pages — qo_plan_drives_parallel·qo_hjoin_runs_parallel 이 부른다. 플랜 결과를 리스트 파일로 물질화했을 때의 추정
+ * 쪽수(card*projected_size/IO_PAGESIZE)를 돌려준다.
+ * develop: develop 에 없다(같은 식이 qo_hjoin_cost 안에만 있었다).
+ * 이 PR: NULL 이면 0, 아니면 추정 쪽수를 돌려준다(하한 없음).
+ * 바뀐 것: 신설 +10줄
  */
 static double
 qo_plan_list_pages (QO_PLAN * plan)
@@ -4400,6 +4482,15 @@ qo_plan_list_pages (QO_PLAN * plan)
  *	 and so does a LIMIT that the joins can stop at (can_apply_limit_card): such a query ends
  *	 before workers pay off, and the LIMIT-aware nested-loop costing decides those plans.
  *	 A LIMIT above a GROUP BY or ORDER BY does not stop the joins and keeps the discount.
+ */
+/*
+ * [리뷰] qo_parallel_cost_divisor — 세 조인 비용 함수와 출력
+ * 함수(qo_plan_print_costs·qo_plan_runs_parallel·qo_plan_child_parallel_mark)가 부른다. 병렬 할인 제수를 돌려준다.
+ * develop: develop 에 없다.
+ * 이 PR: MIN(2, parallelism/2)를 돌려준다. 이 값이 1 이하이거나 info/planner 가 없거나, LIMIT 이 조인에서 멈출 수
+ * 있으면(can_apply_limit_card) 1 이다. parallelism 4→2, 3→1.5, 2→1(unitseam 확인).
+ * 바뀐 것: 신설 +13줄
+ * [지적 R-F2]
  */
 static double
 qo_parallel_cost_divisor (QO_PLAN * join)
@@ -4424,6 +4515,14 @@ qo_parallel_cost_divisor (QO_PLAN * join)
  *	 server's value: test_mode lowers the server's thresholds to exercise the parallel
  *	 executor on tiny tables, and plan choices must not follow that.
  */
+/*
+ * [리뷰] qo_scan_runs_parallel — qo_join_input_factor·qo_plan_drives_parallel 이 부른다. 힙 순차 스캔을 실행기가 병렬로 나눌지 추정한다.
+ * develop: develop 에 없다.
+ * 이 PR: SCAN·seq scan·NO_PARALLEL_SCAN 힌트 없음·TCARD ≥ parallel_scan_page_threshold(CS 에선 기본 256)이면 참이다.
+ * 바뀐 것: 신설 +8줄
+ * [지적 R-F2]
+ * [지적 R-F9]
+ */
 static bool
 qo_scan_runs_parallel (QO_PLAN * scan)
 {
@@ -4443,6 +4542,13 @@ qo_scan_runs_parallel (QO_PLAN * scan)
  *	 by its own size, a nested loop by its own parallel_driven, and a hash join, merge join
  *	 or sort -- whose result is materialized into a list file that the chain then scans -- by
  *	 the estimated size of that list.
+ */
+/*
+ * [리뷰] qo_plan_drives_parallel — qo_nljoin_cost 가 outer 에 대해 부른다. 이 outer 가 구동하는 NL 체인이 병렬로 도는지 판단한다.
+ * develop: develop 에 없다.
+ * 이 PR: 스캔이면 qo_scan_runs_parallel, NL 조인이면 그 parallel_driven 을 상속하고, 그 밖(해시/merge/sort)은 리스트 쪽수 ≥ 임계로 판단한다.
+ * 바뀐 것: 신설 +21줄
+ * [지적 R-F2]
  */
 static bool
 qo_plan_drives_parallel (QO_PLAN * plan)
@@ -4476,6 +4582,15 @@ qo_plan_drives_parallel (QO_PLAN * plan)
  *	 hjoin_try_parallel (); the threshold is the parameter's default (see
  *	 qo_scan_runs_parallel ()).
  */
+/*
+ * [리뷰] qo_hjoin_runs_parallel — qo_hjoin_cost(own_factor)와 qo_plan_runs_parallel(출력)이 부른다. 해시 조인 빌드/프로브를 병렬로
+ * 계산할지 정한다.
+ * develop: develop 에 없다.
+ * 이 PR: divisor>1·HASH_JOIN·NO_PARALLEL_HASH_JOIN 없음·MAX(outer,inner 리스트 쪽수) ≥ 256 이면 참이다.
+ * 바뀐 것: 신설 +8줄
+ * [지적 R-F2]
+ * [지적 R-F4]
+ */
 static bool
 qo_hjoin_runs_parallel (QO_PLAN * plan, double divisor)
 {
@@ -4496,6 +4611,15 @@ qo_hjoin_runs_parallel (QO_PLAN * plan, double divisor)
  *	 discount of a parallel input scan is applied by the join that consumes it. Join inputs
  *	 already carry their own discounts.
  */
+/*
+ * [리뷰] qo_join_input_factor — qo_hjoin_cost·qo_mjoin_cost·qo_plan_child_parallel_mark 가 부른다. 조인 입력 스캔의
+ * variable 비용 배수를 돌려준다.
+ * develop: develop 에 없다.
+ * 이 PR: divisor>1 이고 입력이 병렬 힙 스캔이면 1/divisor, 아니면 1 을 돌려준다.
+ * 바뀐 것: 신설 +5줄
+ * [지적 R-F2]
+ * [지적 R-F5]
+ */
 static double
 qo_join_input_factor (QO_PLAN * input, double divisor)
 {
@@ -4506,6 +4630,14 @@ qo_join_input_factor (QO_PLAN * input, double divisor)
  * qo_nljoin_cost () -
  *   return:
  *   planp(in):
+ */
+/*
+ * [리뷰] qo_nljoin_cost — NL/idx 조인 vtbl 의 cost_fn 이다. qo_join_new → qo_plan_compute_cost 가 부른다.
+ * develop: inner 프로브(ML 포화)와 outer 비용을 직렬로 더했다.
+ * 이 PR: divisor>1 이고 outer 가 병렬을 구동하면 parallel_driven=true 로 두고, inner CPU/IO 를 나눈다. outer 가 스캔이면 outer 비용도
+ * 나눈다. ML 포화는 새 QO_EFFECTIVE_CACHE_PAGES 를 따른다.
+ * 바뀐 것: 분기 +16줄, 플랜 필드 기록(부작용)
+ * [지적 R-F3]
  */
 static void
 qo_nljoin_cost (QO_PLAN * planp)
@@ -4731,6 +4863,13 @@ qo_nljoin_cost (QO_PLAN * planp)
  *   return:
  *   planp(in):
  */
+/*
+ * [리뷰] qo_mjoin_cost — merge 조인 vtbl 의 cost_fn 이다.
+ * develop: outer+inner variable 비용에 merge CPU 를 더했다.
+ * 이 PR: 입력 비용에 qo_join_input_factor 를 곱한다. 하지만 입력이 항상 SORT 라서 factor 는 1 이고 결과는 develop 과 같다.
+ * 바뀐 것: 분기 +4줄
+ * [지적 R-F5]
+ */
 static void
 qo_mjoin_cost (QO_PLAN * planp)
 {
@@ -4814,6 +4953,16 @@ qo_mjoin_cost (QO_PLAN * planp)
  * qo_hjoin_cost () -
  *   return:
  *   planp(in):
+ */
+/*
+ * [리뷰] qo_hjoin_cost — 해시 조인 vtbl 의 cost_fn 이다.
+ * develop: 입력 비용 + 빌드/프로브 CPU + 빌드 IO + 스필 시 (행수 합×0.5×seq) 를 더했다.
+ * 이 PR: 입력은 병렬 스캔이면 1/2 로 한다. 빌드/프로브(상수·IO 포함)는 qo_hjoin_runs_parallel 이면 own_factor 로 나눈다.
+ * HJ_FILE_IO_WEIGHT=0 이라 스필 항은 0 이다.
+ * 바뀐 것: 분기 +15줄, 상수 변경
+ * [지적 R-F2]
+ * [지적 R-F4]
+ * [지적 R-F6]
  */
 static void
 qo_hjoin_cost (QO_PLAN * plan_p)
@@ -4982,6 +5131,13 @@ qo_hjoin_cost (QO_PLAN * plan_p)
  *   plan(in):
  *   f(in):
  *   howfar(in):
+ */
+/*
+ * [리뷰] qo_hjoin_fprint — 해시 조인 vtbl 의 fprint_fn 이다.
+ * develop: 자식을 qo_plan_fprint 로 찍었다.
+ * 이 PR: 자식을 qo_plan_fprint_internal(…, qo_plan_child_parallel_mark) 로 찍어, 병렬 입력 스캔에 'parallel sscan' 과 부모가 매긴
+ * 비용을 표시한다.
+ * 바뀐 것: 호출 교체 2곳
  */
 static void
 qo_hjoin_fprint (QO_PLAN * plan, FILE * f, int howfar)
@@ -6327,6 +6483,13 @@ qo_index_covering_plans_cmp (QO_PLAN * a, QO_PLAN * b)
  *   return: true for a parallel-driven nested loop or a parallel hash join
  *   plan(in):
  */
+/*
+ * [리뷰] qo_plan_runs_parallel — qo_plan_fprint_internal·qo_join_info_internal 이 부른다. 조인이 병렬로 계산되었는지 답한다.
+ * develop: develop 에 없다.
+ * 이 PR: NL 이면 parallel_driven 을, 그 밖이면 qo_hjoin_runs_parallel(plan, divisor) 를 돌려준다. 조인이 아니면 false 다.
+ * 바뀐 것: 신설 +15줄
+ * [지적 R-F2]
+ */
 static bool
 qo_plan_runs_parallel (QO_PLAN * plan)
 {
@@ -6354,6 +6517,13 @@ qo_plan_runs_parallel (QO_PLAN * plan)
  *	 decided on its own (also when it drives a block), and a scan feeding a hash or merge
  *	 join is a parallel unit of its own; a scan plan keeps its serial cost and may serve
  *	 several joins, so that marking is decided here, by the consumer.
+ */
+/*
+ * [리뷰] qo_plan_child_parallel_mark — 조인 fprint/info 가 자식마다 부른다. 자식 출력 방식(NONE/SCAN/IN_BLOCK)을 정한다.
+ * develop: develop 에 없다.
+ * 이 PR: NL 부모가 parallel_driven 이고 자식이 그 outer 스캔·NL 이면 IN_BLOCK(표시 생략)이다. 해시/merge 부모의 병렬 입력 스캔이면 SCAN 이다. 그
+ * 밖은 NONE 이다.
+ * 바뀐 것: 신설 +25줄
  */
 static QO_PARALLEL_MARK
 qo_plan_child_parallel_mark (QO_PLAN * parent, QO_PLAN * child)
@@ -6389,6 +6559,12 @@ qo_plan_child_parallel_mark (QO_PLAN * parent, QO_PLAN * child)
  *   howfar(in):
  *   title(in):
  */
+/*
+ * [리뷰] qo_plan_fprint — qo_plan_dump·TEST_DUMP 경로가 부른다. 플랜 트리 상세 덤프의 진입점이다.
+ * develop: 본체였다.
+ * 이 PR: qo_plan_fprint_internal(plan, f, howfar, title, NONE) 래퍼가 되었다.
+ * 바뀐 것: 본체 이동
+ */
 static void
 qo_plan_fprint (QO_PLAN * plan, FILE * f, int howfar, const char *title)
 {
@@ -6407,6 +6583,13 @@ qo_plan_fprint (QO_PLAN * plan, FILE * f, int howfar, const char *title)
  * Note: a parallel unit -- the top nested loop of a parallel block, a parallel hash join, a
  *	 parallel input scan of a hash or merge join -- is printed as "parallel <name>"; an input
  *	 scan with the cost the consuming join charged for it.
+ */
+/*
+ * [리뷰] qo_plan_fprint_internal — qo_plan_fprint 와 조인 fprint 가 부른다. 한 노드의 제목·plan_string·세부·비용을 찍는다.
+ * develop: develop 에 없다(본체는 develop qo_plan_fprint).
+ * 이 PR: mark 가 SCAN 이거나, NONE 이면서 qo_plan_runs_parallel 이면 'parallel ' 접두를 붙인다. 비용은 SCAN 일 때 부모 할인값으로 찍는다.
+ * 바뀐 것: 신설(본체 이동 + 분기 +4줄)
+ * [지적 R-F2]
  */
 static void
 qo_plan_fprint_internal (QO_PLAN * plan, FILE * f, int howfar, const char *title, QO_PARALLEL_MARK mark)
