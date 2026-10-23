@@ -71,6 +71,13 @@ static struct net_request net_Requests[NET_SERVER_REQUEST_END];
  * net_server_init () -
  *   return:
  */
+/*
+ * [리뷰] net_server_init — 서버 기동 때 net_Requests 표에 요청별 속성과 처리 함수를 등록한다
+ * develop: NET_SERVER_QST_LOG_STATS_PROGRESS 항목이 없었다
+ * 이 PR: IN_TRANSACTION 속성(CHECK_DB_MODIFICATION 없음)으로 sqst_log_stats_progress 를 등록한다
+ * 바뀐 것: 표 항목 +4줄
+ * [지적 R3]
+ */
 static void
 net_server_init (void)
 {

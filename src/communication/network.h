@@ -199,6 +199,16 @@
   NET_SERVER_REQUEST_ITEM(NET_SERVER_SHUTDOWN) \
   \
   /* External storage supports */ \
+  /*
+   * [리뷰] NET_SERVER_REQUEST_ITEM — 서버 요청 번호 목록 X-매크로. enum net_server_request·net_Requests 표
+   * 크기·get_net_request_name 이 여기서 나온다
+   * develop: 목록 꼬리가 NET_SERVER_BTREE_COMPACT_OVERFLOW 였다(base a1c3506c3). develop 은 그 뒤에
+   * QM_BIND_VARIANT·QM_QUERY_DROP_CLONES 가 이미 붙어 있다
+   * 이 PR: 꼬리에 NET_SERVER_QST_LOG_STATS_PROGRESS 를 추가했다
+   * 바뀐 것: enum 항목 +1(+3줄). develop 꼬리와 충돌
+   * [지적 R1]
+   * [지적 R3]
+   */
   NET_SERVER_REQUEST_ITEM(NET_SERVER_ES_CREATE_FILE) \
   NET_SERVER_REQUEST_ITEM(NET_SERVER_ES_WRITE_FILE) \
   NET_SERVER_REQUEST_ITEM(NET_SERVER_ES_READ_FILE) \
