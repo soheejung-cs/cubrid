@@ -4562,6 +4562,90 @@ send:
 }
 
 /*
+ * sqst_log_stats_progress - write the progress of UPDATE STATISTICS ON ALL CLASSES to the event log
+ *
+ * return:
+ *
+ *   rid(in):
+ *   request(in): class oid, phase, state, seq, total, class_ms, elapsed_ms, error
+ *   reqlen(in):
+ *
+ * NOTE: the event log is written regardless of error_log_level, so the progress of a long run can be followed in
+ *       production. Nothing here may fail the run: a failure to log is dropped.
+ */
+/*
+ * [리뷰] sqst_log_stats_progress — NET_SERVER_QST_LOG_STATS_PROGRESS 서버 핸들러. 요청을 풀어 클래스 이름을 찾고 이벤트 로그에
+ * UPDATE_STATISTICS 항목을 쓴 뒤 항상 NO_ERROR 로 응답한다
+ * develop: develop 에 없음
+ * 이 PR: 길이 검사 → unpack 8필드 → er_stack_push → heap_get_class_name(실패 시 *UNKNOWN-CLASS*) →
+ * event_log_start/print/end → free → er_stack_pop → 응답
+ * 바뀐 것: 신설(+61줄)
+ * [지적 R2]
+ * [지적 R3]
+ */
+void
+sqst_log_stats_progress (THREAD_ENTRY *thread_p, unsigned int rid, char *request, int reqlen)
+{
+  OID classoid;
+  int phase, state, seq, total, class_ms, elapsed_ms, error;
+  char *class_name = NULL;
+  FILE *log_fp;
+  int indent = 2;
+  char *ptr;
+  OR_ALIGNED_BUF (OR_INT_SIZE) a_reply;
+  char *reply = OR_ALIGNED_BUF_START (a_reply);
+
+  if (reqlen >= OR_OID_SIZE + OR_INT_SIZE * 7)
+    {
+      ptr = or_unpack_oid (request, &classoid);
+      ptr = or_unpack_int (ptr, &phase);
+      ptr = or_unpack_int (ptr, &state);
+      ptr = or_unpack_int (ptr, &seq);
+      ptr = or_unpack_int (ptr, &total);
+      ptr = or_unpack_int (ptr, &class_ms);
+      ptr = or_unpack_int (ptr, &elapsed_ms);
+      ptr = or_unpack_int (ptr, &error);
+
+      /* keep whatever the logging sets (e.g. the event log file cannot be reopened) away from the caller */
+      er_stack_push ();
+
+      if (heap_get_class_name (thread_p, &classoid, &class_name) != NO_ERROR)
+	{
+	  class_name = NULL;
+	}
+
+      log_fp = event_log_start (thread_p, "UPDATE_STATISTICS");
+      if (log_fp != NULL)
+	{
+	  event_log_print_client_info (LOG_FIND_THREAD_TRAN_INDEX (thread_p), indent);
+	  fprintf (log_fp, "%*cclass: %s\n", indent, ' ', class_name ? class_name : "*UNKNOWN-CLASS*");
+	  if (state == STATS_PROGRESS_STARTED)
+	    {
+	      fprintf (log_fp, "%*cprogress: %s started %d/%d, elapsed: %.3f sec\n\n", indent, ' ',
+		       phase == STATS_PROGRESS_HISTOGRAM ? "histogram" : "statistics", seq, total, elapsed_ms / 1000.0);
+	    }
+	  else
+	    {
+	      fprintf (log_fp, "%*cprogress: %s finished %d/%d, error: %d, time: %.3f sec, elapsed: %.3f sec\n\n",
+		       indent, ' ', phase == STATS_PROGRESS_HISTOGRAM ? "histogram" : "statistics", seq, total, error,
+		       class_ms / 1000.0, elapsed_ms / 1000.0);
+	    }
+	  event_log_end (thread_p);
+	}
+
+      if (class_name != NULL)
+	{
+	  free_and_init (class_name);
+	}
+
+      er_stack_pop ();
+    }
+
+  (void) or_pack_int (reply, NO_ERROR);
+  css_send_data_to_client (thread_p->conn_entry, rid, reply, OR_ALIGNED_BUF_SIZE (a_reply));
+}
+
+/*
  * sbtree_add_index -
  *
  * return:

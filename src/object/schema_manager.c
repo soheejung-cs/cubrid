@@ -4355,12 +4355,23 @@ sm_update_statistics_without_gathering_stats (MOP classop, bool with_fullscan)
  *   return: NO_ERROR on success, non-zero for ERROR
  */
 
+/*
+ * [리뷰] sm_update_all_statistics — UPDATE STATISTICS ON ALL CLASSES(execute_statement)와 optimizedb(SA)의 진입점.
+ * 워크스페이스 flush → 통계 단계 → resident 캐시 재적재 → 히스토그램 단계 순서로 진행한다
+ * develop: base :4359 — 통계 단계가 실패해도 히스토그램 단계를 돌리고 그 결과로 error 를 덮었다. develop 은 #8166 으로 조기 반환하고 skip 목록 2인자를
+ * 받는다
+ * 이 PR: 함수 첫머리(flush 전)에서 run_start_msec 를 한 번 읽어 두 단계에 넘긴다. 실패 뒤 히스토그램 진행은 base 그대로다
+ * 바뀐 것: 지역 변수 +1, 호출 인자 +1(±3줄). develop 과 충돌
+ * [지적 R1]
+ */
 int
 sm_update_all_statistics (bool with_fullscan, int random_seed, int no_histogram)
 {
   int error = NO_ERROR;
   DB_OBJLIST *cl;
   SM_CLASS *class_;
+  /* both phases report their progress against the same start */
+  INT64 run_start_msec = stats_progress_clock_msec ();
 
   /* make sure the workspace is flushed before calculating stats */
   if (locator_all_flush () != NO_ERROR)
@@ -4369,7 +4380,7 @@ sm_update_all_statistics (bool with_fullscan, int random_seed, int no_histogram)
       return er_errid ();
     }
 
-  error = stats_update_all_statistics (with_fullscan, no_histogram /* print_summary */ );
+  error = stats_update_all_statistics (with_fullscan, no_histogram /* print_summary */ , run_start_msec);
   if (error == NO_ERROR)
     {
       /* Need to reset the statistics cache for all resident classes */
@@ -4404,7 +4415,7 @@ sm_update_all_statistics (bool with_fullscan, int random_seed, int no_histogram)
 
   if (!no_histogram)
     {
-      error = update_histogram_for_all_classes (random_seed);
+      error = update_histogram_for_all_classes (random_seed, run_start_msec);
       if (error != NO_ERROR)
 	{
 	  return error;
