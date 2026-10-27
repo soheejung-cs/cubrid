@@ -6802,6 +6802,17 @@ exit_on_error:
  *   env(in/out): Structure to store and return the statistical information
  *   midxkey(in);
  */
+/*
+ * [리뷰] btree_get_stats_midxkey — 샘플링 UPDATE STATISTICS 에서 btree_get_stats_key () 가 표본 리프의 다중 컬럼 키마다 부른다 — 직전
+ * 키와 접두 값을 비교해 pkeys 전이를 세고, 표본 수집 중이면 키를 Duj1 저수지(4,096칸)에 넣으며 레벨별 접두 해시를 저장한다.
+ * develop: develop: 원소마다 val_hash = NULL ? 0xFFFFFFFF : mht_valhash (&elem, 0xFFFFFFFE) (32비트, 버킷용 해시라
+ * NUMERIC·BIT·실수·BIGINT·ENUM 의 서로 다른 값을 접는다), hash = hash * FNV소수 + val_hash (btree.c:6850-6851 @89722cf4e).
+ * 이 PR: val_hash = NULL ? ~0ULL : btree_get_stats_prefix_value_hash (&elem) (64비트, 값 전체), 합성식은 그대로.
+ * 바뀐 것: 해시 원천 교체 2줄 + 주석 1줄. 저수지·전이 계수 로직은 그대로.
+ * [지적 R1]
+ * [지적 R2]
+ * [지적 R3]
+ */
 static int
 btree_get_stats_midxkey (THREAD_ENTRY * thread_p, BTREE_STATS_ENV * env, DB_MIDXKEY * midxkey)
 {
@@ -7361,6 +7372,13 @@ exit_on_error:
 /*
  * btree_get_stats_hash_bytes () - mix bytes into a prefix hash (FNV-1a)
  */
+/*
+ * [리뷰] btree_get_stats_hash_bytes — btree_get_stats_prefix_value_hash () 가 값의 바이트 열을 64비트 FNV-1a 로 섞을 때 부른다 —
+ * 이어받은 해시에 바이트를 하나씩 xor·곱해 돌려준다.
+ * develop: develop 에 없음.
+ * 이 PR: 신설: hash = (hash ^ byte) * 1099511628211 를 size 바이트만큼.
+ * 바뀐 것: 신설 13줄.
+ */
 static UINT64
 btree_get_stats_hash_bytes (UINT64 hash, const void *bytes, size_t size)
 {
@@ -7387,6 +7405,18 @@ btree_get_stats_hash_bytes (UINT64 hash, const void *bytes, size_t size)
  * the first zero byte, FLOAT, DOUBLE and MONETARY are truncated to integers, and ENUM hashes the
  * address of the DB_VALUE. The whole value is mixed here instead, and strings use the
  * collation-aware hash so that values equal under the collation still hash alike.
+ */
+/*
+ * [리뷰] btree_get_stats_prefix_value_hash — btree_get_stats_midxkey () 가 저수지 표본의 키 원소마다 부른다 — tp_value_compare
+ * () 의 같음과 맞는 64비트 해시를 타입별로 돌려준다.
+ * develop: develop 에 없음(같은 자리는 mht_valhash ()).
+ * 이 PR: 신설 156줄: CHAR/VARCHAR 는 콜레이션 해시(mht_get_hash_number), NUMERIC 은 부호 + 17바이트 버퍼(float NUMERIC 은 정규화 이미지
+ * + 남은 scale), BIT/VARBIT 은 크기 + 바이트, FLOAT/DOUBLE/MONETARY 는 비트 패턴(−0 은 0), 정수·날짜·시간·OID·ENUM 은 값의 모든 성분, TZ
+ * 타입은 시간대 제외, 그 밖은 mht_get_hash_number.
+ * 바뀐 것: 신설 함수(타입 분기 15개 + default).
+ * [지적 R1]
+ * [지적 R2]
+ * [지적 R3]
  */
 static UINT64
 btree_get_stats_prefix_value_hash (const DB_VALUE * value)
