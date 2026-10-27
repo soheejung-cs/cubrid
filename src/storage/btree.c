@@ -59,6 +59,7 @@
 #include "thread_manager.hpp"
 
 #include <assert.h>
+#include <math.h>
 #include <algorithm>
 #include <cinttypes>
 #include <stdlib.h>
@@ -1269,6 +1270,8 @@ static int btree_get_stats_key (THREAD_ENTRY * thread_p, BTREE_STATS_ENV * env, 
 static int btree_get_stats_with_AR_sampling (THREAD_ENTRY * thread_p, BTREE_STATS_ENV * env);
 static int btree_get_stats_prefix_skip_scan_level (THREAD_ENTRY * thread_p, BTREE_STATS_ENV * env, int level,
 						   bool * exhausted, int *count);
+static UINT64 btree_get_stats_hash_bytes (UINT64 hash, const void *bytes, size_t size);
+static UINT64 btree_get_stats_prefix_value_hash (const DB_VALUE * value);
 static int btree_get_stats_compare_prefix_hash (const void *hash1, const void *hash2);
 static INT64 btree_get_stats_duj1_estimate (BTREE_STATS_ENV * env, int level);
 static int btree_get_stats_prefix_skip_scan (THREAD_ENTRY * thread_p, BTREE_STATS_ENV * env);
@@ -6799,6 +6802,17 @@ exit_on_error:
  *   env(in/out): Structure to store and return the statistical information
  *   midxkey(in);
  */
+/*
+ * [리뷰] btree_get_stats_midxkey — 샘플링 UPDATE STATISTICS 에서 btree_get_stats_key () 가 표본 리프의 다중 컬럼 키마다 부른다 — 직전
+ * 키와 접두 값을 비교해 pkeys 전이를 세고, 표본 수집 중이면 키를 Duj1 저수지(4,096칸)에 넣으며 레벨별 접두 해시를 저장한다.
+ * develop: develop: 원소마다 val_hash = NULL ? 0xFFFFFFFF : mht_valhash (&elem, 0xFFFFFFFE) (32비트, 버킷용 해시라
+ * NUMERIC·BIT·실수·BIGINT·ENUM 의 서로 다른 값을 접는다), hash = hash * FNV소수 + val_hash (btree.c:6850-6851 @89722cf4e).
+ * 이 PR: val_hash = NULL ? ~0ULL : btree_get_stats_prefix_value_hash (&elem) (64비트, 값 전체), 합성식은 그대로.
+ * 바뀐 것: 해시 원천 교체 2줄 + 주석 1줄. 저수지·전이 계수 로직은 그대로.
+ * [지적 R1]
+ * [지적 R2]
+ * [지적 R3]
+ */
 static int
 btree_get_stats_midxkey (THREAD_ENTRY * thread_p, BTREE_STATS_ENV * env, DB_MIDXKEY * midxkey)
 {
@@ -6833,7 +6847,7 @@ btree_get_stats_midxkey (THREAD_ENTRY * thread_p, BTREE_STATS_ENV * env, DB_MIDX
       if (slot >= 0)
 	{
 	  UINT64 hash = 0;
-	  unsigned int val_hash;
+	  UINT64 val_hash;
 
 	  prev_k_index = 0;
 	  prev_k_ptr = NULL;
@@ -6845,9 +6859,8 @@ btree_get_stats_midxkey (THREAD_ENTRY * thread_p, BTREE_STATS_ENV * env, DB_MIDX
 		  assert_release (false);
 		  goto exit_on_error;
 		}
-	      /* the NULL marker must not collide with any value hash, so values are bounded away
-	       * from it (mht_valhash reduces modulo its ht_size argument) */
-	      val_hash = DB_IS_NULL (&elem) ? 0xFFFFFFFFU : mht_valhash (&elem, 0xFFFFFFFEU);
+	      /* the string hashes stay below 2^32, so the NULL marker cannot meet one */
+	      val_hash = DB_IS_NULL (&elem) ? ~0ULL : btree_get_stats_prefix_value_hash (&elem);
 	      hash = hash * 1099511628211ULL + val_hash;
 	      env->prefix_sample[(size_t) k * BTREE_STATS_DUJ1_SAMPLE + slot] = hash;
 	      if (elem.need_clear == true)
@@ -7354,6 +7367,212 @@ exit_on_error:
   pr_clear_value (&seek_key);
 
   return (ret == NO_ERROR && (ret = er_errid ()) == NO_ERROR) ? ER_FAILED : ret;
+}
+
+/*
+ * btree_get_stats_hash_bytes () - mix bytes into a prefix hash (FNV-1a)
+ */
+/*
+ * [리뷰] btree_get_stats_hash_bytes — btree_get_stats_prefix_value_hash () 가 값의 바이트 열을 64비트 FNV-1a 로 섞을 때 부른다 —
+ * 이어받은 해시에 바이트를 하나씩 xor·곱해 돌려준다.
+ * develop: develop 에 없음.
+ * 이 PR: 신설: hash = (hash ^ byte) * 1099511628211 를 size 바이트만큼.
+ * 바뀐 것: 신설 13줄.
+ */
+static UINT64
+btree_get_stats_hash_bytes (UINT64 hash, const void *bytes, size_t size)
+{
+  const unsigned char *p = (const unsigned char *) bytes;
+  size_t i;
+
+  for (i = 0; i < size; i++)
+    {
+      hash = (hash ^ p[i]) * 1099511628211ULL;
+    }
+
+  return hash;
+}
+
+/*
+ * btree_get_stats_prefix_value_hash () - hash of one non-NULL key element for the prefix hash
+ *     reservoir
+ *   return: 64-bit hash
+ *   value(in): key element
+ *
+ * Note: (CBRD-27701) the Duj1 estimate counts distinct hashes, so the hash must be equal for equal
+ * values and distinct for distinct ones. mht_valhash () is made for hash table buckets and folds
+ * distinct values together: every fixed NUMERIC and most BIT strings hash to 0 because it stops at
+ * the first zero byte, FLOAT, DOUBLE and MONETARY are truncated to integers, and ENUM hashes the
+ * address of the DB_VALUE. The whole value is mixed here instead, and strings use the
+ * collation-aware hash so that values equal under the collation still hash alike.
+ */
+/*
+ * [리뷰] btree_get_stats_prefix_value_hash — btree_get_stats_midxkey () 가 저수지 표본의 키 원소마다 부른다 — tp_value_compare
+ * () 의 같음과 맞는 64비트 해시를 타입별로 돌려준다.
+ * develop: develop 에 없음(같은 자리는 mht_valhash ()).
+ * 이 PR: 신설 156줄: CHAR/VARCHAR 는 콜레이션 해시(mht_get_hash_number), NUMERIC 은 부호 + 17바이트 버퍼(float NUMERIC 은 정규화 이미지
+ * + 남은 scale), BIT/VARBIT 은 크기 + 바이트, FLOAT/DOUBLE/MONETARY 는 비트 패턴(−0 은 0), 정수·날짜·시간·OID·ENUM 은 값의 모든 성분, TZ
+ * 타입은 시간대 제외, 그 밖은 mht_get_hash_number.
+ * 바뀐 것: 신설 함수(타입 분기 15개 + default).
+ * [지적 R1]
+ * [지적 R2]
+ * [지적 R3]
+ */
+static UINT64
+btree_get_stats_prefix_value_hash (const DB_VALUE * value)
+{
+  UINT64 hash = 14695981039346656037ULL;
+
+  switch (DB_VALUE_TYPE (value))
+    {
+    case DB_TYPE_CHAR:
+    case DB_TYPE_VARCHAR:
+      return mht_get_hash_number (UINT_MAX, value);
+
+    case DB_TYPE_NUMERIC:
+      {
+	int precision = 0, scale = 0;
+	bool is_float_numeric = false;
+	bool is_negative = DB_VALUE_NUMERIC_IS_VALUE_NEGATIVE (value);
+	uint8_t calc_buf[DB_NUMERIC_BUF_SIZE];
+	DB_C_NUMERIC num = db_locate_numeric (value);
+
+	db_get_numeric_precision_and_scale (value, &precision, &scale, &is_float_numeric);
+	if (is_float_numeric)
+	  {
+	    /* a float NUMERIC keeps its own scale per value: the normalization of mht_valhash ()
+	     * strips the trailing zeros so that 1.0 and 1.00 share one coefficient, but drops the
+	     * scale left over, so 1.5 and 15 would share it too. The scale left over is mixed in;
+	     * it is the original scale less the number of zeros stripped, which is the decimal
+	     * exponent of the coefficient ratio (an exact power of ten, so the rounding of the
+	     * two doubles cannot change it). */
+	    int left_scale = scale;
+
+	    if (scale != 0 && !(precision == DB_MAX_NUMERIC_PRECISION && scale < 0))
+	      {
+		float_numeric_normalize_for_hash (num, calc_buf, precision, scale);
+		num = calc_buf;
+		if (scale > 0)
+		  {
+		    DB_VALUE coefficient;
+		    double d_value, d_coefficient;
+
+		    db_make_numeric (&coefficient, calc_buf, DB_MAX_NUMERIC_PRECISION, 0, DB_NUMERIC_BUF_SIZE, false,
+				     false);
+		    numeric_coerce_num_to_double (value, 0, &d_value);
+		    numeric_coerce_num_to_double (&coefficient, 0, &d_coefficient);
+		    left_scale =
+		      (d_coefficient == 0) ? 0 : scale - (int) lround (log10 (fabs (d_value) / d_coefficient));
+		  }
+	      }
+	    hash = btree_get_stats_hash_bytes (hash, &left_scale, sizeof (left_scale));
+	  }
+	hash = btree_get_stats_hash_bytes (hash, &is_negative, sizeof (is_negative));
+	return btree_get_stats_hash_bytes (hash, num, DB_NUMERIC_BUF_SIZE);
+      }
+
+    case DB_TYPE_BIT:
+    case DB_TYPE_VARBIT:
+      {
+	int size = db_get_string_size (value);
+
+	hash = btree_get_stats_hash_bytes (hash, &size, sizeof (size));
+	return btree_get_stats_hash_bytes (hash, db_get_string (value), size);
+      }
+
+    case DB_TYPE_FLOAT:
+      {
+	/* -0.0 equals 0.0 */
+	float f = db_get_float (value) + 0.0f;
+
+	return btree_get_stats_hash_bytes (hash, &f, sizeof (f));
+      }
+
+    case DB_TYPE_DOUBLE:
+      {
+	double d = db_get_double (value) + 0.0;
+
+	return btree_get_stats_hash_bytes (hash, &d, sizeof (d));
+      }
+
+    case DB_TYPE_MONETARY:
+      {
+	double d = db_get_monetary (value)->amount + 0.0;
+
+	return btree_get_stats_hash_bytes (hash, &d, sizeof (d));
+      }
+
+    case DB_TYPE_BIGINT:
+      {
+	DB_BIGINT bigint = db_get_bigint (value);
+
+	return btree_get_stats_hash_bytes (hash, &bigint, sizeof (bigint));
+      }
+
+    case DB_TYPE_DATETIME:
+    case DB_TYPE_DATETIMELTZ:
+    case DB_TYPE_DATETIMETZ:
+      {
+	/* the time zone of DATETIMETZ is not compared */
+	const DB_DATETIME *datetime = (DB_VALUE_TYPE (value) == DB_TYPE_DATETIMETZ)
+	  ? &db_get_datetimetz (value)->datetime : db_get_datetime (value);
+
+	hash = btree_get_stats_hash_bytes (hash, &datetime->date, sizeof (datetime->date));
+	return btree_get_stats_hash_bytes (hash, &datetime->time, sizeof (datetime->time));
+      }
+
+    case DB_TYPE_TIMESTAMPTZ:
+      {
+	/* the time zone of TIMESTAMPTZ is not compared */
+	DB_TIMESTAMP timestamp = db_get_timestamptz (value)->timestamp;
+
+	return btree_get_stats_hash_bytes (hash, &timestamp, sizeof (timestamp));
+      }
+
+    case DB_TYPE_ENUMERATION:
+      {
+	/* mht_valhash () hashes the address of the DB_VALUE for this type */
+	unsigned short index = db_get_enum_short (value);
+
+	return btree_get_stats_hash_bytes (hash, &index, sizeof (index));
+      }
+
+    case DB_TYPE_OID:
+      {
+	const OID *oid = db_get_oid (value);
+
+	hash = btree_get_stats_hash_bytes (hash, &oid->pageid, sizeof (oid->pageid));
+	hash = btree_get_stats_hash_bytes (hash, &oid->slotid, sizeof (oid->slotid));
+	return btree_get_stats_hash_bytes (hash, &oid->volid, sizeof (oid->volid));
+      }
+
+    case DB_TYPE_INTEGER:
+      {
+	int i = db_get_int (value);
+
+	return btree_get_stats_hash_bytes (hash, &i, sizeof (i));
+      }
+
+    case DB_TYPE_SHORT:
+      {
+	short sh = db_get_short (value);
+
+	return btree_get_stats_hash_bytes (hash, &sh, sizeof (sh));
+      }
+
+    case DB_TYPE_DATE:
+      return btree_get_stats_hash_bytes (hash, db_get_date (value), sizeof (DB_DATE));
+
+    case DB_TYPE_TIME:
+      return btree_get_stats_hash_bytes (hash, db_get_time (value), sizeof (DB_TIME));
+
+    case DB_TYPE_TIMESTAMP:
+    case DB_TYPE_TIMESTAMPLTZ:
+      return btree_get_stats_hash_bytes (hash, db_get_timestamp (value), sizeof (DB_TIMESTAMP));
+
+    default:
+      return mht_get_hash_number (UINT_MAX, value);
+    }
 }
 
 /*
